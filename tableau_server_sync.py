@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
 Sincronizador Tableau → GitHub (Online y Server)
-Optimizado para Personal Access Token
+Optimizado para Personal Access Token con caracteres especiales
 """
 
 import os
 import sys
 import base64
 import requests
+import json
 from datetime import datetime
 from typing import List, Optional
 import logging
@@ -19,10 +20,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class TableauAPI:
-    """
-    Cliente para API de Tableau (Online y Server)
-    Optimizado para Personal Access Token
-    """
+    """Cliente para API de Tableau"""
     
     def __init__(self, server: str, site: str, username: str, password: str):
         self.server = server
@@ -32,20 +30,18 @@ class TableauAPI:
         self.token = None
         self.base_url = f"{server}/api/3.17"
         
-        # Detectar si es Online o Server
         if "online.tableau.com" in server:
             self.tableau_type = "ONLINE"
-            logger.info("✓ Detectado: Tableau Online")
+            logger.info("Detectado: Tableau Online")
         else:
             self.tableau_type = "SERVER"
-            logger.info("✓ Detectado: Tableau Server")
+            logger.info("Detectado: Tableau Server")
         
     def authenticate(self) -> bool:
-        """Autenticar en Tableau usando Personal Access Token"""
+        """Autenticar usando Personal Access Token"""
         try:
             auth_url = f"{self.base_url}/auth/signin"
             
-            # Formato correcto para Personal Access Token
             payload = {
                 "credentials": {
                     "name": self.username,
@@ -56,21 +52,39 @@ class TableauAPI:
                 }
             }
             
-            logger.info(f"🔐 Intentando autenticar...")
-            logger.info(f"   Servidor: {self.server}")
-            logger.info(f"   Sitio: {self.site}")
-            logger.info(f"   Usuario: {self.username}")
+            logger.info("Intentando autenticar...")
+            logger.info(f"Servidor: {self.server}")
+            logger.info(f"Sitio: {self.site}")
+            logger.info(f"Usuario: {self.username}")
             
-            response = requests.post(auth_url, json=payload, timeout=10)
+            json_payload = json.dumps(payload)
+            
+            response = requests.post(
+                auth_url,
+                data=json_payload,
+                headers={
+                    "Content-Type": "application/json; charset=UTF-8"
+                },
+                timeout=10
+            )
+            
+            logger.info(f"Respuesta: {response.status_code}")
             
             if response.status_code == 401:
-                logger.error(f"✗ Error 401: Credenciales inválidas")
-                logger.error(f"   Verifica: usuario, contraseña/token y sitio")
+                logger.error("Error 401: Credenciales invalidas")
+                logger.error("El token puede estar vencido o ser incorrecto")
+                logger.error(f"Respuesta: {response.text[:200]}")
                 return False
             
             if response.status_code == 403:
-                logger.error(f"✗ Error 403: Acceso prohibido")
-                logger.error(f"   Posible causa: Restricciones de la empresa o IP bloqueada")
+                logger.error("Error 403: Acceso prohibido")
+                logger.error("Posible causa: Restricciones de la empresa")
+                return False
+            
+            if response.status_code == 400:
+                logger.error("Error 400: Bad Request")
+                logger.error("Verifica el formato del token")
+                logger.error(f"Respuesta: {response.text[:200]}")
                 return False
             
             response.raise_for_status()
@@ -78,26 +92,14 @@ class TableauAPI:
             data = response.json()
             self.token = data['credentials']['token']
             
-            logger.info(f"✓ Autenticación exitosa en Tableau {self.tableau_type}")
+            logger.info(f"Autenticacion exitosa en Tableau {self.tableau_type}")
             return True
             
-        except requests.exceptions.Timeout:
-            logger.error(f"✗ Timeout: No hay respuesta del servidor")
-            logger.error(f"   Verifica la URL: {self.server}")
-            return False
-        
-        except requests.exceptions.ConnectionError as e:
-            logger.error(f"✗ Error de conexión: {e}")
-            logger.error(f"   Verifica: URL correcta, internet, firewall")
-            return False
-        
         except requests.exceptions.RequestException as e:
-            logger.error(f"✗ Error de autenticación: {e}")
+            logger.error(f"Error de autenticacion: {e}")
             return False
-        
-        except KeyError:
-            logger.error(f"✗ Respuesta inesperada del servidor")
-            logger.error(f"   Respuesta: {response.text}")
+        except Exception as e:
+            logger.error(f"Error inesperado: {e}")
             return False
     
     def get_workbooks(self) -> List[dict]:
@@ -106,7 +108,7 @@ class TableauAPI:
             headers = {"X-Tableau-Auth": self.token}
             workbooks_url = f"{self.base_url}/sites/{self.site}/workbooks"
             
-            logger.info(f"📚 Obteniendo lista de workbooks...")
+            logger.info("Obteniendo lista de workbooks...")
             
             response = requests.get(workbooks_url, headers=headers, timeout=10)
             response.raise_for_status()
@@ -114,11 +116,11 @@ class TableauAPI:
             data = response.json()
             workbook_list = data.get('workbook', [])
             
-            logger.info(f"✓ Se encontraron {len(workbook_list)} workbooks")
+            logger.info(f"Se encontraron {len(workbook_list)} workbooks")
             return workbook_list
             
         except requests.exceptions.RequestException as e:
-            logger.error(f"✗ Error al obtener workbooks: {e}")
+            logger.error(f"Error al obtener workbooks: {e}")
             return []
     
     def download_workbook(self, workbook_id: str, workbook_name: str, 
@@ -129,7 +131,7 @@ class TableauAPI:
             download_url = (f"{self.base_url}/sites/{self.site}/"
                            f"workbooks/{workbook_id}/content")
             
-            logger.info(f"⬇️  Descargando: {workbook_name}...")
+            logger.info(f"Descargando: {workbook_name}...")
             
             response = requests.get(download_url, headers=headers, timeout=30)
             response.raise_for_status()
@@ -138,11 +140,11 @@ class TableauAPI:
             with open(file_path, 'wb') as f:
                 f.write(response.content)
             
-            logger.info(f"✓ Descargado: {workbook_name}.twbx")
+            logger.info(f"Descargado: {workbook_name}.twbx")
             return file_path
             
         except requests.exceptions.RequestException as e:
-            logger.error(f"✗ Error al descargar {workbook_name}: {e}")
+            logger.error(f"Error al descargar {workbook_name}: {e}")
             return None
 
 
@@ -191,23 +193,22 @@ class GitHubAPI:
             response = requests.put(url, json=payload, headers=self.headers, timeout=10)
             response.raise_for_status()
             
-            logger.info(f"✓ Subido a GitHub: {github_path}")
+            logger.info(f"Subido a GitHub: {github_path}")
             return True
             
         except requests.exceptions.RequestException as e:
-            logger.error(f"✗ Error al subir a GitHub: {e}")
+            logger.error(f"Error al subir a GitHub: {e}")
             return False
 
 
 def main():
-    """Función principal"""
+    """Funcion principal"""
     
     logger.info("=" * 70)
     logger.info("Backup Tableau → GitHub")
     logger.info("=" * 70)
     logger.info("")
     
-    # Variables de entorno
     tableau_server = os.getenv('TABLEAU_SERVER', '')
     tableau_site = os.getenv('TABLEAU_SITE', '')
     tableau_user = os.getenv('TABLEAU_USERNAME', '')
@@ -217,7 +218,6 @@ def main():
     github_repo = os.getenv('GITHUB_REPO_NAME', '')
     github_token = os.getenv('GITHUB_TOKEN', '')
     
-    # Validar variables
     required_vars = [
         ('TABLEAU_SERVER', tableau_server),
         ('TABLEAU_SITE', tableau_site),
@@ -230,28 +230,26 @@ def main():
     
     for var_name, var_value in required_vars:
         if not var_value:
-            logger.error(f"✗ Variable de entorno requerida: {var_name}")
+            logger.error(f"Variable de entorno requerida: {var_name}")
             sys.exit(1)
     
     download_dir = "tableau_workbooks"
     os.makedirs(download_dir, exist_ok=True)
     
-    # Conectar a Tableau
     tableau = TableauAPI(tableau_server, tableau_site, tableau_user, tableau_password)
     if not tableau.authenticate():
-        logger.error("✗ No se pudo autenticar en Tableau")
+        logger.error("No se pudo autenticar en Tableau")
         sys.exit(1)
     
-    # Obtener workbooks
     workbooks = tableau.get_workbooks()
     if not workbooks:
-        logger.warning("⚠️  No se encontraron workbooks")
+        logger.warning("No se encontraron workbooks")
         sys.exit(0)
     
     github = GitHubAPI(github_owner, github_repo, github_token)
     
     logger.info("")
-    logger.info("📥 Descargando y subiendo workbooks...")
+    logger.info("Descargando y subiendo workbooks...")
     logger.info("")
     
     uploaded_count = 0
@@ -275,7 +273,7 @@ def main():
     
     logger.info("")
     logger.info("=" * 70)
-    logger.info(f"✓ Completado: {uploaded_count}/{len(workbooks)} workbooks")
+    logger.info(f"Completado: {uploaded_count}/{len(workbooks)} workbooks")
     logger.info("=" * 70)
 
 

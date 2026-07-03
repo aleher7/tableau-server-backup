@@ -1,39 +1,61 @@
+# Nombre del workflow (aparece en GitHub Actions)
 name: Tableau Backup → GitHub
 
+# Cuando ejecutar este workflow
 on:
+  # Ejecutar automáticamente cada día a las 2 AM (hora UTC)
   schedule:
     - cron: '0 2 * * *'
+  
+  # También permitir ejecutar manualmente desde GitHub
   workflow_dispatch:
 
+# Trabajos a ejecutar
 jobs:
   backup:
+    # Usar un servidor Ubuntu de GitHub
     runs-on: ubuntu-latest
     
+    # Pasos a ejecutar en orden
     steps:
-      - uses: actions/checkout@v4
       
-      - uses: actions/setup-python@v5
+      # Paso 1: Descargar el código del repositorio
+      - name: Descargar repositorio
+        uses: actions/checkout@v4
+      
+      # Paso 2: Instalar Python
+      - name: Instalar Python 3.11
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
       
-      - run: |
+      # Paso 3: Instalar librerías necesarias
+      - name: Instalar dependencias
+        run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
       
-      - name: Ejecutar backup
+      # Paso 4: Ejecutar el script de backup
+      - name: Ejecutar backup de Tableau
         env:
+          # Variables de Tableau (obtenidas de GitHub Secrets)
           TABLEAU_SERVER: ${{ secrets.TABLEAU_SERVER }}
           TABLEAU_SITE: ${{ secrets.TABLEAU_SITE }}
           TABLEAU_USERNAME: ${{ secrets.TABLEAU_USERNAME }}
           TABLEAU_PASSWORD: ${{ secrets.TABLEAU_PASSWORD }}
+          
+          # Variables de GitHub (automáticas)
           GITHUB_REPO_OWNER: ${{ github.repository_owner }}
           GITHUB_REPO_NAME: ${{ github.event.repository.name }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python tableau_backup.py
+        run: |
+          python tableau_backup.py
       
-      - uses: actions/upload-artifact@v4
+      # Paso 5: Guardar los archivos descargados como backup
+      - name: Guardar archivos descargados
         if: always()
+        uses: actions/upload-artifact@v4
         with:
-          name: tableau-backup
+          name: tableau-workbooks-backup
           path: tableau_workbooks/
           retention-days: 30

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Sincronizador Tableau → GitHub (Online y Server)
-Funciona con Tableau Online y Tableau Server
+Optimizado para Personal Access Token
 """
 
 import os
@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 class TableauAPI:
     """
     Cliente para API de Tableau (Online y Server)
-    Detecta automáticamente cuál es
+    Optimizado para Personal Access Token
     """
     
     def __init__(self, server: str, site: str, username: str, password: str):
@@ -35,16 +35,17 @@ class TableauAPI:
         # Detectar si es Online o Server
         if "online.tableau.com" in server:
             self.tableau_type = "ONLINE"
-            logger.info("Detected: Tableau Online")
+            logger.info("✓ Detectado: Tableau Online")
         else:
             self.tableau_type = "SERVER"
-            logger.info("Detected: Tableau Server")
+            logger.info("✓ Detectado: Tableau Server")
         
     def authenticate(self) -> bool:
-        """Autenticar en Tableau"""
+        """Autenticar en Tableau usando Personal Access Token"""
         try:
             auth_url = f"{self.base_url}/auth/signin"
             
+            # Formato correcto para Personal Access Token
             payload = {
                 "credentials": {
                     "name": self.username,
@@ -55,7 +56,23 @@ class TableauAPI:
                 }
             }
             
-            response = requests.post(auth_url, json=payload)
+            logger.info(f"🔐 Intentando autenticar...")
+            logger.info(f"   Servidor: {self.server}")
+            logger.info(f"   Sitio: {self.site}")
+            logger.info(f"   Usuario: {self.username}")
+            
+            response = requests.post(auth_url, json=payload, timeout=10)
+            
+            if response.status_code == 401:
+                logger.error(f"✗ Error 401: Credenciales inválidas")
+                logger.error(f"   Verifica: usuario, contraseña/token y sitio")
+                return False
+            
+            if response.status_code == 403:
+                logger.error(f"✗ Error 403: Acceso prohibido")
+                logger.error(f"   Posible causa: Restricciones de la empresa o IP bloqueada")
+                return False
+            
             response.raise_for_status()
             
             data = response.json()
@@ -64,8 +81,23 @@ class TableauAPI:
             logger.info(f"✓ Autenticación exitosa en Tableau {self.tableau_type}")
             return True
             
+        except requests.exceptions.Timeout:
+            logger.error(f"✗ Timeout: No hay respuesta del servidor")
+            logger.error(f"   Verifica la URL: {self.server}")
+            return False
+        
+        except requests.exceptions.ConnectionError as e:
+            logger.error(f"✗ Error de conexión: {e}")
+            logger.error(f"   Verifica: URL correcta, internet, firewall")
+            return False
+        
         except requests.exceptions.RequestException as e:
             logger.error(f"✗ Error de autenticación: {e}")
+            return False
+        
+        except KeyError:
+            logger.error(f"✗ Respuesta inesperada del servidor")
+            logger.error(f"   Respuesta: {response.text}")
             return False
     
     def get_workbooks(self) -> List[dict]:
@@ -74,7 +106,9 @@ class TableauAPI:
             headers = {"X-Tableau-Auth": self.token}
             workbooks_url = f"{self.base_url}/sites/{self.site}/workbooks"
             
-            response = requests.get(workbooks_url, headers=headers)
+            logger.info(f"📚 Obteniendo lista de workbooks...")
+            
+            response = requests.get(workbooks_url, headers=headers, timeout=10)
             response.raise_for_status()
             
             data = response.json()
@@ -95,7 +129,9 @@ class TableauAPI:
             download_url = (f"{self.base_url}/sites/{self.site}/"
                            f"workbooks/{workbook_id}/content")
             
-            response = requests.get(download_url, headers=headers)
+            logger.info(f"⬇️  Descargando: {workbook_name}...")
+            
+            response = requests.get(download_url, headers=headers, timeout=30)
             response.raise_for_status()
             
             file_path = os.path.join(download_path, f"{workbook_name}.twbx")
@@ -152,7 +188,7 @@ class GitHubAPI:
             if sha:
                 payload["sha"] = sha
             
-            response = requests.put(url, json=payload, headers=self.headers)
+            response = requests.put(url, json=payload, headers=self.headers, timeout=10)
             response.raise_for_status()
             
             logger.info(f"✓ Subido a GitHub: {github_path}")
@@ -166,6 +202,11 @@ class GitHubAPI:
 def main():
     """Función principal"""
     
+    logger.info("=" * 70)
+    logger.info("Backup Tableau → GitHub")
+    logger.info("=" * 70)
+    logger.info("")
+    
     # Variables de entorno
     tableau_server = os.getenv('TABLEAU_SERVER', '')
     tableau_site = os.getenv('TABLEAU_SITE', '')
@@ -176,7 +217,7 @@ def main():
     github_repo = os.getenv('GITHUB_REPO_NAME', '')
     github_token = os.getenv('GITHUB_TOKEN', '')
     
-    # Validar
+    # Validar variables
     required_vars = [
         ('TABLEAU_SERVER', tableau_server),
         ('TABLEAU_SITE', tableau_site),
@@ -189,28 +230,29 @@ def main():
     
     for var_name, var_value in required_vars:
         if not var_value:
-            logger.error(f"✗ Variable de entorno faltante: {var_name}")
+            logger.error(f"✗ Variable de entorno requerida: {var_name}")
             sys.exit(1)
     
     download_dir = "tableau_workbooks"
     os.makedirs(download_dir, exist_ok=True)
     
-    logger.info("=" * 60)
-    logger.info("Backup Tableau → GitHub")
-    logger.info("=" * 60)
-    
     # Conectar a Tableau
     tableau = TableauAPI(tableau_server, tableau_site, tableau_user, tableau_password)
     if not tableau.authenticate():
+        logger.error("✗ No se pudo autenticar en Tableau")
         sys.exit(1)
     
     # Obtener workbooks
     workbooks = tableau.get_workbooks()
     if not workbooks:
-        logger.warning("No se encontraron workbooks")
+        logger.warning("⚠️  No se encontraron workbooks")
         sys.exit(0)
     
     github = GitHubAPI(github_owner, github_repo, github_token)
+    
+    logger.info("")
+    logger.info("📥 Descargando y subiendo workbooks...")
+    logger.info("")
     
     uploaded_count = 0
     for workbook in workbooks:
@@ -219,8 +261,6 @@ def main():
         
         if not wb_id or not wb_name:
             continue
-        
-        logger.info(f"\nProcesando: {wb_name}")
         
         file_path = tableau.download_workbook(wb_id, wb_name, download_dir)
         if not file_path:
@@ -233,9 +273,10 @@ def main():
         if github.upload_file(file_path, github_path, commit_message):
             uploaded_count += 1
     
-    logger.info("\n" + "=" * 60)
+    logger.info("")
+    logger.info("=" * 70)
     logger.info(f"✓ Completado: {uploaded_count}/{len(workbooks)} workbooks")
-    logger.info("=" * 60)
+    logger.info("=" * 70)
 
 
 if __name__ == "__main__":

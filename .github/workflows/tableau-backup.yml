@@ -1,11 +1,8 @@
-name: Backup Tableau Server → GitHub
+name: Tableau Backup → GitHub
 
 on:
   schedule:
-    # Ejecutar diariamente a las 2 AM (UTC)
     - cron: '0 2 * * *'
-  
-  # También permitir ejecución manual
   workflow_dispatch:
 
 jobs:
@@ -13,20 +10,17 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-      - name: Checkout repositorio
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
       
-      - name: Configurar Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
       
-      - name: Instalar dependencias
-        run: |
+      - run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
       
-      - name: Descargar workbooks de Tableau Server
+      - name: Ejecutar backup
         env:
           TABLEAU_SERVER: ${{ secrets.TABLEAU_SERVER }}
           TABLEAU_SITE: ${{ secrets.TABLEAU_SITE }}
@@ -35,13 +29,11 @@ jobs:
           GITHUB_REPO_OWNER: ${{ github.repository_owner }}
           GITHUB_REPO_NAME: ${{ github.event.repository.name }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          python tableau_server_sync.py
+        run: python tableau_backup.py
       
-      - name: Cargar artefactos
+      - uses: actions/upload-artifact@v4
         if: always()
-        uses: actions/upload-artifact@v4
         with:
-          name: tableau-workbooks-backup
+          name: tableau-backup
           path: tableau_workbooks/
           retention-days: 30

@@ -202,20 +202,30 @@ def logout_tabcmd() -> bool:
     return True
 
 
-def descargar_workbook_tabcmd(luid: str, nombre: str, ruta_local: Path) -> bool:
+def descargar_workbook_tabcmd(nombre: str, ruta_local: Path) -> bool:
     """
-    Ejecuta: tabcmd get <luid> -f "ruta_local/nombre.twbx"
+    Ejecuta: tabcmd get "/workbooks/{nombre}.twbx" -f "ruta_local/nombre.twbx"
+    
+    NOTA: Usa content_url (nombre del workbook) en lugar de LUID.
+    Esto es lo que el usuario probó y funciona.
+    
     Devuelve True si exitoso.
     """
     # Asegurar extension .twbx
     if not nombre.lower().endswith(".twbx"):
-        nombre = f"{nombre}.twbx"
+        nombre_archivo = f"{nombre}.twbx"
+    else:
+        nombre_archivo = nombre
 
-    ruta_archivo = ruta_local / nombre
+    ruta_archivo = ruta_local / nombre_archivo
+    
+    # Formato que el usuario probó y funciona:
+    # tabcmd get "/workbooks/{nombre}.twbx" -f "ruta_local/nombre.twbx"
+    content_url = f"/workbooks/{nombre_archivo}"
 
-    cmd = [CONFIG["TABCMD_EXE"], "get", luid, "-f", str(ruta_archivo)]
+    cmd = [CONFIG["TABCMD_EXE"], "get", content_url, "-f", str(ruta_archivo)]
 
-    logger.info("  Descargando [tabcmd get %s] -> %s", luid, ruta_archivo.name)
+    logger.info("  Descargando [tabcmd get %s] -> %s", content_url, nombre_archivo)
 
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
     if result.returncode != 0:
@@ -264,7 +274,6 @@ def descargar_todos():
 
     try:
         for wb in workbooks:
-            luid = wb["luid"]
             nombre = wb["nombre"]
             ruta_proyecto = wb["ruta_proyecto"]
 
@@ -272,8 +281,9 @@ def descargar_todos():
             carpeta = destino_raiz / ruta_proyecto.replace("/", "\\")
             carpeta.mkdir(parents=True, exist_ok=True)
 
-            # Descargar
-            if descargar_workbook_tabcmd(luid, nombre, carpeta):
+            # Descargar con nombre de archivo
+            # (tabcmd usa el nombre del workbook como content_url)
+            if descargar_workbook_tabcmd(nombre, carpeta):
                 ok += 1
             else:
                 errores += 1

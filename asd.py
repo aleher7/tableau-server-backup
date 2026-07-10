@@ -1,89 +1,84 @@
 #!/usr/bin/env python3
 """
-Descarga TODOS los workbooks de Tableau Cloud replicando en local la
-estructura de carpetas (proyectos) que existe en el servidor.
- 
-    Tableau:  Production / Explorers / International / Mi Workbook
-    Local:    <CARPETA_DESTINO>/Production/Explorers/International/Mi Workbook.twbx
- 
-MODOS DE FUNCIONAMIENTO
------------------------
-1) MODO API (recomendado, por defecto): usa la API REST de Tableau mediante
-   la libreria 'tableauserverclient'. Descarga por LUID, obtiene la jerarquia
-   de proyectos directamente del servidor (siempre actualizada) y permite
-   descargar SIN extracto de datos (importante por confidencialidad).
- 
-2) MODO TABCMD (opcional, MODO = "tabcmd"): genera y ejecuta comandos
-   'tabcmd get /workbooks/<content_url>.twbx'. Necesita el content_url de
-   cada workbook, que el modo API obtiene automaticamente.
- 
+DESCARGA DE WORKBOOKS VIA TABCMD (orquestado por SQL + Python)
+
+Arquitectura:
+    Oracle (Admin Insights)
+        ↓
+    consulta_rutas_oracle_mejorada.sql
+        ↓
+    Python (este script)
+        ├─ Lee SQL
+        ├─ Obtiene: LUID, nombre, ruta_proyecto, tipo_item
+        ├─ Crea carpetas locales
+        └─ Ejecuta: tabcmd get <LUID> -f "ruta/local/archivo.twbx"
+        ↓
+    C:\Users\...\Tableau Workbooks (estructura replicada)
+
 REQUISITOS
 ----------
-    pip install tableauserverclient
- 
-AUTENTICACION
--------------
-Se usa un Personal Access Token (PAT). Se crea en Tableau Cloud:
-    Mi cuenta > Configuracion > Tokens de acceso personal
-Guardar el token en variables de entorno (recomendado) o en CONFIG.
- 
-PROGRAMACION DIARIA
--------------------
-Ver README.md (Programador de tareas de Windows + ejecutar_backup_diario.bat)
+    pip install oracledb gitpython
+
+TABCMD
+------
+    Debe estar instalado y en PATH o en ruta específica.
+    Aceptamos tanto LUID como content_url:
+        tabcmd get <luid> -f "ruta/archivo.twbx"
+        tabcmd get /workbooks/<content_url>.twbx -f "ruta/archivo.twbx"
+
+CONEXION ORACLE
+---------------
+    Formato: user/pass@host:port/service_name
+    Ejemplo: admin/password@localhost:1521/orcl
 """
- 
+
 import os
-import re
 import sys
 import logging
 import subprocess
+import argparse
 from pathlib import Path
 from datetime import datetime
- 
+
+try:
+    import oracledb
+except ImportError:
+    print("ERROR: pip install oracledb")
+    sys.exit(1)
+
 # ============================================================
 # CONFIGURACION
 # ============================================================
- 
+
 CONFIG = {
-    # --- Servidor Tableau Cloud ---
-    "SERVER_URL": "https://dub01.online.tableau.com",
-    "SITE_ID": "cantabrialabscorporatebi",          # nombre del site en la URL
- 
-    # --- Autenticacion con Personal Access Token ---
-    # Recomendado: definir variables de entorno TABLEAU_PAT_NAME y TABLEAU_PAT_SECRET
-    "PAT_NAME": os.environ.get("TABLEAU_PAT_NAME", "PON_AQUI_EL_NOMBRE_DEL_TOKEN"),
-    "PAT_SECRET": os.environ.get("TABLEAU_PAT_SECRET", "PON_AQUI_EL_SECRETO"),
- 
-    # --- Carpeta local destino (la que luego se sube a GitHub) ---
+    # Oracle: conexion y tabla
+    "ORACLE_CONN_STR": os.environ.get(
+        "TABLEAU_ORACLE_CONN",
+        "admin/password@localhost:1521/orcl"
+    ),
+    "TABLA_ITEMS": "tableau_items",
+
+    # Carpeta local destino
     "CARPETA_DESTINO": r"C:\Users\alejandro.romaguera\Documents\Tableau Workbooks",
- 
-    # --- Descargar con o sin datos ---
-    # False = descarga el workbook SIN el extracto de datos (recomendado si el
-    #         destino final es GitHub y los datos son confidenciales).
-    # True  = descarga el .twbx completo con datos.
-    "INCLUIR_EXTRACTO": False,
- 
-    # --- Filtros opcionales ---
-    # Lista de proyectos raiz a incluir; vacia = todos.
-    # Ejemplo: ["Production", "Control Interno"]
-    "PROYECTOS_RAIZ": [],
- 
-    # Proyectos a excluir por nombre exacto (en cualquier nivel).
-    # Util para saltarse "Admin Insights", papeleras, etc.
-    "PROYECTOS_EXCLUIDOS": ["Admin Insights"],
- 
-    # --- Modo: "api" (recomendado) o "tabcmd" ---
-    "MODO": "api",
- 
-    # --- Solo para MODO tabcmd ---
+
+    # tabcmd
     "TABCMD_EXE": r"C:\Program Files\Tableau\Tableau Server\packages\bin\tabcmd.exe",
+    "TABCMD_SERVER": "https://dub01.online.tableau.com",
+    "TABCMD_SITE": "cantabrialabscorporatebi",
+
+    # Autenticacion Tableau
+    "TABLEAU_USER": os.environ.get("TABLEAU_USER", "usuario@empresa.com"),
+    "TABLEAU_PASS": os.environ.get("TABLEAU_PASS", "password"),
+    # O usar PAT (recomendado):
+    "TABLEAU_PAT_NAME": os.environ.get("TABLEAU_PAT_NAME", ""),
+    "TABLEAU_PAT_SECRET": os.environ.get("TABLEAU_PAT_SECRET", ""),
 }
- 
+
 # ============================================================
 # LOGGING
 # ============================================================
- 
-log_file = Path(CONFIG["CARPETA_DESTINO"]).parent / "descarga_workbooks.log"
+
+log_file = Path(CONFIG["CARPETA_DESTINO"]).parent / "descarga_tabcmd.log"
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -93,204 +88,241 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger(__name__)
- 
- 
+
+
 # ============================================================
-# UTILIDADES
+# LEER DATOS DE ORACLE
 # ============================================================
- 
-def limpiar_nombre(nombre: str) -> str:
+
+def obtener_workbooks_desde_sql(conn_str: str, tabla: str) -> list:
     """
-    Convierte un nombre de proyecto/workbook en un nombre valido de carpeta
-    o archivo en Windows: elimina caracteres prohibidos, espacios y puntos
-    finales, y recorta espacios sobrantes.
+    Conecta a Oracle y ejecuta la consulta jerárquica.
+    Devuelve lista de workbooks (dicts con: luid, nombre, ruta, tipo).
     """
-    nombre = nombre.strip()
-    nombre = re.sub(r'[<>:"/\\|?*]', "_", nombre)   # caracteres prohibidos
-    nombre = re.sub(r"\s+", " ", nombre)            # espacios multiples
-    nombre = nombre.rstrip(". ")                    # Windows no admite punto/espacio final
-    return nombre or "_sin_nombre_"
- 
- 
-# ============================================================
-# MODO API (tableauserverclient)
-# ============================================================
- 
-def descargar_via_api():
-    import tableauserverclient as TSC
- 
-    auth = TSC.PersonalAccessTokenAuth(
-        token_name=CONFIG["PAT_NAME"],
-        personal_access_token=CONFIG["PAT_SECRET"],
-        site_id=CONFIG["SITE_ID"],
+    try:
+        user_pass, host_sid = conn_str.split("@")
+        user, password = user_pass.split("/")
+        host, port_sid = host_sid.split(":")
+        port, sid = port_sid.split("/")
+        port = int(port)
+    except Exception as e:
+        logger.error("Formato conexion invalido (usa user/pass@host:port/sid): %s", e)
+        return []
+
+    logger.info("Conectando a Oracle: %s@%s:%d/%s", user, host, port, sid)
+
+    try:
+        con = oracledb.connect(
+            user=user, password=password,
+            dsn=oracledb.make_dsn(host=host, port=port, service_name=sid)
+        )
+    except Exception as e:
+        logger.error("Fallo conexion Oracle: %s", e)
+        return []
+
+    # Consulta: jerarquía completa
+    sql = f"""
+    WITH proyectos AS (
+        SELECT item_id, item_name, item_parent_project_id AS parent_id
+        FROM {tabla}
+        WHERE item_type = 'Project'
+    ),
+    rutas_jerarquicas AS (
+        SELECT
+            item_id, item_name, parent_id,
+            LTRIM(SYS_CONNECT_BY_PATH(item_name, '/'), '/') AS ruta_completa,
+            LEVEL AS profundidad
+        FROM proyectos
+        START WITH parent_id IS NULL
+        CONNECT BY PRIOR item_id = parent_id
     )
-    server = TSC.Server(CONFIG["SERVER_URL"], use_server_version=True)
- 
+    SELECT
+        w.item_luid, w.item_name, rj.ruta_completa,
+        'WORKBOOK' AS tipo
+    FROM {tabla} w
+    JOIN rutas_jerarquicas rj ON rj.item_id = w.item_parent_project_id
+    WHERE w.item_type = 'Workbook'
+    ORDER BY rj.ruta_completa, w.item_name
+    """
+
+    cur = con.cursor()
+    cur.execute(sql)
+
+    workbooks = []
+    for luid, nombre, ruta, tipo in cur.fetchall():
+        workbooks.append({
+            "luid": luid,
+            "nombre": nombre,
+            "ruta_proyecto": ruta,
+            "ruta_local_destino": f"{ruta}/{nombre}",  # Sera nombre.twbx al guardar
+        })
+
+    con.close()
+    logger.info("Obtenidos %d workbooks de Oracle", len(workbooks))
+    return workbooks
+
+
+# ============================================================
+# GESTIONAR TABCMD
+# ============================================================
+
+def login_tabcmd() -> bool:
+    """Login en tabcmd. Devuelve True si exitoso."""
+    cmd = [CONFIG["TABCMD_EXE"], "login"]
+    cmd.extend(["-s", CONFIG["TABCMD_SERVER"]])
+    cmd.extend(["-t", CONFIG["TABCMD_SITE"]])
+
+    # Prioridad: PAT > usuario/contraseña
+    if CONFIG["TABLEAU_PAT_NAME"] and CONFIG["TABLEAU_PAT_SECRET"]:
+        cmd.extend(["--token-name", CONFIG["TABLEAU_PAT_NAME"]])
+        cmd.extend(["--token-value", CONFIG["TABLEAU_PAT_SECRET"]])
+        logger.info("Login tabcmd con PAT")
+    else:
+        cmd.extend(["-u", CONFIG["TABLEAU_USER"]])
+        cmd.extend(["-p", CONFIG["TABLEAU_PASS"]])
+        logger.info("Login tabcmd con usuario/contraseña")
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        logger.error("Fallo login tabcmd:\n%s", result.stderr)
+        return False
+
+    logger.info("Login OK")
+    return True
+
+
+def logout_tabcmd() -> bool:
+    """Logout de tabcmd."""
+    cmd = [CONFIG["TABCMD_EXE"], "logout"]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        logger.warning("Logout tabcmd: %s", result.stderr)
+        return False
+    logger.info("Logout OK")
+    return True
+
+
+def descargar_workbook_tabcmd(luid: str, nombre: str, ruta_local: Path) -> bool:
+    """
+    Ejecuta: tabcmd get <luid> -f "ruta_local/nombre.twbx"
+    Devuelve True si exitoso.
+    """
+    # Asegurar extension .twbx
+    if not nombre.lower().endswith(".twbx"):
+        nombre = f"{nombre}.twbx"
+
+    ruta_archivo = ruta_local / nombre
+
+    cmd = [CONFIG["TABCMD_EXE"], "get", luid, "-f", str(ruta_archivo)]
+
+    logger.info("  Descargando [tabcmd get %s] -> %s", luid, ruta_archivo.name)
+
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    if result.returncode != 0:
+        logger.error("    ERROR: %s", result.stderr.strip() if result.stderr else "Codigo error")
+        return False
+
+    logger.info("    OK")
+    return True
+
+
+# ============================================================
+# DESCARGA PRINCIPAL
+# ============================================================
+
+def descargar_todos():
+    """
+    Flujo principal:
+    1. Lee SQL → lista de workbooks
+    2. Login tabcmd
+    3. Para cada workbook: crea carpeta + descarga
+    4. Logout
+    """
     destino_raiz = Path(CONFIG["CARPETA_DESTINO"])
     destino_raiz.mkdir(parents=True, exist_ok=True)
- 
-    ok, errores, saltados = 0, 0, 0
- 
-    with server.auth.sign_in(auth):
-        logger.info("Sesion iniciada en %s (site: %s)",
-                    CONFIG["SERVER_URL"], CONFIG["SITE_ID"])
- 
-        # ----------------------------------------------------
-        # 1. Descargar la jerarquia completa de proyectos
-        # ----------------------------------------------------
-        proyectos = list(TSC.Pager(server.projects))
-        por_id = {p.id: p for p in proyectos}
-        logger.info("Proyectos encontrados: %d", len(proyectos))
- 
-        def ruta_proyecto(project_id: str) -> list[str]:
-            """Devuelve la ruta completa de un proyecto como lista de nombres,
-            desde la raiz hasta el propio proyecto."""
-            partes = []
-            actual = por_id.get(project_id)
-            while actual is not None:
-                partes.append(limpiar_nombre(actual.name))
-                actual = por_id.get(actual.parent_id) if actual.parent_id else None
-            return list(reversed(partes))
- 
-        # ----------------------------------------------------
-        # 2. Recorrer todos los workbooks y descargarlos
-        # ----------------------------------------------------
-        for wb in TSC.Pager(server.workbooks):
-            partes_ruta = ruta_proyecto(wb.project_id)
- 
-            # Filtro de proyectos excluidos
-            if any(p in CONFIG["PROYECTOS_EXCLUIDOS"] for p in partes_ruta):
-                saltados += 1
-                continue
- 
-            # Filtro de proyectos raiz
-            if CONFIG["PROYECTOS_RAIZ"] and (
-                not partes_ruta or partes_ruta[0] not in CONFIG["PROYECTOS_RAIZ"]
-            ):
-                saltados += 1
-                continue
- 
-            carpeta = destino_raiz.joinpath(*partes_ruta)
-            carpeta.mkdir(parents=True, exist_ok=True)
- 
-            nombre_archivo = limpiar_nombre(wb.name)
-            ruta_final = carpeta / nombre_archivo  # TSC anade la extension
- 
-            try:
-                fichero = server.workbooks.download(
-                    wb.id,
-                    filepath=str(ruta_final),
-                    include_extract=CONFIG["INCLUIR_EXTRACTO"],
-                )
-                ok += 1
-                logger.info("OK  [%s] -> %s", wb.name,
-                            Path(fichero).relative_to(destino_raiz))
-            except Exception as e:
-                errores += 1
-                logger.error("ERROR descargando '%s' (%s): %s", wb.name, wb.id, e)
- 
-    logger.info("=" * 60)
-    logger.info("Descarga finalizada: %d correctos, %d errores, %d saltados",
-                ok, errores, saltados)
-    return errores == 0
- 
- 
-# ============================================================
-# MODO TABCMD (alternativo)
-# ============================================================
- 
-def descargar_via_tabcmd():
-    """
-    Igual que el modo API pero la descarga fisica la hace tabcmd.
-    Se usa la API SOLO para obtener la lista de workbooks, su content_url
-    (imprescindible para 'tabcmd get') y la jerarquia de proyectos.
-    """
-    import tableauserverclient as TSC
- 
-    tabcmd = CONFIG["TABCMD_EXE"]
-    if not Path(tabcmd).exists():
-        logger.error("No se encuentra tabcmd en: %s", tabcmd)
-        return False
- 
-    # Login de tabcmd con el mismo PAT
-    login = subprocess.run(
-        [tabcmd, "login",
-         "-s", CONFIG["SERVER_URL"],
-         "-t", CONFIG["SITE_ID"],
-         "--token-name", CONFIG["PAT_NAME"],
-         "--token-value", CONFIG["PAT_SECRET"]],
-        capture_output=True, text=True,
+
+    # Leer SQL
+    workbooks = obtener_workbooks_desde_sql(
+        CONFIG["ORACLE_CONN_STR"],
+        CONFIG["TABLA_ITEMS"]
     )
-    if login.returncode != 0:
-        logger.error("Fallo el login de tabcmd:\n%s", login.stderr)
+
+    if not workbooks:
+        logger.error("No se obtuvieron workbooks de SQL")
         return False
-    logger.info("Login de tabcmd correcto")
- 
-    auth = TSC.PersonalAccessTokenAuth(
-        CONFIG["PAT_NAME"], CONFIG["PAT_SECRET"], site_id=CONFIG["SITE_ID"])
-    server = TSC.Server(CONFIG["SERVER_URL"], use_server_version=True)
- 
-    destino_raiz = Path(CONFIG["CARPETA_DESTINO"])
-    destino_raiz.mkdir(parents=True, exist_ok=True)
+
+    # Verificar tabcmd
+    if not Path(CONFIG["TABCMD_EXE"]).exists():
+        logger.error("tabcmd no encontrado: %s", CONFIG["TABCMD_EXE"])
+        return False
+
+    # Login
+    if not login_tabcmd():
+        return False
+
     ok, errores = 0, 0
- 
-    with server.auth.sign_in(auth):
-        proyectos = list(TSC.Pager(server.projects))
-        por_id = {p.id: p for p in proyectos}
- 
-        def ruta_proyecto(pid):
-            partes, actual = [], por_id.get(pid)
-            while actual:
-                partes.append(limpiar_nombre(actual.name))
-                actual = por_id.get(actual.parent_id) if actual.parent_id else None
-            return list(reversed(partes))
- 
-        for wb in TSC.Pager(server.workbooks):
-            partes = ruta_proyecto(wb.project_id)
-            if any(p in CONFIG["PROYECTOS_EXCLUIDOS"] for p in partes):
-                continue
- 
-            carpeta = destino_raiz.joinpath(*partes)
+
+    try:
+        for wb in workbooks:
+            luid = wb["luid"]
+            nombre = wb["nombre"]
+            ruta_proyecto = wb["ruta_proyecto"]
+
+            # Crear carpeta local
+            carpeta = destino_raiz / ruta_proyecto.replace("/", "\\")
             carpeta.mkdir(parents=True, exist_ok=True)
-            salida = carpeta / f"{limpiar_nombre(wb.name)}.twbx"
- 
-            cmd = [tabcmd, "get",
-                   f"/workbooks/{wb.content_url}.twbx",
-                   "-f", str(salida)]
-            res = subprocess.run(cmd, capture_output=True, text=True)
-            if res.returncode == 0:
+
+            # Descargar
+            if descargar_workbook_tabcmd(luid, nombre, carpeta):
                 ok += 1
-                logger.info("OK  [tabcmd] %s", salida.relative_to(destino_raiz))
             else:
                 errores += 1
-                logger.error("ERROR [tabcmd] %s:\n%s", wb.name, res.stderr)
- 
-    subprocess.run([tabcmd, "logout"], capture_output=True)
-    logger.info("tabcmd: %d correctos, %d errores", ok, errores)
+
+    finally:
+        logout_tabcmd()
+
+    logger.info("=" * 60)
+    logger.info("Descarga finalizada: %d OK, %d errores", ok, errores)
+    logger.info("Archivos en: %s", destino_raiz)
+
     return errores == 0
- 
- 
+
+
 # ============================================================
 # MAIN
 # ============================================================
- 
+
 def main():
+    parser = argparse.ArgumentParser(
+        description="Descarga workbooks de Tableau via tabcmd (SQL + Python)"
+    )
+    parser.add_argument(
+        "--oracle", default=CONFIG["ORACLE_CONN_STR"],
+        help="Conexion Oracle (user/pass@host:port/sid)"
+    )
+    parser.add_argument(
+        "--tabcmd", default=CONFIG["TABCMD_EXE"],
+        help="Ruta a tabcmd.exe"
+    )
+    parser.add_argument(
+        "--destino", default=CONFIG["CARPETA_DESTINO"],
+        help="Carpeta destino para workbooks"
+    )
+    args = parser.parse_args()
+
+    # Actualizar config
+    CONFIG["ORACLE_CONN_STR"] = args.oracle
+    CONFIG["TABCMD_EXE"] = args.tabcmd
+    CONFIG["CARPETA_DESTINO"] = args.destino
+
     logger.info("=" * 60)
-    logger.info("DESCARGA DE WORKBOOKS DE TABLEAU - %s",
-                datetime.now().strftime("%d/%m/%Y %H:%M:%S"))
-    logger.info("Modo: %s | Extracto de datos: %s",
-                CONFIG["MODO"], CONFIG["INCLUIR_EXTRACTO"])
+    logger.info("DESCARGA VIA TABCMD (SQL + Python)")
+    logger.info("Fecha: %s", datetime.now().strftime("%d/%m/%Y %H:%M:%S"))
     logger.info("=" * 60)
- 
-    if "PON_AQUI" in CONFIG["PAT_NAME"] or "PON_AQUI" in CONFIG["PAT_SECRET"]:
-        logger.error("Falta configurar el Personal Access Token "
-                     "(variables TABLEAU_PAT_NAME / TABLEAU_PAT_SECRET).")
-        sys.exit(1)
- 
-    exito = descargar_via_api() if CONFIG["MODO"] == "api" else descargar_via_tabcmd()
+
+    exito = descargar_todos()
     sys.exit(0 if exito else 1)
- 
- 
+
+
 if __name__ == "__main__":
     main()
- 

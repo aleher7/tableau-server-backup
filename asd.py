@@ -1,337 +1,186 @@
 #!/usr/bin/env python3
 """
-DESCARGA DE WORKBOOKS VIA TABCMD (orquestado por SQL + Python)
+Sincroniza la carpeta local de workbooks de Tableau con GitHub.
 
-Arquitectura:
-    Oracle (Admin Insights)
-        ↓
-    consulta_rutas_oracle_mejorada.sql
-        ↓
-    Python (este script)
-        ├─ Lee SQL
-        ├─ Obtiene: LUID, nombre, ruta_proyecto, tipo_item
-        ├─ Crea carpetas locales
-        └─ Ejecuta: tabcmd get <LUID> -f "ruta/local/archivo.twbx"
-        ↓
-    C:\Users\...\Tableau Workbooks (estructura replicada)
+CAMBIOS RESPECTO A LA VERSION ANTERIOR
+--------------------------------------
+1. Ya NO es un monitor infinito (while True): se ejecuta UNA vez y termina.
+   Asi se puede encadenar tras la descarga diaria en el Programador de
+   tareas:  descargar_workbooks.py  ->  subir_github.py
+2. Detecta archivos NUEVOS y tambien MODIFICADOS (antes solo nuevos,
+   porque usaba un set de rutas ya procesadas en memoria).
+3. Hace UN solo commit con todos los cambios del dia (mas limpio que un
+   commit por archivo) y un unico push.
+4. MODO PRUEBA: con --test "ruta/al/archivo.twbx" sube UN solo archivo,
+   para validar el flujo antes de subirlo todo (datos confidenciales).
 
-REQUISITOS
-----------
-    pip install oracledb gitpython
+USO
+---
+    # Prueba con un unico archivo (recomendado la primera vez):
+    python subir_github.py --test "Production\\Supply Chain\\Servicio.twbx"
 
-TABCMD
-------
-    Debe estar instalado y en PATH o en ruta específica.
-    Aceptamos tanto LUID como content_url:
-        tabcmd get <luid> -f "ruta/archivo.twbx"
-        tabcmd get /workbooks/<content_url>.twbx -f "ruta/archivo.twbx"
-
-CONEXION ORACLE
----------------
-    Formato: user/pass@host:port/service_name
-    Ejemplo: admin/password@localhost:1521/orcl
+    # Sincronizacion completa (uso diario):
+    python subir_github.py
 """
 
 import os
 import sys
+import shutil
 import logging
-import subprocess
 import argparse
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
 
-try:
-    import oracledb
-except ImportError:
-    print("ERROR: pip install oracledb")
-    sys.exit(1)
+import git
 
 # ============================================================
 # CONFIGURACION
 # ============================================================
 
-CONFIG = {
-    # Oracle: conexion y tabla
-    "ORACLE_CONN_STR": os.environ.get(
-        "TABLEAU_ORACLE_CONN",
-        "admin/password@localhost:1521/orcl"
-    ),
-    "TABLA_ITEMS": "tableau_items",
+# Carpeta donde descarga los workbooks descargar_workbooks.py
+SOURCE_PATH = r"C:\Users\alejandro.romaguera\Documents\Tableau Workbooks"
 
-    # Carpeta local destino
-    "CARPETA_DESTINO": r"C:\Users\alejandro.romaguera\Documents\Tableau Workbooks",
+# Carpeta del repositorio Git (por defecto, la carpeta actual)
+REPO_PATH = os.getcwd()
 
-    # tabcmd
-    "TABCMD_EXE": r"C:\Program Files\Tableau\Tableau Server\packages\bin\tabcmd.exe",
-    "TABCMD_SERVER": "https://dub01.online.tableau.com",
-    "TABCMD_SITE": "cantabrialabscorporatebi",
+# Subcarpeta del repositorio donde se guardan los workbooks
+DEST_SUBFOLDER = "workbooks"
 
-    # Autenticacion Tableau
-    "TABLEAU_USER": os.environ.get("TABLEAU_USER", "usuario@empresa.com"),
-    "TABLEAU_PASS": os.environ.get("TABLEAU_PASS", "password"),
-    # O usar PAT (recomendado):
-    "TABLEAU_PAT_NAME": os.environ.get("TABLEAU_PAT_NAME", ""),
-    "TABLEAU_PAT_SECRET": os.environ.get("TABLEAU_PAT_SECRET", ""),
-}
+# Extensiones a sincronizar
+EXTENSIONES = (".twbx", ".twb")
 
 # ============================================================
 # LOGGING
 # ============================================================
 
-log_file = Path(CONFIG["CARPETA_DESTINO"]).parent / "descarga_tabcmd.log"
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler(log_file, encoding="utf-8"),
-    ],
 )
 logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# LEER DATOS DE ORACLE
+# FUNCIONES
 # ============================================================
 
-def obtener_workbooks_desde_sql(conn_str: str, tabla: str) -> list:
+def copiar_al_repo(origen: Path, source_root: Path, repo_root: Path) -> str:
     """
-    Conecta a Oracle y ejecuta la consulta jerárquica.
-    Devuelve lista de workbooks (dicts con: luid, nombre, ruta, tipo).
+    Copia un archivo al repositorio conservando las subcarpetas y
+    devuelve su ruta relativa dentro del repo (con barras de Git).
     """
-    try:
-        user_pass, host_sid = conn_str.split("@")
-        user, password = user_pass.split("/")
-        host, port_sid = host_sid.split(":")
-        port, sid = port_sid.split("/")
-        port = int(port)
-    except Exception as e:
-        logger.error("Formato conexion invalido (usa user/pass@host:port/sid): %s", e)
-        return []
-
-    logger.info("Conectando a Oracle: %s@%s:%d/%s", user, host, port, sid)
-
-    try:
-        con = oracledb.connect(
-            user=user, password=password,
-            dsn=oracledb.make_dsn(host=host, port=port, service_name=sid)
-        )
-    except Exception as e:
-        logger.error("Fallo conexion Oracle: %s", e)
-        return []
-
-    # Consulta: jerarquía completa
-    sql = f"""
-    WITH proyectos AS (
-        SELECT item_id, item_name, item_parent_project_id AS parent_id
-        FROM {tabla}
-        WHERE item_type = 'Project'
-    ),
-    rutas_jerarquicas AS (
-        SELECT
-            item_id, item_name, parent_id,
-            LTRIM(SYS_CONNECT_BY_PATH(item_name, '/'), '/') AS ruta_completa,
-            LEVEL AS profundidad
-        FROM proyectos
-        START WITH parent_id IS NULL
-        CONNECT BY PRIOR item_id = parent_id
-    )
-    SELECT
-        w.item_luid, w.item_name, rj.ruta_completa,
-        'WORKBOOK' AS tipo
-    FROM {tabla} w
-    JOIN rutas_jerarquicas rj ON rj.item_id = w.item_parent_project_id
-    WHERE w.item_type = 'Workbook'
-    ORDER BY rj.ruta_completa, w.item_name
-    """
-
-    cur = con.cursor()
-    cur.execute(sql)
-
-    workbooks = []
-    for luid, nombre, ruta, tipo in cur.fetchall():
-        workbooks.append({
-            "luid": luid,
-            "nombre": nombre,
-            "ruta_proyecto": ruta,
-            "ruta_local_destino": f"{ruta}/{nombre}",  # Sera nombre.twbx al guardar
-        })
-
-    con.close()
-    logger.info("Obtenidos %d workbooks de Oracle", len(workbooks))
-    return workbooks
+    rel = origen.relative_to(source_root)
+    destino = repo_root / DEST_SUBFOLDER / rel
+    destino.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(origen, destino)
+    return str(Path(DEST_SUBFOLDER) / rel).replace("\\", "/")
 
 
-# ============================================================
-# GESTIONAR TABCMD
-# ============================================================
+def archivo_cambiado(origen: Path, source_root: Path, repo_root: Path) -> bool:
+    """True si el archivo no existe en el repo o su contenido difiere
+    (comparacion rapida por tamano y fecha de modificacion)."""
+    destino = repo_root / DEST_SUBFOLDER / origen.relative_to(source_root)
+    if not destino.exists():
+        return True
+    o, d = origen.stat(), destino.stat()
+    return o.st_size != d.st_size or int(o.st_mtime) > int(d.st_mtime)
 
-def login_tabcmd() -> bool:
-    """Login en tabcmd. Devuelve True si exitoso."""
-    cmd = [CONFIG["TABCMD_EXE"], "login"]
-    cmd.extend(["-s", CONFIG["TABCMD_SERVER"]])
-    cmd.extend(["-t", CONFIG["TABCMD_SITE"]])
-
-    # Prioridad: PAT > usuario/contraseña
-    if CONFIG["TABLEAU_PAT_NAME"] and CONFIG["TABLEAU_PAT_SECRET"]:
-        cmd.extend(["--token-name", CONFIG["TABLEAU_PAT_NAME"]])
-        cmd.extend(["--token-value", CONFIG["TABLEAU_PAT_SECRET"]])
-        logger.info("Login tabcmd con PAT")
-    else:
-        cmd.extend(["-u", CONFIG["TABLEAU_USER"]])
-        cmd.extend(["-p", CONFIG["TABLEAU_PASS"]])
-        logger.info("Login tabcmd con usuario/contraseña")
-
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        logger.error("Fallo login tabcmd:\n%s", result.stderr)
-        return False
-
-    logger.info("Login OK")
-    return True
-
-
-def logout_tabcmd() -> bool:
-    """Logout de tabcmd."""
-    cmd = [CONFIG["TABCMD_EXE"], "logout"]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        logger.warning("Logout tabcmd: %s", result.stderr)
-        return False
-    logger.info("Logout OK")
-    return True
-
-
-def descargar_workbook_tabcmd(nombre: str, ruta_local: Path) -> bool:
-    """
-    Ejecuta: tabcmd get "/workbooks/{nombre}.twbx" -f "ruta_local/nombre.twbx"
-    
-    NOTA: Usa content_url (nombre del workbook) en lugar de LUID.
-    Esto es lo que el usuario probó y funciona.
-    
-    Devuelve True si exitoso.
-    """
-    # Asegurar extension .twbx
-    if not nombre.lower().endswith(".twbx"):
-        nombre_archivo = f"{nombre}.twbx"
-    else:
-        nombre_archivo = nombre
-
-    ruta_archivo = ruta_local / nombre_archivo
-    
-    # Formato que el usuario probó y funciona:
-    # tabcmd get "/workbooks/{nombre}.twbx" -f "ruta_local/nombre.twbx"
-    content_url = f"/workbooks/{nombre_archivo}"
-
-    cmd = [CONFIG["TABCMD_EXE"], "get", content_url, "-f", str(ruta_archivo)]
-
-    logger.info("  Descargando [tabcmd get %s] -> %s", content_url, nombre_archivo)
-
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-    if result.returncode != 0:
-        logger.error("    ERROR: %s", result.stderr.strip() if result.stderr else "Codigo error")
-        return False
-
-    logger.info("    OK")
-    return True
-
-
-# ============================================================
-# DESCARGA PRINCIPAL
-# ============================================================
-
-def descargar_todos():
-    """
-    Flujo principal:
-    1. Lee SQL → lista de workbooks
-    2. Login tabcmd
-    3. Para cada workbook: crea carpeta + descarga
-    4. Logout
-    """
-    destino_raiz = Path(CONFIG["CARPETA_DESTINO"])
-    destino_raiz.mkdir(parents=True, exist_ok=True)
-
-    # Leer SQL
-    workbooks = obtener_workbooks_desde_sql(
-        CONFIG["ORACLE_CONN_STR"],
-        CONFIG["TABLA_ITEMS"]
-    )
-
-    if not workbooks:
-        logger.error("No se obtuvieron workbooks de SQL")
-        return False
-
-    # Verificar tabcmd
-    if not Path(CONFIG["TABCMD_EXE"]).exists():
-        logger.error("tabcmd no encontrado: %s", CONFIG["TABCMD_EXE"])
-        return False
-
-    # Login
-    if not login_tabcmd():
-        return False
-
-    ok, errores = 0, 0
-
-    try:
-        for wb in workbooks:
-            nombre = wb["nombre"]
-            ruta_proyecto = wb["ruta_proyecto"]
-
-            # Crear carpeta local
-            carpeta = destino_raiz / ruta_proyecto.replace("/", "\\")
-            carpeta.mkdir(parents=True, exist_ok=True)
-
-            # Descargar con nombre de archivo
-            # (tabcmd usa el nombre del workbook como content_url)
-            if descargar_workbook_tabcmd(nombre, carpeta):
-                ok += 1
-            else:
-                errores += 1
-
-    finally:
-        logout_tabcmd()
-
-    logger.info("=" * 60)
-    logger.info("Descarga finalizada: %d OK, %d errores", ok, errores)
-    logger.info("Archivos en: %s", destino_raiz)
-
-    return errores == 0
-
-
-# ============================================================
-# MAIN
-# ============================================================
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Descarga workbooks de Tableau via tabcmd (SQL + Python)"
-    )
+        description="Sincroniza workbooks de Tableau con GitHub")
     parser.add_argument(
-        "--oracle", default=CONFIG["ORACLE_CONN_STR"],
-        help="Conexion Oracle (user/pass@host:port/sid)"
-    )
+        "--test", metavar="ARCHIVO",
+        help="Modo prueba: sube UN solo archivo (ruta relativa a la "
+             "carpeta de workbooks, p. ej. 'Production\\Supply Chain\\Servicio.twbx')")
     parser.add_argument(
-        "--tabcmd", default=CONFIG["TABCMD_EXE"],
-        help="Ruta a tabcmd.exe"
-    )
-    parser.add_argument(
-        "--destino", default=CONFIG["CARPETA_DESTINO"],
-        help="Carpeta destino para workbooks"
-    )
+        "--no-push", action="store_true",
+        help="Hace el commit pero NO hace push (para revisar antes)")
     args = parser.parse_args()
 
-    # Actualizar config
-    CONFIG["ORACLE_CONN_STR"] = args.oracle
-    CONFIG["TABCMD_EXE"] = args.tabcmd
-    CONFIG["CARPETA_DESTINO"] = args.destino
+    source_root = Path(SOURCE_PATH)
+    repo_root = Path(REPO_PATH)
 
     logger.info("=" * 60)
-    logger.info("DESCARGA VIA TABCMD (SQL + Python)")
-    logger.info("Fecha: %s", datetime.now().strftime("%d/%m/%Y %H:%M:%S"))
+    logger.info("Sincronizacion Tableau -> GitHub  (%s)",
+                "MODO PRUEBA: 1 archivo" if args.test else "completa")
+    logger.info("Origen:      %s", source_root)
+    logger.info("Repositorio: %s", repo_root)
     logger.info("=" * 60)
 
-    exito = descargar_todos()
-    sys.exit(0 if exito else 1)
+    # --- Validaciones ---
+    try:
+        repo = git.Repo(repo_root)
+    except Exception as e:
+        logger.error("No es un repositorio Git valido: %s", e)
+        sys.exit(1)
+
+    if not source_root.exists():
+        logger.error("La carpeta de origen NO existe: %s", source_root)
+        sys.exit(1)
+
+    # --- Seleccionar archivos a subir ---
+    if args.test:
+        candidato = source_root / args.test
+        if not candidato.exists():
+            logger.error("El archivo de prueba no existe: %s", candidato)
+            sys.exit(1)
+        archivos = [candidato]
+    else:
+        archivos = [
+            p for p in source_root.rglob("*")
+            if p.suffix.lower() in EXTENSIONES
+            and archivo_cambiado(p, source_root, repo_root)
+        ]
+
+    if not archivos:
+        logger.info("No hay cambios que subir. Fin.")
+        return
+
+    logger.info("Archivos a sincronizar: %d", len(archivos))
+
+    # --- Copiar y anadir a Git ---
+    rutas_git = []
+    for f in archivos:
+        try:
+            ruta = copiar_al_repo(f, source_root, repo_root)
+            rutas_git.append(ruta)
+            logger.info("  + %s", ruta)
+        except Exception as e:
+            logger.error("Error copiando %s: %s", f, e)
+
+    if not rutas_git:
+        logger.error("Ningun archivo se pudo copiar. Fin.")
+        sys.exit(1)
+
+    repo.index.add(rutas_git)
+
+    if not repo.index.diff("HEAD") and not repo.untracked_files:
+        logger.info("Los archivos son identicos a los del repositorio. "
+                    "No se crea commit.")
+        return
+
+    # --- Commit ---
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if args.test:
+        msg = f"[PRUEBA] {rutas_git[0]} - {timestamp}"
+    else:
+        msg = f"[SYNC] {len(rutas_git)} workbook(s) actualizados - {timestamp}"
+    repo.index.commit(msg)
+    logger.info("Commit creado: %s", msg)
+
+    # --- Push ---
+    if args.no_push:
+        logger.info("--no-push activado: revisa el commit y haz "
+                    "'git push' manualmente cuando quieras.")
+        return
+
+    try:
+        repo.remote("origin").push()
+        logger.info("Push a GitHub correcto")
+    except Exception as e:
+        logger.error("Error en el push: %s", e)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

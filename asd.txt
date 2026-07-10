@@ -1,0 +1,65 @@
+WITH proyectos AS (
+    -- Todos los proyectos (carpetas): forman el arbol
+    SELECT
+        item_id,
+        item_name,
+        item_parent_project_id AS parent_id
+    FROM tableau_items
+    WHERE item_type = 'Project'
+),
+rutas_jerarquicas AS (
+    -- Recorrido jerarquico: construye ruta completa de cada proyecto
+    -- Incluyendo proyectos intermedios sin workbooks directos
+    SELECT
+        item_id,
+        item_name,
+        parent_id,
+        LTRIM(SYS_CONNECT_BY_PATH(item_name, '/'), '/') AS ruta_completa,
+        LEVEL AS profundidad
+    FROM proyectos
+    START WITH parent_id IS NULL          -- proyectos raiz
+    CONNECT BY PRIOR item_id = parent_id
+)
+ 
+-- ==========================================================
+-- PARTE 1: WORKBOOKS (cada uno con su ruta completa)
+-- ==========================================================
+SELECT
+    w.item_luid                                   AS workbook_luid,
+    w.item_name                                   AS workbook,
+    rj.ruta_completa                              AS ruta_proyecto,
+    rj.ruta_completa || '/' || w.item_name        AS ruta_local_destino,
+    w.owner_email,
+    w.updated_at_loc_hora                         AS ultima_actualizacion,
+    'WORKBOOK' AS tipo_item,
+    'SÍ' AS descargar
+FROM tableau_items w
+JOIN rutas_jerarquicas rj
+  ON rj.item_id = w.item_parent_project_id
+WHERE w.item_type = 'Workbook'
+ 
+UNION ALL
+ 
+-- ==========================================================
+-- PARTE 2: CONTROL - Proyectos intermedios sin workbooks
+-- ==========================================================
+-- Esto te permite verificar que NINGUNA carpeta intermedia se pierde
+SELECT
+    NULL AS workbook_luid,
+    'N/A (carpeta intermedia)' AS workbook,
+    rj.ruta_completa AS ruta_proyecto,
+    rj.ruta_completa AS ruta_local_destino,
+    'N/A' AS owner_email,
+    NULL AS ultima_actualizacion,
+    'CARPETA INTERMEDIA' AS tipo_item,
+    'Solo crear la carpeta' AS descargar
+FROM rutas_jerarquicas rj
+WHERE NOT EXISTS (
+    -- Excluir si tiene workbooks DIRECTOS (ya salen en la PARTE 1)
+    SELECT 1
+    FROM tableau_items w
+    WHERE w.item_type = 'Workbook'
+      AND w.item_parent_project_id = rj.item_id
+)
+ 
+ORDER BY ruta_local_destino, workbook, tipo_item;

@@ -121,12 +121,23 @@ def leer_archivo_datos(ruta_archivo):
         
         # Buscar columnas de forma flexible (sin importar espacios/comillas)
         def buscar_columna(df, patrones):
-            """Busca una columna que contenga uno de los patrones"""
+            """Busca una columna que contenga uno de los patrones (búsqueda exacta primero)"""
+            # Primero intentar coincidencia exacta
             for col in df.columns:
                 col_limpio = col.strip().upper().replace('"', '')
                 for patron in patrones:
-                    if patron.upper() in col_limpio:
-                        logger.info("[MAPEO] Columna '%s' mapeada a '%s'", col, patron)
+                    if col_limpio == patron.upper():
+                        logger.info("[MAPEO] Columna '%s' mapeada a '%s' (coincidencia exacta)", col, patron)
+                        return col
+            
+            # Si no encuentra exacta, buscar parcial (pero más específica)
+            for col in df.columns:
+                col_limpio = col.strip().upper().replace('"', '')
+                for patron in patrones:
+                    patron_upper = patron.upper()
+                    # Buscar el patrón pero evitar que WORKBOOK coincida con WORKBOOK_LUID
+                    if patron_upper in col_limpio and not (patron_upper == 'WORKBOOK' and 'LUID' in col_limpio):
+                        logger.info("[MAPEO] Columna '%s' mapeada a '%s' (coincidencia parcial)", col, patron)
                         return col
             return None
         

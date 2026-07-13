@@ -94,18 +94,27 @@ def leer_archivo_datos(ruta_archivo):
         
         # Detectar formato y leer
         if extension == '.dsv':
-            # DSV: delimitado por separador (tipicamente |, ;, \t)
-            df = pd.read_csv(ruta_archivo, sep='|', quotechar='"', skipinitialspace=True)
+            # DSV: usa pipe como separador, puede tener comillas en valores
+            # No usar quotechar para evitar confusiones
+            df = pd.read_csv(ruta_archivo, sep='|', quotechar=None, skipinitialspace=True)
         elif extension in ['.xlsx', '.xls']:
             # Excel
             df = pd.read_excel(ruta_archivo)
         elif extension == '.csv':
-            # CSV estándar
-            df = pd.read_csv(ruta_archivo)
+            # CSV: usa coma como separador
+            df = pd.read_csv(ruta_archivo, sep=',', quotechar='"', skipinitialspace=True)
         else:
-            # Por defecto intentar como CSV
-            logger.warning("[AVISO] Extension no reconocida, intentando como CSV")
-            df = pd.read_csv(ruta_archivo)
+            # Por defecto intentar como pipe DSV
+            logger.warning("[AVISO] Extension no reconocida, intentando como DSV con pipe")
+            df = pd.read_csv(ruta_archivo, sep='|', quotechar=None, skipinitialspace=True)
+        
+        # IMPORTANTE: Limpiar espacios y comillas de nombres de columnas
+        df.columns = [col.strip().replace('"', '') for col in df.columns]
+        
+        # IMPORTANTE: Limpiar comillas de TODOS los valores (strings)
+        for col in df.columns:
+            if df[col].dtype == 'object':  # Solo si es texto
+                df[col] = df[col].astype(str).str.replace('"', '', regex=False).str.strip()
         
         # IMPORTANTE: Limpiar espacios y comillas de nombres de columnas
         df.columns = [col.strip().replace('"', '') for col in df.columns]

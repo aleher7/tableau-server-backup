@@ -344,18 +344,74 @@ def mostrar_reporte(estadisticas, tiempo_total):
 # MAIN
 # ============================================================================
 
+def obtener_datos_inteligente(config):
+    """
+    Intenta obtener datos de Oracle primero.
+    Si falla, cae automáticamente a Excel (backup) en la misma ruta del script.
+    
+    Returns:
+        DataFrame con los datos y tipo de fuente (oracle/excel)
+    """
+    
+    fuente_datos = None
+    df = None
+    
+    # ========== PASO 1: INTENTAR ORACLE ==========
+    logger.info("\n🔗 Intentando conectar a Oracle...")
+    
+    if not ORACLE_AVAILABLE:
+        logger.warning("⚠️  oracledb no está instalado - saltando Oracle")
+    else:
+        try:
+            df = conectar_oracle(config)
+            fuente_datos = 'oracle'
+            logger.info("✅ ÉXITO: Datos obtenidos desde ORACLE")
+            return df, fuente_datos
+        except Exception as e:
+            logger.warning(f"⚠️  Oracle falló: {str(e)[:100]}")
+            logger.info("↓ Cayendo al backup (Excel)...")
+    
+    # ========== PASO 2: FALLBACK A EXCEL ==========
+    logger.info("\n📖 Buscando archivo Excel de backup...")
+    
+    # Buscar Excel en la misma ruta del script
+    directorio_script = Path(__file__).parent
+    archivos_excel = list(directorio_script.glob('*.xlsx'))
+    
+    if not archivos_excel:
+        logger.error("❌ No se encontró archivo Excel (.xlsx) en la carpeta del script")
+        logger.error(f"   Ubicación: {directorio_script}")
+        logger.error("   Coloca un archivo .xlsx con los workbooks")
+        sys.exit(1)
+    
+    # Si hay múltiples Excel, usar el primero o el especificado en config
+    if 'excel_backup_nombre' in config:
+        archivo_excel = directorio_script / config['excel_backup_nombre']
+    else:
+        # Usar el primer Excel encontrado (o el más reciente)
+        archivo_excel = sorted(archivos_excel, key=lambda x: x.stat().st_mtime, reverse=True)[0]
+    
+    if not archivo_excel.exists():
+        logger.error(f"❌ Archivo Excel no encontrado: {archivo_excel}")
+        sys.exit(1)
+    
+    logger.info(f"📖 Usando Excel de backup: {archivo_excel.name}")
+    
+    try:
+        df = leer_excel(str(archivo_excel))
+        fuente_datos = 'excel'
+        logger.info("✅ ÉXITO: Datos obtenidos desde EXCEL (backup)")
+        return df, fuente_datos
+    except Exception as e:
+        logger.error(f"❌ Error al leer Excel: {e}")
+        sys.exit(1)
+
 def main():
     """Función principal"""
     
     # Argumentos de línea de comandos
     parser = argparse.ArgumentParser(
-        description='Descarga workbooks Tableau desde Excel u Oracle y los sube a GitHub'
-    )
-    parser.add_argument(
-        '--modo',
-        choices=['excel', 'oracle'],
-        default='excel',
-        help='Fuente de datos: excel u oracle (default: excel)'
+        description='Descarga workbooks Tableau (intenta Oracle, fallback a Excel)'
     )
     parser.add_argument(
         '--config',
@@ -367,6 +423,11 @@ def main():
         action='store_true',
         help='Solo descargar, sin subir a GitHub'
     )
+    parser.add_argument(
+        '--forzar-excel',
+        action='store_true',
+        help='Forzar uso de Excel (sin intentar Oracle)'
+    )
     
     args = parser.parse_args()
     
@@ -376,35 +437,49 @@ def main():
     logger.info("📋 Cargando configuración...")
     config = cargar_config(args.config)
     
-    # Leer datos (Excel u Oracle)
-    logger.info(f"\n📊 Modo: {args.modo.upper()}")
+    # Obtener datos (Oracle con fallback a Excel)
+    logger.info(f"\n{'='*60}")
+    logger.info("OBTENER DATOS")
+    logger.info(f"{'='*60}")
     
-    if args.modo == 'excel':
-        if 'excel_ruta' not in config:
-            logger.error("❌ 'excel_ruta' no está en config.json")
+    if args.forzar_excel:
+        logger.info("🔧 Forzando Excel (--forzar-excel)")
+        directorio_script = Path(__file__).parent
+        archivos_excel = list(directorio_script.glob('*.xlsx'))
+        if not archivos_excel:
+            logger.error("❌ No hay archivos Excel en la carpeta del script")
             sys.exit(1)
-        df = leer_excel(config['excel_ruta'])
-    
-    elif args.modo == 'oracle':
-        if not ORACLE_AVAILABLE:
-            logger.error("❌ oracledb no está instalado")
-            logger.info("Instala con: pip install oracledb")
-            sys.exit(1)
-        df = conectar_oracle(config)
+        archivo_excel = sorted(archivos_excel, key=lambda x: x.stat().st_mtime, reverse=True)[0]
+        logger.info(f"📖 Usando: {archivo_excel.name}")
+        df = leer_excel(str(archivo_excel))
+        fuente_datos = 'excel'
+    else:
+        # Intenta Oracle, fallback a Excel
+        df, fuente_datos = obtener_datos_inteligente(config)
     
     # Autenticar en Tableau
+    logger.info(f"\n{'='*60}")
+    logger.info("AUTENTICAR EN TABLEAU")
+    logger.info(f"{'='*60}")
     server = autenticar_tableau(config)
     
     # Crear directorio base
     directorio_base = config.get('directorio_descarga', './tableau_workbooks')
     Path(directorio_base).mkdir(parents=True, exist_ok=True)
-    logger.info(f"📁 Directorio base: {directorio_base}")
+    logger.info(f"\n📁 Directorio base: {directorio_base}")
+    logger.info(f"📊 Fuente de datos: {fuente_datos.upper()}")
     
     # Descargar workbooks
+    logger.info(f"\n{'='*60}")
+    logger.info("DESCARGANDO WORKBOOKS")
+    logger.info(f"{'='*60}")
     estadisticas = procesar_descargas(server, df, directorio_base)
     
     # Subir a GitHub (opcional)
     if not args.sin_github and config.get('github_enabled', True):
+        logger.info(f"\n{'='*60}")
+        logger.info("SUBIENDO A GITHUB")
+        logger.info(f"{'='*60}")
         subir_github(directorio_base, config)
     
     # Cerrar sesión Tableau

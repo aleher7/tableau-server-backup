@@ -72,9 +72,10 @@ def cargar_config(config_file="config.json"):
 # LEER DATOS DESDE EXCEL
 # ============================================================================
 
-def leer_excel(ruta_excel):
+def leer_archivo_datos(ruta_archivo):
     """
-    Lee el Excel con la estructura de workbooks
+    Lee el archivo de datos (Excel o DSV)
+    Detecta automáticamente el formato por extensión
     
     Retorna DataFrame con columnas:
     - WORKBOOK_LUID
@@ -87,10 +88,26 @@ def leer_excel(ruta_excel):
     - DESCARGAR (si existe)
     """
     try:
-        logger.info("[LEYENDO] Excel: %s", ruta_excel)
-        df = pd.read_excel(ruta_excel)
+        logger.info("[LEYENDO] Archivo: %s", ruta_archivo)
         
-        logger.info("[OK] Excel cargado: %d filas", len(df))
+        extension = Path(ruta_archivo).suffix.lower()
+        
+        # Detectar formato y leer
+        if extension == '.dsv':
+            # DSV: delimitado por separador (tipicamente |, ;, \t)
+            df = pd.read_csv(ruta_archivo, sep='|')
+        elif extension in ['.xlsx', '.xls']:
+            # Excel
+            df = pd.read_excel(ruta_archivo)
+        elif extension == '.csv':
+            # CSV estándar
+            df = pd.read_csv(ruta_archivo)
+        else:
+            # Por defecto intentar como CSV
+            logger.warning("[AVISO] Extension no reconocida, intentando como CSV")
+            df = pd.read_csv(ruta_archivo)
+        
+        logger.info("[OK] Archivo cargado: %d filas", len(df))
         logger.info("[INFO] Columnas: %s", ", ".join(df.columns))
         
         # Filtrar solo si DESCARGAR=True (si existe esa columna)
@@ -100,7 +117,7 @@ def leer_excel(ruta_excel):
         
         return df
     except Exception as e:
-        logger.error("[ERROR] Error al leer Excel: %s", e)
+        logger.error("[ERROR] Error al leer archivo: %s", e)
         sys.exit(1)
 
 # ============================================================================
@@ -198,39 +215,41 @@ def obtener_datos_inteligente(config):
             logger.warning("[AVISO] Oracle fallo: %s", str(e)[:100])
             logger.info("[FALLBACK] Cayendo a Excel de respaldo...")
     
-    # ========== PASO 2: FALLBACK A EXCEL ==========
-    logger.info("[BUSCANDO] Archivo Excel de respaldo...")
+    # ========== PASO 2: FALLBACK A ARCHIVO DE DATOS ==========
+    logger.info("[BUSCANDO] Archivo de datos de respaldo...")
     
-    # Buscar Excel en la misma ruta del script
     directorio_script = Path(__file__).parent
-    archivos_excel = list(directorio_script.glob('*.xlsx'))
     
-    if not archivos_excel:
-        logger.error("[ERROR] No se encontró archivo Excel (.xlsx) en la carpeta del script")
+    # Buscar archivo "prueba" con cualquier extensión (.dsv, .xlsx, .csv, etc)
+    archivos_prueba = []
+    
+    # Buscar todos los archivos que empiezan con "prueba" (case-insensitive)
+    for archivo in directorio_script.glob('prueba*'):
+        if archivo.is_file():
+            archivos_prueba.append(archivo)
+    
+    if not archivos_prueba:
+        logger.error("[ERROR] No se encontró archivo 'prueba' en la carpeta del script")
         logger.error("[INFO] Ubicacion: %s", directorio_script)
-        logger.error("[ACCION] Coloca un archivo .xlsx con los workbooks")
+        logger.error("[ACCION] Coloca un archivo llamado 'prueba' (prueba.dsv, prueba.xlsx, prueba.csv, etc)")
         sys.exit(1)
     
-    # Si hay múltiples Excel, usar el primero o el especificado en config
-    if 'excel_backup_nombre' in config:
-        archivo_excel = directorio_script / config['excel_backup_nombre']
-    else:
-        # Usar el primer Excel encontrado (o el más reciente)
-        archivo_excel = sorted(archivos_excel, key=lambda x: x.stat().st_mtime, reverse=True)[0]
+    # Si hay múltiples archivos "prueba", usar el más reciente
+    archivo_datos = sorted(archivos_prueba, key=lambda x: x.stat().st_mtime, reverse=True)[0]
     
-    if not archivo_excel.exists():
-        logger.error("[ERROR] Archivo Excel no encontrado: %s", archivo_excel)
+    if not archivo_datos.exists():
+        logger.error("[ERROR] Archivo de datos no encontrado: %s", archivo_datos)
         sys.exit(1)
     
-    logger.info("[USANDO] Excel de respaldo: %s", archivo_excel.name)
+    logger.info("[USANDO] Archivo de datos: %s", archivo_datos.name)
     
     try:
-        df = leer_excel(str(archivo_excel))
-        fuente_datos = 'excel'
-        logger.info("[EXITO] Datos obtenidos desde EXCEL (respaldo)")
+        df = leer_archivo_datos(str(archivo_datos))
+        fuente_datos = 'archivo_datos'
+        logger.info("[EXITO] Datos obtenidos desde archivo de datos (respaldo)")
         return df, fuente_datos
     except Exception as e:
-        logger.error("[ERROR] Error al leer Excel: %s", e)
+        logger.error("[ERROR] Error al leer archivo de datos: %s", e)
         sys.exit(1)
 
 # ============================================================================
@@ -452,18 +471,25 @@ def main():
     logger.info("="*60)
     
     if args.forzar_excel:
-        logger.info("[FORZANDO] Excel (--forzar-excel)")
+        logger.info("[FORZANDO] Archivo de datos (--forzar-excel)")
         directorio_script = Path(__file__).parent
-        archivos_excel = list(directorio_script.glob('*.xlsx'))
-        if not archivos_excel:
-            logger.error("[ERROR] No hay archivos Excel en la carpeta del script")
+        
+        # Buscar archivo "prueba" con cualquier extensión
+        archivos_prueba = []
+        for archivo in directorio_script.glob('prueba*'):
+            if archivo.is_file():
+                archivos_prueba.append(archivo)
+        
+        if not archivos_prueba:
+            logger.error("[ERROR] No hay archivos 'prueba' en la carpeta del script")
             sys.exit(1)
-        archivo_excel = sorted(archivos_excel, key=lambda x: x.stat().st_mtime, reverse=True)[0]
-        logger.info("[USANDO] %s", archivo_excel.name)
-        df = leer_excel(str(archivo_excel))
-        fuente_datos = 'excel'
+        
+        archivo_datos = sorted(archivos_prueba, key=lambda x: x.stat().st_mtime, reverse=True)[0]
+        logger.info("[USANDO] %s", archivo_datos.name)
+        df = leer_archivo_datos(str(archivo_datos))
+        fuente_datos = 'archivo_datos'
     else:
-        # Intenta Oracle, fallback a Excel
+        # Intenta Oracle, fallback a archivo de datos
         df, fuente_datos = obtener_datos_inteligente(config)
     
     # Autenticar en Tableau

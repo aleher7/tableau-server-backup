@@ -1,0 +1,25 @@
+{
+  "modo_datos": "excel",
+  
+  "excel_ruta": "C:\\ruta\\a\\tu\\archivo\\workbooks_tableau.xlsx",
+  
+  "oracle_enabled": false,
+  "oracle_dsn": "GOLDDB_TPURGENT:1522/golddb_tpurgent",
+  "oracle_user": "CLABS_STG_PRO",
+  "oracle_password": "tu_contraseña_aqui",
+  "oracle_wallet_location": "C:\\ruta\\a\\wallet_golddb_new.zip",
+  "oracle_wallet_password": "",
+  
+  "tableau_server": "https://dub01.online.tableau.com",
+  "tableau_site": "cantabrialabscorporatebi",
+  "tableau_token_name": "tu_token_name",
+  "tableau_token": "tu_tableau_token_aqui",
+  
+  "directorio_descarga": "C:\\Users\\alejandro.romaguera\\Desktop\\Tableau_Workbooks",
+  
+  "github_enabled": true,
+  "github_repo_path": "C:\\ruta\\a\\tu\\repositorio\\github",
+  "github_token": "tu_github_token_aqui",
+  
+  "log_level": "INFO"
+}

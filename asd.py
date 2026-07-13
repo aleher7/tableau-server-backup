@@ -95,8 +95,8 @@ def leer_archivo_datos(ruta_archivo):
         # Detectar formato y leer
         if extension == '.dsv':
             # DSV: usa pipe como separador, puede tener comillas en valores
-            # No usar quotechar para evitar confusiones
-            df = pd.read_csv(ruta_archivo, sep='|', quotechar=None, skipinitialspace=True)
+            # Usar quoting='none' para no interpretar comillas
+            df = pd.read_csv(ruta_archivo, sep='|', quoting=3, skipinitialspace=True)
         elif extension in ['.xlsx', '.xls']:
             # Excel
             df = pd.read_excel(ruta_archivo)
@@ -106,7 +106,7 @@ def leer_archivo_datos(ruta_archivo):
         else:
             # Por defecto intentar como pipe DSV
             logger.warning("[AVISO] Extension no reconocida, intentando como DSV con pipe")
-            df = pd.read_csv(ruta_archivo, sep='|', quotechar=None, skipinitialspace=True)
+            df = pd.read_csv(ruta_archivo, sep='|', quoting=3, skipinitialspace=True)
         
         # IMPORTANTE: Limpiar espacios y comillas de nombres de columnas
         df.columns = [col.strip().replace('"', '') for col in df.columns]
@@ -116,15 +116,48 @@ def leer_archivo_datos(ruta_archivo):
             if df[col].dtype == 'object':  # Solo si es texto
                 df[col] = df[col].astype(str).str.replace('"', '', regex=False).str.strip()
         
-        # IMPORTANTE: Limpiar espacios y comillas de nombres de columnas
-        df.columns = [col.strip().replace('"', '') for col in df.columns]
-        
         logger.info("[OK] Archivo cargado: %d filas", len(df))
         logger.info("[INFO] Columnas encontradas: %s", ", ".join(df.columns))
         
+        # Buscar columnas de forma flexible (sin importar espacios/comillas)
+        def buscar_columna(df, patrones):
+            """Busca una columna que contenga uno de los patrones"""
+            for col in df.columns:
+                col_limpio = col.strip().upper().replace('"', '')
+                for patron in patrones:
+                    if patron.upper() in col_limpio:
+                        logger.info("[MAPEO] Columna '%s' mapeada a '%s'", col, patron)
+                        return col
+            return None
+        
+        # Mapear columnas
+        col_luid = buscar_columna(df, ['WORKBOOK_LUID', 'LUID', 'ID'])
+        col_nombre = buscar_columna(df, ['WORKBOOK', 'NOMBRE'])
+        col_ruta = buscar_columna(df, ['RUTA_PROYECTO', 'PROYECTO', 'RUTA'])
+        col_descargar = buscar_columna(df, ['DESCARGAR', 'DOWNLOAD'])
+        
+        if not col_luid:
+            logger.error("[ERROR] No se encontró columna WORKBOOK_LUID (o similar)")
+            logger.error("[INFO] Columnas disponibles: %s", ", ".join(df.columns))
+            sys.exit(1)
+        if not col_nombre:
+            logger.error("[ERROR] No se encontró columna WORKBOOK")
+            sys.exit(1)
+        if not col_ruta:
+            logger.error("[ERROR] No se encontró columna RUTA_PROYECTO")
+            sys.exit(1)
+        
+        # Renombrar columnas para que sean estándar
+        df = df.rename(columns={
+            col_luid: 'WORKBOOK_LUID',
+            col_nombre: 'WORKBOOK',
+            col_ruta: 'RUTA_PROYECTO'
+        })
+        
         # Filtrar solo si DESCARGAR=True (si existe esa columna)
-        if 'DESCARGAR' in df.columns:
-            df = df[df['DESCARGAR'] == True]
+        if col_descargar:
+            df = df.rename(columns={col_descargar: 'DESCARGAR'})
+            df = df[df['DESCARGAR'].astype(str).str.upper().isin(['TRUE', '1', 'TRUE'])]
             logger.info("[FILTRADO] Workbooks para descargar: %d", len(df))
         
         return df

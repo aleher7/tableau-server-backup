@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Script Dual: Lee estructura de workbooks desde EXCEL o ORACLE
-Descarga workbooks de Tableau respetando estructura de carpetas
-Sube automáticamente a GitHub
+Script dual: Lee estructura de workbooks desde EXCEL o ORACLE
+Intenta Oracle primero, fallback automático a Excel como backup
+Descarga workbooks de Tableau y los sube a GitHub
 
 Uso:
-    python descargar_workbooks_excel_oracle.py --modo excel
-    python descargar_workbooks_excel_oracle.py --modo oracle
+    python descargar_workbooks_excel_oracle.py
+    python descargar_workbooks_excel_oracle.py --forzar-excel
+    python descargar_workbooks_excel_oracle.py --sin-github
 """
 
 import os
@@ -23,7 +24,7 @@ import pandas as pd
 try:
     import tableauserverclient as TSC
 except ImportError:
-    print("❌ tableauserverclient no está instalado")
+    print("ERROR: tableauserverclient no está instalado")
     print("Instala con: pip install tableauserverclient")
     sys.exit(1)
 
@@ -33,7 +34,7 @@ try:
     ORACLE_AVAILABLE = True
 except ImportError:
     ORACLE_AVAILABLE = False
-    print("⚠️  oracledb no instalado (Excel funcionará igual)")
+    print("ADVERTENCIA: oracledb no instalado (Excel funcionará igual)")
 
 # ============================================================================
 # LOGGING
@@ -58,13 +59,13 @@ def cargar_config(config_file="config.json"):
     try:
         with open(config_file, 'r') as f:
             config = json.load(f)
-        logger.info("✓ Configuración cargada correctamente")
+        logger.info("[OK] Configuración cargada correctamente")
         return config
     except FileNotFoundError:
-        logger.error(f"❌ Archivo {config_file} no encontrado")
+        logger.error("[ERROR] Archivo %s no encontrado", config_file)
         sys.exit(1)
     except json.JSONDecodeError:
-        logger.error(f"❌ Error al parsear {config_file}")
+        logger.error("[ERROR] Error al parsear %s", config_file)
         sys.exit(1)
 
 # ============================================================================
@@ -86,35 +87,35 @@ def leer_excel(ruta_excel):
     - DESCARGAR (si existe)
     """
     try:
-        logger.info(f"📖 Leyendo Excel: {ruta_excel}")
+        logger.info("[LEYENDO] Excel: %s", ruta_excel)
         df = pd.read_excel(ruta_excel)
         
-        logger.info(f"✓ Excel cargado: {len(df)} filas")
-        logger.info(f"  Columnas: {', '.join(df.columns)}")
+        logger.info("[OK] Excel cargado: %d filas", len(df))
+        logger.info("[INFO] Columnas: %s", ", ".join(df.columns))
         
         # Filtrar solo si DESCARGAR=True (si existe esa columna)
         if 'DESCARGAR' in df.columns:
             df = df[df['DESCARGAR'] == True]
-            logger.info(f"✓ Filtrados workbooks para descargar: {len(df)}")
+            logger.info("[FILTRADO] Workbooks para descargar: %d", len(df))
         
         return df
     except Exception as e:
-        logger.error(f"❌ Error al leer Excel: {e}")
+        logger.error("[ERROR] Error al leer Excel: %s", e)
         sys.exit(1)
 
 # ============================================================================
-# LEER DATOS DESDE ORACLE
+# CONECTAR A ORACLE
 # ============================================================================
 
 def conectar_oracle(config):
     """Conecta a Oracle y obtiene la estructura de workbooks"""
     
     if not ORACLE_AVAILABLE:
-        logger.error("❌ oracledb no está instalado")
+        logger.error("[ERROR] oracledb no está instalado")
         sys.exit(1)
     
     try:
-        logger.info("🔗 Conectando a Oracle...")
+        logger.info("[CONECTANDO] Oracle...")
         
         # Usar wallet si está configurado
         if config.get('oracle_wallet_location'):
@@ -130,7 +131,7 @@ def conectar_oracle(config):
             dsn=config['oracle_dsn']
         )
         
-        logger.info("✓ Conectado a Oracle")
+        logger.info("[OK] Conectado a Oracle")
         
         # Ejecutar query
         cursor = conexion.cursor()
@@ -158,12 +159,78 @@ def conectar_oracle(config):
         
         # Convertir a DataFrame
         df = pd.DataFrame(filas, columns=columnas)
-        logger.info(f"✓ Oracle: {len(df)} workbooks encontrados")
+        logger.info("[OK] Oracle: %d workbooks encontrados", len(df))
         
         return df
         
     except Exception as e:
-        logger.error(f"❌ Error al conectar Oracle: {e}")
+        logger.error("[ERROR] Error al conectar Oracle: %s", e)
+        raise
+
+# ============================================================================
+# OBTENER DATOS INTELIGENTE (ORACLE + FALLBACK EXCEL)
+# ============================================================================
+
+def obtener_datos_inteligente(config):
+    """
+    Intenta obtener datos de Oracle primero.
+    Si falla, cae automáticamente a Excel (backup) en la misma ruta del script.
+    
+    Returns:
+        DataFrame con los datos y tipo de fuente (oracle/excel)
+    """
+    
+    fuente_datos = None
+    df = None
+    
+    # ========== PASO 1: INTENTAR ORACLE ==========
+    logger.info("[INTENTANDO] Conectar a Oracle...")
+    
+    if not ORACLE_AVAILABLE:
+        logger.warning("[AVISO] oracledb no está instalado - saltando Oracle")
+    else:
+        try:
+            df = conectar_oracle(config)
+            fuente_datos = 'oracle'
+            logger.info("[EXITO] Datos obtenidos desde ORACLE")
+            return df, fuente_datos
+        except Exception as e:
+            logger.warning("[AVISO] Oracle fallo: %s", str(e)[:100])
+            logger.info("[FALLBACK] Cayendo a Excel de respaldo...")
+    
+    # ========== PASO 2: FALLBACK A EXCEL ==========
+    logger.info("[BUSCANDO] Archivo Excel de respaldo...")
+    
+    # Buscar Excel en la misma ruta del script
+    directorio_script = Path(__file__).parent
+    archivos_excel = list(directorio_script.glob('*.xlsx'))
+    
+    if not archivos_excel:
+        logger.error("[ERROR] No se encontró archivo Excel (.xlsx) en la carpeta del script")
+        logger.error("[INFO] Ubicacion: %s", directorio_script)
+        logger.error("[ACCION] Coloca un archivo .xlsx con los workbooks")
+        sys.exit(1)
+    
+    # Si hay múltiples Excel, usar el primero o el especificado en config
+    if 'excel_backup_nombre' in config:
+        archivo_excel = directorio_script / config['excel_backup_nombre']
+    else:
+        # Usar el primer Excel encontrado (o el más reciente)
+        archivo_excel = sorted(archivos_excel, key=lambda x: x.stat().st_mtime, reverse=True)[0]
+    
+    if not archivo_excel.exists():
+        logger.error("[ERROR] Archivo Excel no encontrado: %s", archivo_excel)
+        sys.exit(1)
+    
+    logger.info("[USANDO] Excel de respaldo: %s", archivo_excel.name)
+    
+    try:
+        df = leer_excel(str(archivo_excel))
+        fuente_datos = 'excel'
+        logger.info("[EXITO] Datos obtenidos desde EXCEL (respaldo)")
+        return df, fuente_datos
+    except Exception as e:
+        logger.error("[ERROR] Error al leer Excel: %s", e)
         sys.exit(1)
 
 # ============================================================================
@@ -173,7 +240,7 @@ def conectar_oracle(config):
 def autenticar_tableau(config):
     """Autentica en Tableau Server/Cloud"""
     try:
-        logger.info("🔐 Autenticando en Tableau...")
+        logger.info("[AUTENTICANDO] Tableau...")
         
         tableau_auth = TSC.PersonalAccessTokenAuth(
             token_name=config['tableau_token_name'],
@@ -184,11 +251,11 @@ def autenticar_tableau(config):
         server = TSC.Server(config['tableau_server'])
         server.auth.sign_in(tableau_auth)
         
-        logger.info("✓ Autenticado en Tableau")
+        logger.info("[OK] Autenticado en Tableau")
         return server
         
     except Exception as e:
-        logger.error(f"❌ Error al autenticar en Tableau: {e}")
+        logger.error("[ERROR] Error al autenticar en Tableau: %s", e)
         sys.exit(1)
 
 # ============================================================================
@@ -211,16 +278,16 @@ def descargar_workbook(server, workbook_luid, ruta_destino):
         # Crear carpeta si no existe
         ruta_destino.parent.mkdir(parents=True, exist_ok=True)
         
-        logger.info(f"⬇️  Descargando: {workbook_luid}")
+        logger.info("[DESCARGANDO] %s", workbook_luid)
         
         # Descargar workbook
         content = server.workbooks.download(workbook_luid, filepath=str(ruta_destino))
         
-        logger.info(f"✓ Descargado: {ruta_destino.name}")
+        logger.info("[OK] Descargado: %s", ruta_destino.name)
         return True
         
     except Exception as e:
-        logger.error(f"❌ Error descargando {workbook_luid}: {e}")
+        logger.error("[ERROR] Error descargando %s: %s", workbook_luid, e)
         return False
 
 # ============================================================================
@@ -247,9 +314,9 @@ def procesar_descargas(server, df, directorio_base):
         'tiempos': {}
     }
     
-    logger.info(f"\n{'='*60}")
-    logger.info(f"INICIANDO DESCARGA DE {len(df)} WORKBOOKS")
-    logger.info(f"{'='*60}\n")
+    logger.info("="*60)
+    logger.info("INICIANDO DESCARGA DE %d WORKBOOKS", len(df))
+    logger.info("="*60)
     
     for idx, fila in df.iterrows():
         workbook_luid = fila['WORKBOOK_LUID']
@@ -259,9 +326,9 @@ def procesar_descargas(server, df, directorio_base):
         # Construir ruta local respetando estructura
         ruta_local = Path(directorio_base) / ruta_proyecto / f"{workbook_nombre}.twbx"
         
-        logger.info(f"\n[{idx+1}/{len(df)}] {workbook_nombre}")
-        logger.info(f"     Proyecto: {ruta_proyecto}")
-        logger.info(f"     LUID: {workbook_luid}")
+        logger.info("\n[%d/%d] %s", idx+1, len(df), workbook_nombre)
+        logger.info("       Proyecto: %s", ruta_proyecto)
+        logger.info("       LUID: %s", workbook_luid)
         
         inicio = datetime.now()
         
@@ -282,20 +349,20 @@ def subir_github(directorio_base, config):
     """Hace git add, commit y push a GitHub"""
     
     try:
-        logger.info(f"\n{'='*60}")
+        logger.info("="*60)
         logger.info("SUBIENDO A GITHUB")
-        logger.info(f"{'='*60}\n")
+        logger.info("="*60)
         
         os.chdir(directorio_base)
         
         # Git add
-        logger.info("📤 git add .")
+        logger.info("[GIT] git add .")
         subprocess.run(['git', 'add', '.'], check=True, capture_output=True)
         
         # Git commit
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         mensaje = f"Tableau Backup - {timestamp}"
-        logger.info(f"📤 git commit -m '{mensaje}'")
+        logger.info("[GIT] git commit -m '%s'", mensaje)
         resultado = subprocess.run(
             ['git', 'commit', '-m', mensaje],
             check=True,
@@ -304,19 +371,19 @@ def subir_github(directorio_base, config):
         )
         
         if "nothing to commit" in resultado.stdout:
-            logger.info("ℹ️  No hay cambios que hacer commit")
+            logger.info("[AVISO] No hay cambios que hacer commit")
             return
         
         # Git push
-        logger.info("📤 git push origin main")
+        logger.info("[GIT] git push origin main")
         subprocess.run(['git', 'push', 'origin', 'main'], check=True, capture_output=True)
         
-        logger.info("✓ Subido a GitHub correctamente")
+        logger.info("[OK] Subido a GitHub correctamente")
         
     except subprocess.CalledProcessError as e:
-        logger.error(f"❌ Error en Git: {e}")
+        logger.error("[ERROR] Error en Git: %s", e)
     except Exception as e:
-        logger.error(f"❌ Error al subir a GitHub: {e}")
+        logger.error("[ERROR] Error al subir a GitHub: %s", e)
 
 # ============================================================================
 # REPORTE FINAL
@@ -325,86 +392,28 @@ def subir_github(directorio_base, config):
 def mostrar_reporte(estadisticas, tiempo_total):
     """Muestra reporte de ejecución"""
     
-    logger.info(f"\n{'='*60}")
+    logger.info("="*60)
     logger.info("REPORTE FINAL")
-    logger.info(f"{'='*60}")
-    logger.info(f"Total de workbooks:    {estadisticas['total']}")
-    logger.info(f"Descargados:           {estadisticas['descargados']} ✓")
-    logger.info(f"Errores:               {estadisticas['errores']} ✗")
-    logger.info(f"Tasa de éxito:         {(estadisticas['descargados']/estadisticas['total']*100):.1f}%")
-    logger.info(f"Tiempo total:          {tiempo_total:.2f}s")
+    logger.info("="*60)
+    logger.info("Total de workbooks:    %d", estadisticas['total'])
+    logger.info("Descargados:           %d [OK]", estadisticas['descargados'])
+    logger.info("Errores:               %d [ERROR]", estadisticas['errores'])
+    
+    if estadisticas['total'] > 0:
+        tasa = (estadisticas['descargados']/estadisticas['total']*100)
+        logger.info("Tasa de exito:         %.1f%%", tasa)
+    
+    logger.info("Tiempo total:          %.2fs", tiempo_total)
     
     if estadisticas['tiempos']:
         promedio = sum(estadisticas['tiempos'].values()) / len(estadisticas['tiempos'])
-        logger.info(f"Tiempo promedio/workbook: {promedio:.2f}s")
+        logger.info("Tiempo promedio/workbook: %.2fs", promedio)
     
-    logger.info(f"{'='*60}\n")
+    logger.info("="*60)
 
 # ============================================================================
 # MAIN
 # ============================================================================
-
-def obtener_datos_inteligente(config):
-    """
-    Intenta obtener datos de Oracle primero.
-    Si falla, cae automáticamente a Excel (backup) en la misma ruta del script.
-    
-    Returns:
-        DataFrame con los datos y tipo de fuente (oracle/excel)
-    """
-    
-    fuente_datos = None
-    df = None
-    
-    # ========== PASO 1: INTENTAR ORACLE ==========
-    logger.info("\n🔗 Intentando conectar a Oracle...")
-    
-    if not ORACLE_AVAILABLE:
-        logger.warning("⚠️  oracledb no está instalado - saltando Oracle")
-    else:
-        try:
-            df = conectar_oracle(config)
-            fuente_datos = 'oracle'
-            logger.info("✅ ÉXITO: Datos obtenidos desde ORACLE")
-            return df, fuente_datos
-        except Exception as e:
-            logger.warning(f"⚠️  Oracle falló: {str(e)[:100]}")
-            logger.info("↓ Cayendo al backup (Excel)...")
-    
-    # ========== PASO 2: FALLBACK A EXCEL ==========
-    logger.info("\n📖 Buscando archivo Excel de backup...")
-    
-    # Buscar Excel en la misma ruta del script
-    directorio_script = Path(__file__).parent
-    archivos_excel = list(directorio_script.glob('*.xlsx'))
-    
-    if not archivos_excel:
-        logger.error("❌ No se encontró archivo Excel (.xlsx) en la carpeta del script")
-        logger.error(f"   Ubicación: {directorio_script}")
-        logger.error("   Coloca un archivo .xlsx con los workbooks")
-        sys.exit(1)
-    
-    # Si hay múltiples Excel, usar el primero o el especificado en config
-    if 'excel_backup_nombre' in config:
-        archivo_excel = directorio_script / config['excel_backup_nombre']
-    else:
-        # Usar el primer Excel encontrado (o el más reciente)
-        archivo_excel = sorted(archivos_excel, key=lambda x: x.stat().st_mtime, reverse=True)[0]
-    
-    if not archivo_excel.exists():
-        logger.error(f"❌ Archivo Excel no encontrado: {archivo_excel}")
-        sys.exit(1)
-    
-    logger.info(f"📖 Usando Excel de backup: {archivo_excel.name}")
-    
-    try:
-        df = leer_excel(str(archivo_excel))
-        fuente_datos = 'excel'
-        logger.info("✅ ÉXITO: Datos obtenidos desde EXCEL (backup)")
-        return df, fuente_datos
-    except Exception as e:
-        logger.error(f"❌ Error al leer Excel: {e}")
-        sys.exit(1)
 
 def main():
     """Función principal"""
@@ -416,7 +425,7 @@ def main():
     parser.add_argument(
         '--config',
         default='config.json',
-        help='Archivo de configuración (default: config.json)'
+        help='Archivo de configuracion (default: config.json)'
     )
     parser.add_argument(
         '--sin-github',
@@ -434,23 +443,23 @@ def main():
     inicio_total = datetime.now()
     
     # Cargar configuración
-    logger.info("📋 Cargando configuración...")
+    logger.info("[CARGANDO] Configuración...")
     config = cargar_config(args.config)
     
     # Obtener datos (Oracle con fallback a Excel)
-    logger.info(f"\n{'='*60}")
+    logger.info("="*60)
     logger.info("OBTENER DATOS")
-    logger.info(f"{'='*60}")
+    logger.info("="*60)
     
     if args.forzar_excel:
-        logger.info("🔧 Forzando Excel (--forzar-excel)")
+        logger.info("[FORZANDO] Excel (--forzar-excel)")
         directorio_script = Path(__file__).parent
         archivos_excel = list(directorio_script.glob('*.xlsx'))
         if not archivos_excel:
-            logger.error("❌ No hay archivos Excel en la carpeta del script")
+            logger.error("[ERROR] No hay archivos Excel en la carpeta del script")
             sys.exit(1)
         archivo_excel = sorted(archivos_excel, key=lambda x: x.stat().st_mtime, reverse=True)[0]
-        logger.info(f"📖 Usando: {archivo_excel.name}")
+        logger.info("[USANDO] %s", archivo_excel.name)
         df = leer_excel(str(archivo_excel))
         fuente_datos = 'excel'
     else:
@@ -458,28 +467,28 @@ def main():
         df, fuente_datos = obtener_datos_inteligente(config)
     
     # Autenticar en Tableau
-    logger.info(f"\n{'='*60}")
+    logger.info("="*60)
     logger.info("AUTENTICAR EN TABLEAU")
-    logger.info(f"{'='*60}")
+    logger.info("="*60)
     server = autenticar_tableau(config)
     
     # Crear directorio base
     directorio_base = config.get('directorio_descarga', './tableau_workbooks')
     Path(directorio_base).mkdir(parents=True, exist_ok=True)
-    logger.info(f"\n📁 Directorio base: {directorio_base}")
-    logger.info(f"📊 Fuente de datos: {fuente_datos.upper()}")
+    logger.info("\n[DIRECTORIO] %s", directorio_base)
+    logger.info("[FUENTE] %s", fuente_datos.upper())
     
     # Descargar workbooks
-    logger.info(f"\n{'='*60}")
+    logger.info("="*60)
     logger.info("DESCARGANDO WORKBOOKS")
-    logger.info(f"{'='*60}")
+    logger.info("="*60)
     estadisticas = procesar_descargas(server, df, directorio_base)
     
     # Subir a GitHub (opcional)
     if not args.sin_github and config.get('github_enabled', True):
-        logger.info(f"\n{'='*60}")
+        logger.info("="*60)
         logger.info("SUBIENDO A GITHUB")
-        logger.info(f"{'='*60}")
+        logger.info("="*60)
         subir_github(directorio_base, config)
     
     # Cerrar sesión Tableau

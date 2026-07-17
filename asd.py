@@ -4,7 +4,7 @@
 Script para descargar workbooks de Tableau desde SQL PLUS o archivo,
 y subirlos automáticamente a GitHub.
 
-Versión FINAL: Lee SQL desde archivo local + menos comentarios (pero suficientes)
+Versión 2: Consulta SQL dentro del script (sin archivo externo)
 """
 
 import os
@@ -39,6 +39,24 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# ============================================================================
+# CONSULTA SQL (AQUÍ ES DONDE PONES TU QUERY)
+# ============================================================================
+# Modifica esta consulta según tus necesidades
+# NO AGREGUES: SET FEEDBACK, SET PAGESIZE, etc. (el script lo hace automáticamente)
+
+CONSULTA_SQL = """
+SELECT * FROM DESCARGA_WORKBOOKS
+"""
+
+# Ejemplos de otras queries:
+# CONSULTA_SQL = """
+# SELECT WORKBOOK_LUID, WORKBOOK, RUTA_PROYECTO 
+# FROM DESCARGA_WORKBOOKS 
+# WHERE DESCARGAR = 'SI'
+# ORDER BY RUTA_PROYECTO, WORKBOOK
+# """
 
 # ============================================================================
 # FUNCIONES
@@ -107,45 +125,20 @@ def limpiar_directorio(directorio_base):
         sys.exit(1)
 
 
-def leer_consulta_sql(archivo_sql="consulta.sql"):
-    """
-    Lee la consulta SQL desde archivo local.
-    
-    IMPORTANTE: Esta es la NUEVA FUNCIONALIDAD.
-    El archivo consulta.sql debe contener SOLO la consulta SQL,
-    sin comandos SQL PLUS (SET FEEDBACK, etc). El script agrega 
-    automáticamente esos comandos.
-    
-    Proceso:
-    1. Verificar si consulta.sql existe en el directorio actual
-    2. Si existe, leer y retornar la consulta
-    3. Si no existe, retornar None (se usará fallback a archivo)
-    
-    Ejemplo de contenido de consulta.sql:
-    SELECT * FROM DESCARGA_WORKBOOKS;
-    """
-    sql_file = Path(archivo_sql)
-    
-    if sql_file.exists():
-        try:
-            with open(sql_file, 'r', encoding='utf-8') as f:
-                consulta = f.read().strip()
-            if consulta:
-                logger.info("[OK] Consulta SQL leída de: %s", archivo_sql)
-                return consulta
-        except Exception as e:
-            logger.warning("[AVISO] Error al leer archivo SQL: %s", e)
-    
-    # Si no existe o hay error, retornar None para usar fallback
-    logger.info("[INFO] Archivo SQL no encontrado: %s", archivo_sql)
-    return None
-
-
 def ejecutar_sqlplus(usuario, contraseña, dsn, consulta_sql):
     """
     Ejecuta una consulta SQL PLUS y retorna DataFrame con resultados.
     
     IMPORTANTE: SQL PLUS es una herramienta externa de Oracle (no conexión nativa).
+    
+    VARIABLES DE CONEXIÓN:
+    - usuario: Tu usuario de Oracle (ej: scott)
+    - contraseña: Tu password (ej: tiger)
+    - dsn: Servidor + Puerto + SID (ej: localhost:1521/XE)
+    
+    FORMATO DE CONEXIÓN: usuario/contraseña@dsn
+    Ejemplo completo: scott/tiger@localhost:1521/XE
+    
     El proceso:
     1. Crear archivo SQL temporal con la consulta y configuración
     2. Ejecutar sqlplus como proceso externo (subprocess)
@@ -164,10 +157,15 @@ def ejecutar_sqlplus(usuario, contraseña, dsn, consulta_sql):
         logger.info("[SQLPLUS] Conectando con SQL PLUS...")
         
         # ============================================================
+        # MOSTRAR INFORMACIÓN DE CONEXIÓN (sin exponer password)
+        # ============================================================
+        # Mostramos qué usuario y DSN se va a usar (sin mostrar el password)
+        logger.info("[SQLPLUS] Usuario: %s", usuario)
+        logger.info("[SQLPLUS] DSN: %s", dsn)
+        
+        # ============================================================
         # Crear archivo SQL temporal
         # ============================================================
-        # Necesitamos un archivo porque SQL PLUS lo lee de stdin.
-        # Lo hacemos temporal para no dejar archivos sueltos después.
         with tempfile.NamedTemporaryFile(mode='w', suffix='.sql', delete=False, encoding='utf-8') as f:
             # Agregar configuración SQL PLUS
             f.write("SET FEEDBACK OFF\n")
@@ -179,17 +177,16 @@ def ejecutar_sqlplus(usuario, contraseña, dsn, consulta_sql):
             
             # Agregar la consulta del usuario
             f.write(consulta_sql)
-            f.write("\nEXIT;\n")  # Terminar sesión SQL PLUS
+            f.write("\nEXIT;\n")
             
             archivo_sql = f.name
         
         # ============================================================
         # Ejecutar sqlplus como proceso externo
         # ============================================================
-        # subprocess.run() ejecuta un programa externo.
-        # -S = modo silencioso (no muestra banner de Oracle).
-        # capture_output=True = capturar stdout y stderr.
-        # timeout=60 = máximo 60 segundos (si tarda más, hay problema).
+        # ¡IMPORTANTE! La conexión se forma así:
+        # conexion_string = f"{usuario}/{contraseña}@{dsn}"
+        # Ejemplo: "scott/tiger@localhost:1521/XE"
         
         conexion_string = f"{usuario}/{contraseña}@{dsn}"
         
@@ -211,8 +208,6 @@ def ejecutar_sqlplus(usuario, contraseña, dsn, consulta_sql):
         # ============================================================
         # Verificar si la consulta tuvo éxito
         # ============================================================
-        # returncode=0 significa que sqlplus terminó correctamente.
-        # Si es distinto de 0, hubo error (credenciales, sintaxis SQL, etc.).
         
         if resultado.returncode != 0:
             logger.error("[ERROR] SQL PLUS error (código %d): %s", resultado.returncode, resultado.stderr)
@@ -225,12 +220,6 @@ def ejecutar_sqlplus(usuario, contraseña, dsn, consulta_sql):
         # ============================================================
         # Parsear la salida de SQL PLUS
         # ============================================================
-        # SQL PLUS devuelve algo como:
-        # WORKBOOK_LUID|WORKBOOK|RUTA_PROYECTO
-        # a1b2c3d4|Dashboard_Ventas|Finance
-        # b2c3d4e5|Dashboard_Budget|Finance
-        #
-        # Separamos por líneas, luego por |
         
         lineas = [l.strip() for l in resultado.stdout.strip().split('\n') if l.strip()]
         
@@ -255,8 +244,6 @@ def ejecutar_sqlplus(usuario, contraseña, dsn, consulta_sql):
         # ============================================================
         # Convertir a DataFrame
         # ============================================================
-        # DataFrame es como una tabla Excel en Python.
-        # Mucho más fácil de manipular que listas.
         
         df = pd.DataFrame(datos, columns=encabezados)
         logger.info("[OK] Datos obtenidos de SQL PLUS: %d filas", len(df))
@@ -284,28 +271,16 @@ def leer_archivo_datos(ruta_archivo):
     Proceso principal:
     1. Detectar formato por extensión (.xlsx, .csv, .txt, .dsv)
     2. Leer con el parser aproppiado para ese formato
-    3. Limpiar espacios y comillas (archivos suelen tener "suciedad")
+    3. Limpiar espacios y comillas
     4. Buscar columnas FLEXIBLEMENTE (tolera nombres distintos)
     5. Validar que existan LAS COLUMNAS REQUERIDAS
     6. Renombrar a NOMBRES ESTÁNDAR
-    7. Filtrar solo lo que debe descargarse (si existe columna DESCARGAR)
+    7. Filtrar solo lo que debe descargarse
     """
     try:
         logger.info("[LEYENDO] Archivo: %s", ruta_archivo)
         
-        # ============================================================
-        # Paso 1: Detectar formato por extensión
-        # ============================================================
         extension = Path(ruta_archivo).suffix.lower()
-        
-        # ============================================================
-        # Paso 2: Leer con el parser aproppiado
-        # ============================================================
-        # Cada formato tiene sus particularidades:
-        # - Excel (.xlsx): binario, complejo
-        # - CSV: texto con comas, puede tener comillas
-        # - TXT: texto con tabulaciones
-        # - DSV: Delimited Separated Values, similar a CSV
         
         if extension == '.dsv':
             df = pd.read_csv(ruta_archivo, sep=',', quotechar='"', 
@@ -321,31 +296,15 @@ def leer_archivo_datos(ruta_archivo):
         
         logger.info("[OK] Archivo cargado: %d filas", len(df))
         
-        # ============================================================
-        # Paso 3: Limpiar datos
-        # ============================================================
-        # A veces los archivos tienen espacios o comillas extra:
-        # "  WORKBOOK_LUID  " → debería ser WORKBOOK_LUID
-        # ""Dashboard"" → debería ser Dashboard
-        
+        # Limpiar datos
         df.columns = [col.strip().replace('"', '') for col in df.columns]
         for col in df.columns:
-            if df[col].dtype == 'object':  # 'object' = texto en pandas
+            if df[col].dtype == 'object':
                 df[col] = df[col].astype(str).str.replace('"', '', regex=False).str.strip()
         
-        # ============================================================
-        # Paso 4: Buscar columnas flexiblemente
-        # ============================================================
-        # Los usuarios pueden nombrar las columnas de forma distinta.
-        # Estrategia de DOS FASES:
-        # 1. Búsqueda EXACTA (WORKBOOK_LUID == WORKBOOK_LUID)
-        # 2. Búsqueda PARCIAL (contiene la palabra clave)
-        # 
-        # Con validaciones para evitar falsas coincidencias.
-        # Por ejemplo: si buscamos "WORKBOOK", no queremos "WORKBOOK_LUID".
-        
+        # Buscar columnas flexiblemente
         def buscar_columna(df, patrones):
-            # FASE 1: Búsqueda exacta (más preciso)
+            # FASE 1: Búsqueda exacta
             for col in df.columns:
                 col_limpio = col.strip().upper().replace('"', '')
                 for patron in patrones:
@@ -353,12 +312,11 @@ def leer_archivo_datos(ruta_archivo):
                         logger.info("[MAPEO] Columna '%s' mapeada a '%s'", col, patron)
                         return col
             
-            # FASE 2: Búsqueda parcial (fallback)
+            # FASE 2: Búsqueda parcial
             for col in df.columns:
                 col_limpio = col.strip().upper()
                 for patron in patrones:
                     if patron.upper() in col_limpio:
-                        # Validaciones para evitar falsas coincidencias
                         if patron.upper() == 'WORKBOOK' and 'LUID' in col_limpio:
                             continue
                         if patron.upper() == 'RUTA' and 'LOCAL' in col_limpio:
@@ -373,12 +331,7 @@ def leer_archivo_datos(ruta_archivo):
         col_ruta = buscar_columna(df, ['RUTA_PROYECTO', 'PROYECTO', 'RUTA', 'PROJECT'])
         col_descargar = buscar_columna(df, ['DESCARGAR', 'DOWNLOAD', 'ACTIVO', 'ACTIVE'])
         
-        # ============================================================
-        # Paso 5: Validar que existan TODAS las columnas requeridas
-        # ============================================================
-        # Sin estas columnas no podemos hacer nada.
-        # Es mejor fallar AQUÍ que después con errores confusos.
-        
+        # Validar columnas requeridas
         if not col_luid:
             logger.error("[ERROR] No se encontró columna WORKBOOK_LUID/LUID")
             logger.error("[INFO] Columnas disponibles: %s", ", ".join(df.columns))
@@ -390,23 +343,14 @@ def leer_archivo_datos(ruta_archivo):
             logger.error("[ERROR] No se encontró columna RUTA_PROYECTO/PROYECTO")
             sys.exit(1)
         
-        # ============================================================
-        # Paso 6: Renombrar a NOMBRES ESTÁNDAR
-        # ============================================================
-        # El resto del script ESPERA columnas con estos nombres exactos.
-        
+        # Renombrar a NOMBRES ESTÁNDAR
         df = df.rename(columns={
             col_luid: 'WORKBOOK_LUID',
             col_nombre: 'WORKBOOK',
             col_ruta: 'RUTA_PROYECTO'
         })
         
-        # ============================================================
-        # Paso 7: Filtrar solo lo que debe descargarse
-        # ============================================================
-        # Si existe columna DESCARGAR, usarla para filtrar.
-        # Solo descargar si DESCARGAR = TRUE, SI, 1, etc.
-        
+        # Filtrar solo lo que debe descargarse
         if col_descargar:
             df = df.rename(columns={col_descargar: 'DESCARGAR'})
             df = df[df['DESCARGAR'].astype(str).str.upper().isin(['SÍ', 'SI', '1', 'TRUE', 'Y', 'YES'])]
@@ -424,10 +368,9 @@ def obtener_datos_inteligente(config, forzar_excel=False):
     Obtiene lista de workbooks con estrategia de FALLBACK.
     
     ESTRATEGIA:
-    1. Intenta leer consulta.sql local (NUEVA FUNCIONALIDAD)
-    2. Si existe, ejecuta SQL PLUS con esa consulta
-    3. Si SQL PLUS falla, intenta archivo local (workbooks.txt)
-    4. Retorna los datos y la FUENTE para logging
+    1. Intenta ejecutar SQL PLUS (consulta está dentro del script)
+    2. Si SQL PLUS falla, intenta archivo local (workbooks.txt)
+    3. Retorna los datos y la FUENTE para logging
     
     Parámetro --forzar-excel salta directamente a archivo (útil para testing).
     """
@@ -435,9 +378,7 @@ def obtener_datos_inteligente(config, forzar_excel=False):
     logger.info("OBTENER DATOS")
     logger.info("="*60)
     
-    # ============================================================
     # Si el usuario pasó --forzar-excel, saltarse SQL PLUS
-    # ============================================================
     if forzar_excel:
         logger.info("[FORZANDO] Usando archivo de datos (--forzar-excel)")
         archivo_datos = config.get('archivo_datos', 'workbooks.txt')
@@ -445,35 +386,30 @@ def obtener_datos_inteligente(config, forzar_excel=False):
         return df, "ARCHIVO_DATOS"
     
     # ============================================================
-    # Intenta leer consulta SQL local y ejecutar SQL PLUS
+    # Intenta ejecutar SQL PLUS con la consulta (está en CONSULTA_SQL)
     # ============================================================
-    consulta = leer_consulta_sql("consulta.sql")
-    
-    if consulta:
-        try:
-            # ¡IMPORTANTE! La consulta viene del archivo local
-            df = ejecutar_sqlplus(
-                usuario=config['oracle_user'],
-                contraseña=config['oracle_password'],
-                dsn=config['oracle_dsn'],
-                consulta_sql=consulta
-            )
-            
-            if df is not None:
-                logger.info("[EXITO] Datos obtenidos desde SQL PLUS")
-                return df, "SQLPLUS"
-            
-        except KeyError as e:
-            # KeyError = falta parámetro en config
-            logger.warning("[AVISO] Config incompleta: %s", e)
-        except Exception as e:
-            logger.error("[ERROR] SQL PLUS falló: %s", e)
+    try:
+        logger.info("[SQLPLUS] Usando consulta del script...")
+        df = ejecutar_sqlplus(
+            usuario=config['oracle_user'],
+            contraseña=config['oracle_password'],
+            dsn=config['oracle_dsn'],
+            consulta_sql=CONSULTA_SQL
+        )
+        
+        if df is not None:
+            logger.info("[EXITO] Datos obtenidos desde SQL PLUS")
+            return df, "SQLPLUS"
+        
+    except KeyError as e:
+        # KeyError = falta parámetro en config
+        logger.warning("[AVISO] Config incompleta: %s", e)
+    except Exception as e:
+        logger.error("[ERROR] SQL PLUS falló: %s", e)
     
     # ============================================================
     # FALLBACK: usar archivo local como respaldo
     # ============================================================
-    # Si no existe consulta.sql o SQL PLUS falla,
-    # leer la lista de workbooks desde archivo local.
     logger.warning("[FALLBACK] Usando archivo de datos")
     archivo_datos = config.get('archivo_datos', 'workbooks.txt')
     df = leer_archivo_datos(archivo_datos)
@@ -533,12 +469,7 @@ def descargar_workbook(server, workbook_luid, ruta_destino):
         ruta_destino.parent.mkdir(parents=True, exist_ok=True)
         logger.info("[DESCARGANDO] %s", workbook_luid)
         
-        # ============================================================
         # EL TRUCO: Descargar SIN la extensión .twbx
-        # ============================================================
-        # ruta_destino.stem quita la extensión.
-        # Finance/Dashboard_Ventas.twbx → Finance/Dashboard_Ventas
-        
         ruta_temporal = str(ruta_destino.parent / ruta_destino.stem)
         server.workbooks.download(workbook_luid, filepath=ruta_temporal)
         
@@ -586,8 +517,6 @@ def procesar_descargas(server, df, directorio_base):
     - Cuántos se descargaron OK
     - Cuántos fallaron
     - Cuánto tiempo tardó cada uno
-    
-    Estas estadísticas se usan después para el reporte final.
     """
     
     estadisticas = {
@@ -648,18 +577,11 @@ def subir_github(directorio_base, config):
         
         os.chdir(directorio_base)
         
-        # ============================================================
-        # git add . (agregar cambios)
-        # ============================================================
+        # git add .
         logger.info("[GIT] git add .")
         subprocess.run(['git', 'add', '.'], check=True, capture_output=True)
         
-        # ============================================================
-        # git commit (crear snapshot)
-        # ============================================================
-        # El commit es una "foto" de todos los cambios en un momento específico.
-        # Usamos timestamp para que cada commit sea único y identificable.
-        
+        # git commit
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         mensaje = f"Tableau Backup - {timestamp}"
         
@@ -676,9 +598,7 @@ def subir_github(directorio_base, config):
             logger.info("[AVISO] No hay cambios que hacer commit")
             return
         
-        # ============================================================
-        # git push (enviar a GitHub)
-        # ============================================================
+        # git push
         logger.info("[GIT] git push origin main")
         subprocess.run(['git', 'push', 'origin', 'main'], check=True, capture_output=True)
         
@@ -743,11 +663,7 @@ def main():
     8. Generar reporte final
     """
     
-    # ============================================================
-    # Paso 1: Procesar argumentos de línea de comandos
-    # ============================================================
-    # Permite personalizar el comportamiento sin editar código.
-    
+    # Procesar argumentos
     parser = argparse.ArgumentParser(
         description='Descarga workbooks Tableau y sube a GitHub'
     )
@@ -771,59 +687,43 @@ def main():
     
     inicio_total = datetime.now()
     
-    # ============================================================
-    # Paso 2: Cargar configuración
-    # ============================================================
+    # Cargar configuración
     logger.info("[CARGANDO] Configuración...")
     config = cargar_config(args.config)
     
-    # ============================================================
-    # Paso 3: Limpiar directorio
-    # ============================================================
+    # Obtener directorio base
     directorio_base = config.get('directorio_descarga', './tableau_workbooks')
+    
+    # Limpiar directorio
     limpiar_directorio(directorio_base)
     
-    # ============================================================
-    # Paso 4: Obtener datos (SQL PLUS o archivo)
-    # ============================================================
+    # Obtener datos
     df, fuente_datos = obtener_datos_inteligente(config, args.forzar_excel)
     
-    # ============================================================
-    # Paso 5: Autenticar en Tableau
-    # ============================================================
+    # Autenticar en Tableau
     logger.info("="*60)
     logger.info("AUTENTICAR EN TABLEAU")
     logger.info("="*60)
     server = autenticar_tableau(config)
     
-    # ============================================================
-    # Mostrar información de la ejecución
-    # ============================================================
+    # Información de ejecución
     logger.info("\n[DIRECTORIO] %s", directorio_base)
     logger.info("[FUENTE] %s", fuente_datos.upper())
     logger.info("[WORKBOOKS] %d para descargar", len(df))
     
-    # ============================================================
-    # Paso 6: Descargar workbooks
-    # ============================================================
+    # Descargar workbooks
     estadisticas = procesar_descargas(server, df, directorio_base)
     
-    # ============================================================
-    # Paso 7: Subir a GitHub (opcional)
-    # ============================================================
+    # Subir a GitHub (opcional)
     if not args.sin_github and config.get('github_enabled', True):
         subir_github(directorio_base, config)
     else:
         logger.info("[AVISO] GitHub deshabilitado o --sin-github especificado")
     
-    # ============================================================
-    # Cerrar sesión con Tableau
-    # ============================================================
+    # Cerrar sesión
     server.auth.sign_out()
     
-    # ============================================================
-    # Paso 8: Generar reporte final
-    # ============================================================
+    # Reporte final
     tiempo_total = (datetime.now() - inicio_total).total_seconds()
     mostrar_reporte(estadisticas, tiempo_total)
 
@@ -833,5 +733,4 @@ def main():
 # ============================================================================
 
 if __name__ == '__main__':
-    # Esto significa: "Si este archivo se ejecuta directamente, ejecutar main()"
     main()

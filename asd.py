@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 
 """
-Script para descargar workbooks de Tableau usando:
-1. SQL PLUS (ejecuta consulta, genera lista_workbooks.txt)
-2. Python (parsea archivo, descarga workbooks, sube a GitHub)
+Script MEJORADO para descargar workbooks de Tableau usando:
+1. SQL PLUS (ejecuta consulta, genera lista_workbooks.txt en formato CSV)
+2. Python (parsea CSV, descarga workbooks, sube a GitHub)
 
-Ventajas:
-- Usa tu setup actual de SQL PLUS
-- Python solo descarga y sube
-- Separación de responsabilidades
-- Más fácil de mantener
+MEJORAS v2:
+- Parsea CSV/TSV/PIPE en lugar de formato raro de SQL PLUS
+- Código mucho más simple y robusto
+- Mejor validación
 """
 
 import os
@@ -65,23 +64,10 @@ def cargar_config(config_file="config.json"):
 
 
 def ejecutar_sqlplus(comando_sqlplus, timeout=15):
-    """
-    Ejecuta comando SQL PLUS como proceso externo.
-    
-    El comando es típicamente:
-    cd C:\oracle\instantclient_23_0 && sqlplus -S usuario/password@dsn @archivo.sql
-    
-    El comando genera: C:\tabcmd\TableauGitHub\lista_workbooks.txt
-    
-    Parámetros:
-    - comando_sqlplus: Comando completo a ejecutar
-    - timeout: Máximo de segundos a esperar
-    """
+    """Ejecuta comando SQL PLUS"""
     try:
         logger.info("[SQLPLUS] Ejecutando comando...")
-        logger.info("[SQLPLUS] Comando: %s", comando_sqlplus[:100] + "..." if len(comando_sqlplus) > 100 else comando_sqlplus)
         
-        # Ejecutar comando en Windows (shell=True para que interprete && correctamente)
         resultado = subprocess.run(
             comando_sqlplus,
             shell=True,
@@ -107,11 +93,7 @@ def ejecutar_sqlplus(comando_sqlplus, timeout=15):
 
 
 def esperar_archivo(ruta_archivo, timeout=15, intervalo=1):
-    """
-    Espera a que se genere el archivo lista_workbooks.txt
-    
-    Verifica cada 'intervalo' segundos hasta 'timeout' segundos máximo
-    """
+    """Espera a que se genere el archivo"""
     logger.info("[ESPERANDO] Archivo: %s", ruta_archivo)
     
     inicio = time.time()
@@ -121,8 +103,6 @@ def esperar_archivo(ruta_archivo, timeout=15, intervalo=1):
         if ruta.exists():
             tamaño = ruta.stat().st_size
             logger.info("[OK] Archivo encontrado (%d bytes)", tamaño)
-            
-            # Esperar un poco más para asegurar que se terminó de escribir
             time.sleep(2)
             return True
         
@@ -134,110 +114,55 @@ def esperar_archivo(ruta_archivo, timeout=15, intervalo=1):
     return False
 
 
-def parsear_lista_workbooks(ruta_archivo):
+def parsear_lista_workbooks(ruta_archivo, separador=','):
     """
-    Parsea el archivo lista_workbooks.txt generado por SQL PLUS.
+    Parsea archivo CSV/TSV/PIPE generado por SQL PLUS (VERSIÓN MEJORADA).
     
-    El archivo tiene un formato especial:
-    ─────────────────────────────────────────────────────────
-    WORKBOOK_LUID
-    ────────────────────────────────────────────────────────
-    cede88a2-52d7-439a-8d72-f16b42a73b89
+    Ahora SQL PLUS genera un formato LIMPIO:
+    ─────────────────────────────────────
+    WORKBOOK_LUID,WORKBOOK,RUTA_PROYECTO
+    cede88a2-52d7-439a-8d72-f16b42a73b89,Admin Insights Starter,Finance
+    def456ghi-789a-bcde-f012-3456789abcde,Dashboard_Budget,Finance
+    ghi789jkl-012b-cdef-3456-789abcdef012,Dashboard_RH,RRHH
+    ─────────────────────────────────────
     
-    WORKBOOK
-    ────────────────────────────────────────────────────────
-    Admin Insights Starter
-    
-    RUTA_PROYECTO
-    ────────────────────────────────────────────────────────
-    Finance
-    
-    OWNER_EMAIL
-    ────────────────────────────────────────────────────────
-    ...
-    
-    TIPO_ITEM                DESCARGAR
-    ────────────────────────────────────────────────────────
-    cede88a2-52d7-439a...    DESCARGAR
-    
-    WORKBOOK_LUID
-    ────────────────────────────────────────────────────────
-    (siguiente workbook)
-    ─────────────────────────────────────────────────────────
-    
-    Algoritmo:
-    1. Leer línea por línea
-    2. Detectar encabezados conocidos (WORKBOOK_LUID, WORKBOOK, RUTA_PROYECTO)
-    3. Saltarse líneas de guiones y vacías
-    4. Leer el valor (siguiente línea no vacía)
-    5. Agrupar por WORKBOOK_LUID
-    6. Cuando vuelve WORKBOOK_LUID, es un nuevo registro
+    Mucho más simple de parsear con pandas.read_csv()
     """
     
     try:
         logger.info("[PARSEANDO] Archivo: %s", ruta_archivo)
+        logger.info("[PARSEANDO] Separador: %r", separador)
         
-        workbooks = []
-        workbook_actual = {}
+        # Leer como CSV (pandas lo hace MUCHO mejor)
+        df = pd.read_csv(
+            ruta_archivo,
+            sep=separador,
+            skipinitialspace=True,  # Elimina espacios después de separador
+            dtype=str,               # Todo como string
+            encoding='utf-8'
+        )
         
-        # Encabezados que nos interesan
-        encabezados_buscados = ['WORKBOOK_LUID', 'WORKBOOK', 'RUTA_PROYECTO']
+        # Limpiar espacios en blanco
+        df = df.apply(lambda x: x.str.strip() if x.dtype == "object" else x)
         
-        with open(ruta_archivo, 'r', encoding='utf-8', errors='replace') as f:
-            lineas = f.readlines()
+        logger.info("[OK] Parseado: %d workbooks", len(df))
+        logger.info("[COLUMNAS] %s", ", ".join(df.columns))
         
-        i = 0
-        while i < len(lineas):
-            linea = lineas[i].strip()
-            
-            # Buscar encabezados conocidos
-            if linea in encabezados_buscados:
-                # Si WORKBOOK_LUID y ya tenemos datos, es un nuevo workbook
-                if linea == 'WORKBOOK_LUID' and workbook_actual:
-                    # Guardar el workbook anterior si está completo
-                    if 'WORKBOOK_LUID' in workbook_actual and 'WORKBOOK' in workbook_actual:
-                        workbooks.append(workbook_actual)
-                    workbook_actual = {}
-                
-                # Saltarse líneas de guiones (─────────────)
-                i += 1
-                while i < len(lineas) and ('─' in lineas[i] or '-' in lineas[i]):
-                    i += 1
-                
-                # Leer el valor (siguiente línea no vacía)
-                while i < len(lineas):
-                    valor = lineas[i].strip()
-                    if valor and not ('─' in valor or '-' in valor):
-                        workbook_actual[linea] = valor
-                        break
-                    i += 1
-            
-            i += 1
+        # Validar columnas requeridas
+        columnas_requeridas = ['WORKBOOK_LUID', 'WORKBOOK']
         
-        # Agregar el último workbook si está completo
-        if workbook_actual and 'WORKBOOK_LUID' in workbook_actual and 'WORKBOOK' in workbook_actual:
-            workbooks.append(workbook_actual)
+        for col in columnas_requeridas:
+            if col not in df.columns:
+                logger.error("[ERROR] Columna requerida no encontrada: %s", col)
+                logger.error("[INFO] Columnas disponibles: %s", ", ".join(df.columns))
+                return None
         
-        logger.info("[OK] Parseado: %d workbooks", len(workbooks))
-        
-        # Convertir a DataFrame para facilitar manejo
-        df = pd.DataFrame(workbooks)
-        
-        # Asegurar que tenemos las columnas necesarias
-        columnas_necesarias = ['WORKBOOK_LUID', 'WORKBOOK']
-        columnas_faltantes = [col for col in columnas_necesarias if col not in df.columns]
-        
-        if columnas_faltantes:
-            logger.error("[ERROR] Columnas faltantes: %s", columnas_faltantes)
-            return None
-        
-        # Si RUTA_PROYECTO no existe, usar valor por defecto
+        # Si falta RUTA_PROYECTO, usar default
         if 'RUTA_PROYECTO' not in df.columns:
-            logger.warning("[AVISO] RUTA_PROYECTO no encontrada, usando valor por defecto")
+            logger.warning("[AVISO] RUTA_PROYECTO no encontrada, usando 'default'")
             df['RUTA_PROYECTO'] = 'default'
         
-        logger.info("[OK] DataFrame creado: %d filas, %d columnas", len(df), len(df.columns))
-        
+        logger.info("[OK] DataFrame validado")
         return df
         
     except Exception as e:
@@ -246,9 +171,7 @@ def parsear_lista_workbooks(ruta_archivo):
 
 
 def limpiar_directorio(directorio_base):
-    """
-    Elimina completamente la carpeta de descargas y la recrea vacía.
-    """
+    """Limpia y recrea directorio"""
     logger.info("="*60)
     logger.info("LIMPIEZA DE DIRECTORIO")
     logger.info("="*60)
@@ -259,9 +182,9 @@ def limpiar_directorio(directorio_base):
         logger.info("[LIMPIANDO] Eliminando directorio: %s", directorio_base)
         try:
             shutil.rmtree(directorio_base)
-            logger.info("[OK] Directorio eliminado completamente")
+            logger.info("[OK] Directorio eliminado")
         except Exception as e:
-            logger.error("[ERROR] Error al eliminar directorio: %s", e)
+            logger.error("[ERROR] Error al eliminar: %s", e)
     
     try:
         Path(directorio_base).mkdir(parents=True, exist_ok=True)
@@ -272,7 +195,7 @@ def limpiar_directorio(directorio_base):
 
 
 def autenticar_tableau(config):
-    """Autentica en Tableau Server usando PAT"""
+    """Autentica en Tableau Server"""
     try:
         logger.info("[AUTENTICANDO] Tableau...")
         
@@ -294,11 +217,11 @@ def autenticar_tableau(config):
 
 
 def descargar_workbook(server, workbook_luid, ruta_destino):
-    """Descarga UN workbook de Tableau Server"""
+    """Descarga UN workbook"""
     try:
         ruta_destino = Path(ruta_destino)
-        
         ruta_destino.parent.mkdir(parents=True, exist_ok=True)
+        
         logger.info("[DESCARGANDO] %s", workbook_luid)
         
         ruta_temporal = str(ruta_destino.parent / ruta_destino.stem)
@@ -311,16 +234,14 @@ def descargar_workbook(server, workbook_luid, ruta_destino):
             
             if archivos_twbx:
                 shutil.move(str(archivos_twbx[0]), str(ruta_destino))
-                
                 try:
                     shutil.rmtree(carpeta_descargada)
                     logger.info("[OK] Descargado: %s", ruta_destino.name)
-                except Exception as e:
-                    logger.warning("[AVISO] No se limpió carpeta temporal: %s", e)
-                
+                except:
+                    pass
                 return True
             else:
-                logger.error("[ERROR] No se encontró .twbx dentro de carpeta")
+                logger.error("[ERROR] No se encontró .twbx")
                 return False
         else:
             if ruta_destino.exists():
@@ -336,7 +257,7 @@ def descargar_workbook(server, workbook_luid, ruta_destino):
 
 
 def procesar_descargas(server, df, directorio_base):
-    """Descarga todos los workbooks del DataFrame"""
+    """Descarga todos los workbooks"""
     
     estadisticas = {
         'total': len(df),
@@ -373,7 +294,7 @@ def procesar_descargas(server, df, directorio_base):
 
 
 def subir_github(directorio_base, config):
-    """Sube cambios a GitHub"""
+    """Sube a GitHub"""
     
     try:
         logger.info("="*60)
@@ -388,7 +309,7 @@ def subir_github(directorio_base, config):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         mensaje = f"Tableau Backup - {timestamp}"
         
-        logger.info("[GIT] git commit -m '%s'", mensaje)
+        logger.info("[GIT] git commit")
         resultado = subprocess.run(
             ['git', 'commit', '-m', mensaje],
             check=True,
@@ -397,22 +318,20 @@ def subir_github(directorio_base, config):
         )
         
         if "nothing to commit" in resultado.stdout.lower():
-            logger.info("[AVISO] No hay cambios que hacer commit")
+            logger.info("[AVISO] No hay cambios")
             return
         
-        logger.info("[GIT] git push origin main")
+        logger.info("[GIT] git push")
         subprocess.run(['git', 'push', 'origin', 'main'], check=True, capture_output=True)
         
-        logger.info("[OK] Subido a GitHub correctamente")
+        logger.info("[OK] Subido a GitHub")
         
-    except subprocess.CalledProcessError as e:
-        logger.error("[ERROR] Error en Git: %s", e)
     except Exception as e:
-        logger.error("[ERROR] Error al subir: %s", e)
+        logger.error("[ERROR] Error en GitHub: %s", e)
 
 
 def mostrar_reporte(estadisticas, tiempo_total):
-    """Muestra resumen final"""
+    """Muestra reporte final"""
     
     logger.info("="*60)
     logger.info("REPORTE FINAL")
@@ -430,7 +349,7 @@ def mostrar_reporte(estadisticas, tiempo_total):
     
     if estadisticas['tiempos']:
         promedio = sum(estadisticas['tiempos'].values()) / len(estadisticas['tiempos'])
-        logger.info("Tiempo promedio/workbook: %.2fs", promedio)
+        logger.info("Tiempo promedio/wb:    %.2fs", promedio)
     
     logger.info("="*60)
 
@@ -443,17 +362,22 @@ def main():
     """Orquestador principal"""
     
     parser = argparse.ArgumentParser(
-        description='Descarga workbooks Tableau usando SQL PLUS + Python'
+        description='Descarga workbooks Tableau usando SQL PLUS + Python (v2 MEJORADO)'
     )
     parser.add_argument(
         '--config',
         default='config.json',
-        help='Archivo de configuracion (default: config.json)'
+        help='Archivo de configuración (default: config.json)'
     )
     parser.add_argument(
         '--sin-github',
         action='store_true',
         help='Solo descargar, sin subir a GitHub'
+    )
+    parser.add_argument(
+        '--separador',
+        default=',',
+        help='Separador CSV (default: ,) - usar "\\t" para TSV o "|" para PIPE'
     )
     
     args = parser.parse_args()
@@ -478,7 +402,7 @@ def main():
         logger.error("[FATAL] No se pudo ejecutar SQL PLUS")
         sys.exit(1)
     
-    # PASO 2: Esperar a que se genere el archivo
+    # PASO 2: Esperar archivo
     logger.info("="*60)
     logger.info("PASO 2: ESPERAR ARCHIVO")
     logger.info("="*60)
@@ -486,24 +410,24 @@ def main():
     archivo_lista = config['archivo_lista_workbooks']
     
     if not esperar_archivo(archivo_lista, timeout):
-        logger.error("[FATAL] El archivo lista_workbooks.txt no se generó")
+        logger.error("[FATAL] El archivo no se generó")
         sys.exit(1)
     
-    # PASO 3: Parsear el archivo
+    # PASO 3: Parsear archivo
     logger.info("="*60)
-    logger.info("PASO 3: PARSEAR ARCHIVO")
+    logger.info("PASO 3: PARSEAR ARCHIVO (CSV/TSV/PIPE)")
     logger.info("="*60)
     
-    df = parsear_lista_workbooks(archivo_lista)
+    df = parsear_lista_workbooks(archivo_lista, args.separador)
     
     if df is None or len(df) == 0:
-        logger.error("[FATAL] No se pudo parsear el archivo o está vacío")
+        logger.error("[FATAL] No se pudo parsear el archivo")
         sys.exit(1)
     
-    # PASO 4: Limpiar directorio de descargas
+    # PASO 4: Limpiar directorio
     limpiar_directorio(directorio_base)
     
-    # PASO 5: Autenticar en Tableau
+    # PASO 5: Autenticar Tableau
     logger.info("="*60)
     logger.info("PASO 5: AUTENTICAR TABLEAU")
     logger.info("="*60)
@@ -513,23 +437,18 @@ def main():
     # PASO 6: Descargar workbooks
     estadisticas = procesar_descargas(server, df, directorio_base)
     
-    # PASO 7: Subir a GitHub
+    # PASO 7: Subir GitHub
     if not args.sin_github and config.get('github_enabled', True):
         subir_github(directorio_base, config)
     else:
-        logger.info("[AVISO] GitHub deshabilitado o --sin-github especificado")
+        logger.info("[AVISO] GitHub deshabilitado")
     
-    # Cerrar sesión
     server.auth.sign_out()
     
-    # PASO 8: Generar reporte
+    # PASO 8: Reporte
     tiempo_total = (datetime.now() - inicio_total).total_seconds()
     mostrar_reporte(estadisticas, tiempo_total)
 
-
-# ============================================================================
-# PUNTO DE ENTRADA
-# ============================================================================
 
 if __name__ == '__main__':
     main()

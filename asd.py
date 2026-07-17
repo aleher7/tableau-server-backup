@@ -1,285 +1,592 @@
 #!/usr/bin/env python3
-"""
-Script de diagnóstico: Compara tu Excel/TXT con dashboards reales en Tableau
-Identifica cuáles faltan, tienen LUID incorrecto, etc.
 
-ACTUALIZADO: Ahora lee automáticamente .txt, .csv, .xlsx, .dsv, etc.
+"""
+Script dual: Lee estructura de workbooks desde SQL PLUS o ARCHIVO
+Descarga workbooks de Tableau y los sube a GitHub
+Versión MEJORADA: Limpia carpeta antes de descargar + SQL PLUS integrado
 """
 
-import tableauserverclient as TSC
-import pandas as pd
+import os
 import sys
+import json
+import logging
+import subprocess
+import argparse
+import shutil
+import tempfile
 from pathlib import Path
+from datetime import datetime
+import pandas as pd
+
+try:
+    import tableauserverclient as TSC
+except ImportError:
+    print("ERROR: tableauserverclient no está instalado")
+    print("Instala con: pip install tableauserverclient")
+    sys.exit(1)
 
 # ============================================================================
-# CONFIGURACIÓN - EDITA ESTOS VALORES
+# CONFIGURACIÓN DE LOGGING
 # ============================================================================
 
-TABLEAU_SERVER = "https://tu_tableau_server"          # Ejemplo: https://tableau.miempresa.com
-TOKEN_NAME = "tu_token_name"                          # Tu PAT token name
-TOKEN = "tu_token"                                    # Tu PAT token
-SITE_ID = "tu_site"                                  # Tu site ID (default, site2, etc.)
-ARCHIVO_DATOS = "workbooks.txt"                       # .txt, .xlsx, .csv, .dsv, etc.
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('tableau_sync.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 # ============================================================================
-# LECTURA FLEXIBLE DE ARCHIVO
+# FUNCIONES PRINCIPALES
 # ============================================================================
+
+def cargar_config(config_file="config.json"):
+    """Carga la configuración desde JSON"""
+    try:
+        with open(config_file, 'r') as f:
+            config = json.load(f)
+        logger.info("[OK] Configuración cargada correctamente")
+        return config
+    except FileNotFoundError:
+        logger.error("[ERROR] Archivo %s no encontrado", config_file)
+        sys.exit(1)
+    except json.JSONDecodeError:
+        logger.error("[ERROR] Error al parsear %s", config_file)
+        sys.exit(1)
+
+
+def limpiar_directorio(directorio_base):
+    """
+    Elimina completamente el directorio y lo recrea
+    Si falla, intenta limpiar solo el contenido
+    """
+    logger.info("="*60)
+    logger.info("LIMPIEZA DE DIRECTORIO")
+    logger.info("="*60)
+    
+    ruta = Path(directorio_base)
+    
+    # INTENTO 1: Eliminar directorio completo
+    if ruta.exists():
+        logger.info("[LIMPIANDO] Eliminando directorio: %s", directorio_base)
+        try:
+            shutil.rmtree(directorio_base)
+            logger.info("[OK] Directorio eliminado completamente")
+        except PermissionError as e:
+            logger.warning("[AVISO] Permiso denegado, intentando limpiar contenido: %s", e)
+            # INTENTO 2: Limpiar solo el contenido
+            try:
+                for archivo in ruta.rglob('*'):
+                    try:
+                        if archivo.is_file():
+                            archivo.unlink()
+                            logger.debug("[DEL] Archivo: %s", archivo.name)
+                        elif archivo.is_dir() and archivo != ruta:
+                            shutil.rmtree(archivo)
+                            logger.debug("[DEL] Carpeta: %s", archivo.name)
+                    except Exception as ex:
+                        logger.warning("[AVISO] No se pudo borrar: %s", ex)
+                logger.info("[OK] Contenido del directorio limpiado")
+            except Exception as ex:
+                logger.error("[ERROR] No se pudo limpiar: %s", ex)
+        except Exception as e:
+            logger.error("[ERROR] Error al eliminar directorio: %s", e)
+    
+    # Recrear directorio
+    try:
+        Path(directorio_base).mkdir(parents=True, exist_ok=True)
+        logger.info("[OK] Directorio recreado: %s", directorio_base)
+    except Exception as e:
+        logger.error("[ERROR] No se pudo recrear directorio: %s", e)
+        sys.exit(1)
+
+
+def ejecutar_sqlplus(usuario, contraseña, dsn, consulta_sql):
+    """
+    Ejecuta una consulta con SQL PLUS
+    Retorna un DataFrame con los resultados
+    """
+    try:
+        logger.info("[SQLPLUS] Conectando con SQL PLUS...")
+        
+        # Crear archivo temporal con la consulta
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.sql', delete=False, encoding='utf-8') as f:
+            # Comandos SQL PLUS
+            f.write("SET FEEDBACK OFF\n")
+            f.write("SET PAGESIZE 0\n")
+            f.write("SET LINESIZE 1000\n")
+            f.write("SET COLSEP |\n")
+            f.write("SET HEADING ON\n")
+            f.write("WHENEVER SQLERROR EXIT SQL.SQLCODE\n")
+            
+            # Tu consulta
+            f.write(consulta_sql)
+            f.write("\nEXIT;\n")
+            
+            archivo_sql = f.name
+        
+        # Ejecutar SQL PLUS
+        conexion_string = f"{usuario}/{contraseña}@{dsn}"
+        
+        logger.info("[SQLPLUS] Ejecutando consulta...")
+        resultado = subprocess.run(
+            ['sqlplus', '-S', conexion_string],
+            stdin=open(archivo_sql, encoding='utf-8'),
+            capture_output=True,
+            text=True,
+            timeout=60
+        )
+        
+        # Limpiar archivo temporal
+        try:
+            os.unlink(archivo_sql)
+        except:
+            pass
+        
+        # Verificar errores
+        if resultado.returncode != 0:
+            logger.error("[ERROR] SQL PLUS error (código %d): %s", resultado.returncode, resultado.stderr)
+            return None
+        
+        if not resultado.stdout.strip():
+            logger.warning("[AVISO] SQL PLUS retornó sin datos")
+            return None
+        
+        # Parsear salida (separada por |)
+        lineas = [l.strip() for l in resultado.stdout.strip().split('\n') if l.strip()]
+        
+        if len(lineas) < 2:
+            logger.warning("[AVISO] No hay suficientes datos en la respuesta")
+            return None
+        
+        # Primera línea = encabezados
+        encabezados = [col.strip() for col in lineas[0].split('|')]
+        
+        # Resto = datos
+        datos = []
+        for linea in lineas[1:]:
+            if linea.strip():
+                valores = [val.strip() for val in linea.split('|')]
+                datos.append(valores)
+        
+        if not datos:
+            logger.warning("[AVISO] No hay datos en la tabla")
+            return None
+        
+        # Crear DataFrame
+        df = pd.DataFrame(datos, columns=encabezados)
+        
+        logger.info("[OK] Datos obtenidos de SQL PLUS: %d filas", len(df))
+        logger.debug("[COLUMNAS] %s", ", ".join(df.columns))
+        
+        return df
+        
+    except subprocess.TimeoutExpired:
+        logger.error("[ERROR] SQL PLUS timeout (>60 segundos)")
+        return None
+    except FileNotFoundError:
+        logger.error("[ERROR] SQL PLUS no encontrado. Verifica que esté instalado y en PATH")
+        return None
+    except Exception as e:
+        logger.error("[ERROR] Error en SQL PLUS: %s", e)
+        return None
+
 
 def leer_archivo_datos(ruta_archivo):
-    """Lee automáticamente .txt, .csv, .xlsx, .dsv, etc."""
-    
-    print(f"[LEYENDO] {ruta_archivo}...")
-    
+    """Lee el archivo de datos (Excel o DSV)"""
     try:
+        logger.info("[LEYENDO] Archivo: %s", ruta_archivo)
+        
+        # Detectar formato
         extension = Path(ruta_archivo).suffix.lower()
         
-        # Detectar formato y leer
+        # Leer según formato
         if extension == '.dsv':
-            # DSV: usa coma como separador con comillas
-            df = pd.read_csv(ruta_archivo, sep=',', quotechar='"', doublequote=True, skipinitialspace=True, on_bad_lines='skip')
-            print(f"[OK] Formato detectado: DSV (coma separada)")
+            df = pd.read_csv(
+                ruta_archivo,
+                sep=',',
+                quotechar='"',
+                doublequote=True,
+                skipinitialspace=True,
+                on_bad_lines='skip'
+            )
         elif extension in ['.xlsx', '.xls']:
-            # Excel
             df = pd.read_excel(ruta_archivo)
-            print(f"[OK] Formato detectado: Excel (.xlsx/.xls)")
         elif extension == '.csv':
-            # CSV: usa coma como separador
-            df = pd.read_csv(ruta_archivo, sep=',', quotechar='"', doublequote=True, skipinitialspace=True, on_bad_lines='skip')
-            print(f"[OK] Formato detectado: CSV (coma separada)")
-        elif extension == '.txt':
-            # TXT: intentar varias opciones
-            # Primero intentar con tabulación
-            try:
-                df = pd.read_csv(ruta_archivo, sep='\t', quotechar='"', doublequote=True, skipinitialspace=True, on_bad_lines='skip')
-                print(f"[OK] Formato detectado: TXT (tabulación)")
-            except:
-                # Si falla, intentar con coma
-                try:
-                    df = pd.read_csv(ruta_archivo, sep=',', quotechar='"', doublequote=True, skipinitialspace=True, on_bad_lines='skip')
-                    print(f"[OK] Formato detectado: TXT (coma separada)")
-                except:
-                    # Si aún falla, intentar con espacio
-                    df = pd.read_csv(ruta_archivo, sep='\s+', quotechar='"', doublequote=True, skipinitialspace=True, on_bad_lines='skip')
-                    print(f"[OK] Formato detectado: TXT (espacio separado)")
+            df = pd.read_csv(
+                ruta_archivo,
+                sep=',',
+                quotechar='"',
+                doublequote=True,
+                skipinitialspace=True,
+                on_bad_lines='skip'
+            )
         else:
-            # Por defecto intentar como TXT con tabulación
-            print(f"[AVISO] Extensión no reconocida, intentando como TXT...")
-            try:
-                df = pd.read_csv(ruta_archivo, sep='\t', quotechar='"', doublequote=True, skipinitialspace=True, on_bad_lines='skip')
-                print(f"[OK] Formato detectado: TXT (tabulación)")
-            except:
-                df = pd.read_csv(ruta_archivo, sep=',', quotechar='"', doublequote=True, skipinitialspace=True, on_bad_lines='skip')
-                print(f"[OK] Formato detectado: TXT (coma)")
+            logger.warning("[AVISO] Extension no reconocida, intentando como TXT")
+            df = pd.read_csv(ruta_archivo, sep='\t', on_bad_lines='skip')
         
-        # Limpiar espacios y comillas de nombres de columnas
+        logger.info("[OK] Archivo cargado: %d filas", len(df))
+        
+        # Limpiar columnas
         df.columns = [col.strip().replace('"', '') for col in df.columns]
         
-        # Limpiar comillas de valores
+        # Limpiar valores
         for col in df.columns:
             if df[col].dtype == 'object':
                 df[col] = df[col].astype(str).str.replace('"', '', regex=False).str.strip()
         
-        print(f"[OK] {len(df)} filas leídas\n")
+        # Búsqueda flexible de columnas
+        def buscar_columna(df, patrones):
+            for col in df.columns:
+                col_limpio = col.strip().upper().replace('"', '')
+                for patron in patrones:
+                    if col_limpio == patron.upper():
+                        logger.info("[MAPEO] Columna '%s' mapeada a '%s'", col, patron)
+                        return col
+            
+            for col in df.columns:
+                col_limpio = col.strip().upper()
+                for patron in patrones:
+                    if patron.upper() in col_limpio:
+                        if patron.upper() == 'WORKBOOK' and 'LUID' in col_limpio:
+                            continue
+                        if patron.upper() == 'RUTA' and 'LOCAL' in col_limpio:
+                            continue
+                        logger.info("[MAPEO] Columna '%s' mapeada parcialmente a '%s'", col, patron)
+                        return col
+            return None
         
-        # Mostrar columnas encontradas
-        print(f"Columnas detectadas: {', '.join(df.columns)}\n")
+        # Mapear columnas
+        col_luid = buscar_columna(df, ['WORKBOOK_LUID', 'LUID', 'ID'])
+        col_nombre = buscar_columna(df, ['WORKBOOK', 'NOMBRE', 'NAME'])
+        col_ruta = buscar_columna(df, ['RUTA_PROYECTO', 'PROYECTO', 'RUTA', 'PROJECT'])
+        col_descargar = buscar_columna(df, ['DESCARGAR', 'DOWNLOAD', 'ACTIVO', 'ACTIVE'])
+        
+        # Verificar columnas requeridas
+        if not col_luid:
+            logger.error("[ERROR] No se encontró columna WORKBOOK_LUID/LUID")
+            logger.error("[INFO] Columnas disponibles: %s", ", ".join(df.columns))
+            sys.exit(1)
+        if not col_nombre:
+            logger.error("[ERROR] No se encontró columna WORKBOOK/NOMBRE")
+            sys.exit(1)
+        if not col_ruta:
+            logger.error("[ERROR] No se encontró columna RUTA_PROYECTO/PROYECTO")
+            sys.exit(1)
+        
+        # Renombrar a estándar
+        df = df.rename(columns={
+            col_luid: 'WORKBOOK_LUID',
+            col_nombre: 'WORKBOOK',
+            col_ruta: 'RUTA_PROYECTO'
+        })
+        
+        # Filtrar descargas si existe la columna
+        if col_descargar:
+            df = df.rename(columns={col_descargar: 'DESCARGAR'})
+            df = df[df['DESCARGAR'].astype(str).str.upper().isin(['SÍ', 'SI', '1', 'TRUE', 'Y', 'YES'])]
+            logger.info("[FILTRADO] Workbooks para descargar: %d", len(df))
         
         return df
         
     except Exception as e:
-        print(f"[ERROR] No se pudo leer el archivo: {e}")
+        logger.error("[ERROR] Error al leer archivo: %s", e)
         sys.exit(1)
 
-# ============================================================================
-# BUSCAR COLUMNAS
-# ============================================================================
 
-def buscar_columna(df, patrones):
-    """Busca columna de forma flexible"""
-    # Primero exacta
-    for col in df.columns:
-        col_limpio = col.strip().upper().replace('"', '')
-        for patron in patrones:
-            if col_limpio == patron.upper():
-                return col
+def obtener_datos_inteligente(config, forzar_excel=False):
+    """
+    Obtiene datos de SQL PLUS con fallback a archivo
+    """
+    logger.info("="*60)
+    logger.info("OBTENER DATOS")
+    logger.info("="*60)
     
-    # Luego parcial
-    for col in df.columns:
-        col_limpio = col.strip().upper().replace('"', '')
-        for patron in patrones:
-            patron_upper = patron.upper()
-            if patron_upper in col_limpio:
-                if patron_upper == 'WORKBOOK' and 'LUID' in col_limpio:
-                    continue
-                if patron_upper == 'RUTA' and 'LOCAL' in col_limpio:
-                    continue
-                return col
-    return None
+    # Si fuerza Excel, salta SQL PLUS
+    if forzar_excel:
+        logger.info("[FORZANDO] Usando archivo de datos (--forzar-excel)")
+        archivo_datos = config.get('archivo_datos', 'workbooks.txt')
+        df = leer_archivo_datos(archivo_datos)
+        return df, "ARCHIVO_DATOS"
+    
+    # Intenta SQL PLUS
+    try:
+        consulta = config.get(
+            'sqlplus_query',
+            'SELECT * FROM DESCARGA_WORKBOOKS'
+        )
+        
+        df = ejecutar_sqlplus(
+            usuario=config['oracle_user'],
+            contraseña=config['oracle_password'],
+            dsn=config['oracle_dsn'],
+            consulta_sql=consulta
+        )
+        
+        if df is not None:
+            logger.info("[EXITO] Datos obtenidos desde SQL PLUS")
+            return df, "SQLPLUS"
+        
+    except KeyError as e:
+        logger.warning("[AVISO] Config incompleta para SQL PLUS: %s", e)
+    except Exception as e:
+        logger.error("[ERROR] SQL PLUS falló: %s", e)
+    
+    # Fallback a archivo
+    logger.warning("[FALLBACK] Usando archivo de datos")
+    archivo_datos = config.get('archivo_datos', 'workbooks.txt')
+    df = leer_archivo_datos(archivo_datos)
+    return df, "ARCHIVO_DATOS"
+
+
+def autenticar_tableau(config):
+    """Autentica en Tableau Server/Cloud"""
+    try:
+        logger.info("[AUTENTICANDO] Tableau...")
+        
+        tableau_auth = TSC.PersonalAccessTokenAuth(
+            token_name=config['tableau_token_name'],
+            personal_access_token=config['tableau_token'],
+            site_id=config['tableau_site']
+        )
+        
+        server = TSC.Server(config['tableau_server'])
+        server.auth.sign_in(tableau_auth)
+        
+        logger.info("[OK] Autenticado en Tableau")
+        return server
+        
+    except Exception as e:
+        logger.error("[ERROR] Error al autenticar: %s", e)
+        sys.exit(1)
+
+
+def descargar_workbook(server, workbook_luid, ruta_destino):
+    """Descarga un workbook de Tableau usando su LUID"""
+    try:
+        ruta_destino = Path(ruta_destino)
+        
+        # Crear directorio padre
+        ruta_destino.parent.mkdir(parents=True, exist_ok=True)
+        
+        logger.info("[DESCARGANDO] %s", workbook_luid)
+        
+        # Descargar sin extensión (truco importante)
+        ruta_temporal = str(ruta_destino.parent / ruta_destino.stem)
+        
+        server.workbooks.download(workbook_luid, filepath=ruta_temporal)
+        
+        # Procesar archivo descargado
+        carpeta_descargada = Path(ruta_temporal)
+        
+        if carpeta_descargada.is_dir():
+            archivos_twbx = list(carpeta_descargada.glob('*.twbx'))
+            
+            if archivos_twbx:
+                shutil.move(str(archivos_twbx[0]), str(ruta_destino))
+                
+                try:
+                    shutil.rmtree(carpeta_descargada)
+                    logger.info("[OK] Descargado: %s", ruta_destino.name)
+                except Exception as e:
+                    logger.warning("[AVISO] No se limpió carpeta temporal: %s", e)
+                
+                return True
+            else:
+                logger.error("[ERROR] No se encontró .twbx")
+                return False
+        else:
+            if ruta_destino.exists():
+                logger.info("[OK] Descargado: %s", ruta_destino.name)
+                return True
+            else:
+                logger.error("[ERROR] Archivo no encontrado")
+                return False
+        
+    except Exception as e:
+        logger.error("[ERROR] Error descargando: %s", e)
+        return False
+
+
+def procesar_descargas(server, df, directorio_base):
+    """Procesa las descargas de todos los workbooks"""
+    
+    estadisticas = {
+        'total': len(df),
+        'descargados': 0,
+        'errores': 0,
+        'tiempos': {}
+    }
+    
+    logger.info("="*60)
+    logger.info("DESCARGANDO WORKBOOKS")
+    logger.info("="*60)
+    
+    for contador, (idx, fila) in enumerate(df.iterrows(), 1):
+        workbook_luid = str(fila['WORKBOOK_LUID']).strip()
+        workbook_nombre = str(fila['WORKBOOK']).strip()
+        ruta_proyecto = str(fila['RUTA_PROYECTO']).strip()
+        
+        ruta_local = Path(directorio_base) / ruta_proyecto / f"{workbook_nombre}.twbx"
+        
+        logger.info("\n[%d/%d] %s", contador, len(df), workbook_nombre)
+        logger.info("       Proyecto: %s", ruta_proyecto)
+        logger.info("       LUID: %s", workbook_luid)
+        
+        inicio = datetime.now()
+        
+        if descargar_workbook(server, workbook_luid, ruta_local):
+            estadisticas['descargados'] += 1
+            tiempo = (datetime.now() - inicio).total_seconds()
+            estadisticas['tiempos'][workbook_nombre] = tiempo
+        else:
+            estadisticas['errores'] += 1
+    
+    return estadisticas
+
+
+def subir_github(directorio_base, config):
+    """Hace git add, commit y push a GitHub"""
+    
+    try:
+        logger.info("="*60)
+        logger.info("SUBIENDO A GITHUB")
+        logger.info("="*60)
+        
+        os.chdir(directorio_base)
+        
+        logger.info("[GIT] git add .")
+        subprocess.run(['git', 'add', '.'], check=True, capture_output=True)
+        
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        mensaje = f"Tableau Backup - {timestamp}"
+        
+        logger.info("[GIT] git commit -m '%s'", mensaje)
+        resultado = subprocess.run(
+            ['git', 'commit', '-m', mensaje],
+            check=True,
+            capture_output=True,
+            text=True
+        )
+        
+        if "nothing to commit" in resultado.stdout.lower():
+            logger.info("[AVISO] No hay cambios que hacer commit")
+            return
+        
+        logger.info("[GIT] git push origin main")
+        subprocess.run(['git', 'push', 'origin', 'main'], check=True, capture_output=True)
+        
+        logger.info("[OK] Subido a GitHub correctamente")
+        
+    except subprocess.CalledProcessError as e:
+        logger.error("[ERROR] Error en Git: %s", e)
+    except Exception as e:
+        logger.error("[ERROR] Error al subir: %s", e)
+
+
+def mostrar_reporte(estadisticas, tiempo_total):
+    """Muestra reporte de ejecución"""
+    
+    logger.info("="*60)
+    logger.info("REPORTE FINAL")
+    logger.info("="*60)
+    
+    logger.info("Total de workbooks:    %d", estadisticas['total'])
+    logger.info("Descargados:           %d [OK]", estadisticas['descargados'])
+    logger.info("Errores:               %d [ERROR]", estadisticas['errores'])
+    
+    if estadisticas['total'] > 0:
+        tasa = (estadisticas['descargados'] / estadisticas['total'] * 100)
+        logger.info("Tasa de exito:         %.1f%%", tasa)
+    
+    logger.info("Tiempo total:          %.2fs", tiempo_total)
+    
+    if estadisticas['tiempos']:
+        promedio = sum(estadisticas['tiempos'].values()) / len(estadisticas['tiempos'])
+        logger.info("Tiempo promedio/workbook: %.2fs", promedio)
+    
+    logger.info("="*60)
+
 
 # ============================================================================
-# MAIN
+# FUNCIÓN PRINCIPAL
 # ============================================================================
 
 def main():
-    # Autenticar
-    print("=" * 80)
-    print("[CONECTANDO] Tableau Server...")
-    print("=" * 80)
+    """Función principal - Coordinador del flujo"""
     
-    try:
-        tableau_auth = TSC.PersonalAccessTokenAuth(
-            token_name=TOKEN_NAME,
-            personal_access_token=TOKEN,
-            site_id=SITE_ID
-        )
-        
-        server = TSC.Server(TABLEAU_SERVER)
-        server.auth.sign_in(tableau_auth)
-        print("[OK] Conectado\n")
-    except Exception as e:
-        print(f"[ERROR] Error autenticando: {e}")
-        print(f"\nVerifica:")
-        print(f"  - TABLEAU_SERVER: {TABLEAU_SERVER}")
-        print(f"  - TOKEN_NAME: {TOKEN_NAME}")
-        print(f"  - SITE_ID: {SITE_ID}")
-        sys.exit(1)
+    # PASO 1: PROCESAR ARGUMENTOS
+    parser = argparse.ArgumentParser(
+        description='Descarga workbooks Tableau y sube a GitHub'
+    )
+    parser.add_argument(
+        '--config',
+        default='config.json',
+        help='Archivo de configuracion (default: config.json)'
+    )
+    parser.add_argument(
+        '--sin-github',
+        action='store_true',
+        help='Solo descargar, sin subir a GitHub'
+    )
+    parser.add_argument(
+        '--forzar-excel',
+        action='store_true',
+        help='Forzar uso de Excel/TXT (sin SQL PLUS)'
+    )
     
-    # Obtener dashboards reales
-    print("=" * 80)
-    print("[OBTENIENDO] Dashboards desde Tableau...")
-    print("=" * 80)
-    dashboards_reales = {}
+    args = parser.parse_args()
     
-    try:
-        for workbook in TSC.Pager(server.workbooks.get):
-            dashboards_reales[workbook.id] = {
-                'nombre': workbook.name,
-                'proyecto': workbook.project_name
-            }
-        
-        print(f"[OK] {len(dashboards_reales)} dashboards encontrados en Tableau\n")
-    except Exception as e:
-        print(f"[ERROR] Error obteniendo dashboards: {e}")
-        sys.exit(1)
+    # PASO 2: CRONOMETRAR EJECUCIÓN TOTAL
+    inicio_total = datetime.now()
     
-    # Leer archivo de datos
-    print("=" * 80)
-    print("[LEYENDO] Archivo de datos")
-    print("=" * 80)
+    # PASO 3: CARGAR CONFIGURACIÓN
+    logger.info("[CARGANDO] Configuración...")
+    config = cargar_config(args.config)
     
-    if not Path(ARCHIVO_DATOS).exists():
-        print(f"[ERROR] No se encontró: {ARCHIVO_DATOS}")
-        sys.exit(1)
+    # PASO 4: OBTENER DIRECTORIO BASE
+    directorio_base = config.get('directorio_descarga', './tableau_workbooks')
     
-    df = leer_archivo_datos(ARCHIVO_DATOS)
+    # PASO 5: ⭐ LIMPIAR DIRECTORIO (NUEVA FUNCIONALIDAD)
+    limpiar_directorio(directorio_base)
     
-    # Mapear columnas
-    col_luid = buscar_columna(df, ['WORKBOOK_LUID', 'LUID'])
-    col_nombre = buscar_columna(df, ['WORKBOOK'])
-    col_ruta = buscar_columna(df, ['RUTA_PROYECTO', 'PROYECTO', 'RUTA'])
+    # PASO 6: OBTENER DATOS
+    df, fuente_datos = obtener_datos_inteligente(config, args.forzar_excel)
     
-    if not col_luid:
-        print(f"[ERROR] No se encontró columna WORKBOOK_LUID")
-        print(f"Columnas disponibles: {', '.join(df.columns)}")
-        sys.exit(1)
-    if not col_nombre:
-        print(f"[ERROR] No se encontró columna WORKBOOK")
-        sys.exit(1)
+    # PASO 7: AUTENTICAR EN TABLEAU
+    logger.info("="*60)
+    logger.info("AUTENTICAR EN TABLEAU")
+    logger.info("="*60)
+    server = autenticar_tableau(config)
     
-    # Renombrar
-    df = df.rename(columns={
-        col_luid: 'WORKBOOK_LUID',
-        col_nombre: 'WORKBOOK'
-    })
+    # PASO 8: MOSTRAR INFO
+    logger.info("\n[DIRECTORIO] %s", directorio_base)
+    logger.info("[FUENTE] %s", fuente_datos.upper())
+    logger.info("[WORKBOOKS] %d para descargar", len(df))
     
-    if col_ruta:
-        df = df.rename(columns={col_ruta: 'RUTA_PROYECTO'})
+    # PASO 9: DESCARGAR WORKBOOKS
+    estadisticas = procesar_descargas(server, df, directorio_base)
     
-    # Comparar
-    print("=" * 80)
-    print("DIAGNÓSTICO")
-    print("=" * 80 + "\n")
-    
-    encontrados = 0
-    no_encontrados = 0
-    luid_incorrecto = 0
-    
-    # Mapeo de LUID correcto para sugerencias
-    nombre_a_luid = {db['nombre'].lower(): luid for luid, db in dashboards_reales.items()}
-    
-    for idx, fila in df.iterrows():
-        luid = str(fila['WORKBOOK_LUID']).strip()
-        nombre_excel = str(fila['WORKBOOK']).strip()
-        
-        # Omitir filas vacías
-        if not luid or luid.lower() == 'nan':
-            continue
-        
-        if luid in dashboards_reales:
-            nombre_real = dashboards_reales[luid]['nombre']
-            proyecto_real = dashboards_reales[luid]['proyecto']
-            
-            if nombre_real == nombre_excel:
-                encontrados += 1
-                print(f"✅ [{idx+1}] {nombre_excel}")
-                print(f"    Proyecto: {proyecto_real}")
-                print(f"    LUID: {luid[:20]}...\n")
-            else:
-                luid_incorrecto += 1
-                print(f"⚠️  [{idx+1}] LUID CORRECTO pero NOMBRE DIFERENTE:")
-                print(f"    Excel:    {nombre_excel}")
-                print(f"    Tableau:  {nombre_real}")
-                print(f"    Proyecto: {proyecto_real}")
-                print(f"    LUID:     {luid[:20]}...\n")
-        else:
-            no_encontrados += 1
-            print(f"❌ [{idx+1}] NO ENCONTRADO: {nombre_excel}")
-            print(f"    LUID: {luid}")
-            
-            # Buscar si existe con otro LUID
-            nombre_excel_lower = nombre_excel.lower()
-            if nombre_excel_lower in nombre_a_luid:
-                luid_correcto = nombre_a_luid[nombre_excel_lower]
-                db_correcto = dashboards_reales[luid_correcto]
-                print(f"    💡 Sugerencia: Encontrado en Tableau con LUID diferente:")
-                print(f"       Nombre:  {db_correcto['nombre']}")
-                print(f"       LUID:    {luid_correcto}")
-                print(f"       Proyecto: {db_correcto['proyecto']}")
-            else:
-                # Buscar nombres similares
-                nombres_similares = [
-                    (luid_real, db['nombre']) 
-                    for luid_real, db in dashboards_reales.items() 
-                    if nombre_excel_lower in db['nombre'].lower() or 
-                       db['nombre'].lower() in nombre_excel_lower
-                ]
-                
-                if nombres_similares:
-                    print(f"    💡 Sugerencias de nombres similares:")
-                    for luid_real, nombre_similar in nombres_similares[:3]:
-                        print(f"       - {nombre_similar}")
-                        print(f"         LUID: {luid_real}")
-            print()
-    
-    # Resumen
-    print("=" * 80)
-    print("RESUMEN")
-    print("=" * 80)
-    total = encontrados + luid_incorrecto + no_encontrados
-    print(f"✅ Encontrados:        {encontrados}/{total}")
-    print(f"⚠️  LUID incorrecto:    {luid_incorrecto}/{total}")
-    print(f"❌ No encontrados:     {no_encontrados}/{total}")
-    print("=" * 80)
-    
-    if no_encontrados > 0 or luid_incorrecto > 0:
-        print("\n[ACCIÓN RECOMENDADA]")
-        print("1. Verifica los LUID con el script de generación de Excel")
-        print("2. Revisa los nombres exactamente como aparecen en Tableau")
-        print("3. Asegúrate de que tienes permisos para descargar estos dashboards")
+    # PASO 10: SUBIR A GITHUB (OPCIONAL)
+    if not args.sin_github and config.get('github_enabled', True):
+        subir_github(directorio_base, config)
     else:
-        print("\n✅ ¡TODOS LOS DASHBOARDS ESTÁN LISTOS!")
+        logger.info("[AVISO] GitHub deshabilitado o --sin-github especificado")
     
+    # PASO 11: CERRAR SESIÓN
     server.auth.sign_out()
+    
+    # PASO 12: GENERAR REPORTE
+    tiempo_total = (datetime.now() - inicio_total).total_seconds()
+    mostrar_reporte(estadisticas, tiempo_total)
+
+
+# ============================================================================
+# PUNTO DE ENTRADA
+# ============================================================================
 
 if __name__ == '__main__':
     main()

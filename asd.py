@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 
 """
-Script MEJORADO para descargar workbooks de Tableau usando:
+Script CORREGIDO para descargar workbooks de Tableau usando:
 1. SQL PLUS (ejecuta consulta, genera lista_workbooks.txt en formato CSV)
 2. Python (parsea CSV, descarga workbooks, sube a GitHub)
 
-MEJORAS v2:
-- Parsea CSV/TSV/PIPE en lugar de formato raro de SQL PLUS
-- Código mucho más simple y robusto
-- Mejor validación
+CORRECCIONES v2:
+- Validación robusta de config.json
+- Mensajes de error claros
+- Manejo seguro de variables faltantes
 """
 
 import os
@@ -45,21 +45,117 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# FUNCIONES
+# FUNCIONES DE VALIDACIÓN
+# ============================================================================
+
+def validar_config(config):
+    """Valida que el config.json tenga todas las claves necesarias"""
+    
+    logger.info("="*60)
+    logger.info("VALIDANDO CONFIGURACIÓN")
+    logger.info("="*60)
+    
+    # Claves requeridas para SQL PLUS
+    claves_sqlplus_requeridas = [
+        'sqlplus_comando',
+        'archivo_lista_workbooks'
+    ]
+    
+    # Claves requeridas para Tableau
+    claves_tableau_requeridas = [
+        'tableau_server',
+        'tableau_token_name',
+        'tableau_token',
+        'tableau_site'
+    ]
+    
+    # Claves opcionales con valores por defecto
+    claves_opcionales = {
+        'directorio_descarga': './tableau_workbooks',
+        'timeout_sqlplus': 15,
+        'github_enabled': True
+    }
+    
+    # VALIDAR CLAVES SQL PLUS
+    logger.info("[VERIFICANDO] Claves SQL PLUS...")
+    for clave in claves_sqlplus_requeridas:
+        if clave not in config:
+            logger.error("[ERROR] Clave REQUERIDA no encontrada: %s", clave)
+            logger.error("[ERROR] Claves disponibles: %s", ", ".join(config.keys()))
+            logger.error("")
+            logger.error("Por favor, agrega estas claves a tu config.json:")
+            for c in claves_sqlplus_requeridas:
+                if c not in config:
+                    logger.error('  "%s": "...",', c)
+            sys.exit(1)
+        else:
+            logger.info("  ✅ %s encontrada", clave)
+    
+    # VALIDAR CLAVES TABLEAU
+    logger.info("[VERIFICANDO] Claves Tableau...")
+    for clave in claves_tableau_requeridas:
+        if clave not in config:
+            logger.error("[ERROR] Clave REQUERIDA no encontrada: %s", clave)
+            logger.error("[ERROR] Claves disponibles: %s", ", ".join(config.keys()))
+            logger.error("")
+            logger.error("Por favor, agrega estas claves a tu config.json:")
+            for c in claves_tableau_requeridas:
+                if c not in config:
+                    logger.error('  "%s": "...",', c)
+            sys.exit(1)
+        else:
+            logger.info("  ✅ %s encontrada", clave)
+    
+    # CLAVES OPCIONALES
+    logger.info("[VERIFICANDO] Claves opcionales...")
+    for clave, valor_default in claves_opcionales.items():
+        if clave not in config:
+            logger.info("  ⚠️  %s no encontrada, usando default: %s", clave, valor_default)
+            config[clave] = valor_default
+        else:
+            logger.info("  ✅ %s encontrada", clave)
+    
+    logger.info("[OK] Configuración validada correctamente")
+    logger.info("")
+    return config
+
+
+# ============================================================================
+# FUNCIONES PRINCIPALES
 # ============================================================================
 
 def cargar_config(config_file="config.json"):
-    """Carga la configuración desde JSON"""
+    """Carga y valida la configuración desde JSON"""
     try:
         with open(config_file, 'r') as f:
             config = json.load(f)
-        logger.info("[OK] Configuración cargada correctamente")
+        logger.info("[OK] Archivo %s cargado", config_file)
+        
+        # VALIDAR CONFIGURACIÓN
+        config = validar_config(config)
+        
         return config
     except FileNotFoundError:
         logger.error("[ERROR] Archivo %s no encontrado", config_file)
+        logger.error("")
+        logger.error("Debes crear un archivo config.json con este contenido:")
+        logger.error("")
+        logger.error("""{
+  "tableau_server": "https://tu_tableau_server.com",
+  "tableau_token_name": "tu_nombre_del_token",
+  "tableau_token": "tu_token_aqui",
+  "tableau_site": "default",
+  
+  "directorio_descarga": "./tableau_workbooks",
+  "github_enabled": true,
+  
+  "sqlplus_comando": "cd C:\\\\oracle\\\\instantclient_23_0 && sqlplus -S usuario/password@servidor:1521/SID @C:\\\\tabcmd\\\\TableauGitHub\\\\Descarga.sql",
+  "archivo_lista_workbooks": "C:\\\\tabcmd\\\\TableauGitHub\\\\lista_workbooks.txt",
+  "timeout_sqlplus": 15
+}""")
         sys.exit(1)
     except json.JSONDecodeError:
-        logger.error("[ERROR] Error al parsear %s", config_file)
+        logger.error("[ERROR] Error al parsear %s (JSON inválido)", config_file)
         sys.exit(1)
 
 
@@ -67,6 +163,7 @@ def ejecutar_sqlplus(comando_sqlplus, timeout=15):
     """Ejecuta comando SQL PLUS"""
     try:
         logger.info("[SQLPLUS] Ejecutando comando...")
+        logger.info("[SQLPLUS] Timeout: %d segundos", timeout)
         
         resultado = subprocess.run(
             comando_sqlplus,
@@ -86,6 +183,7 @@ def ejecutar_sqlplus(comando_sqlplus, timeout=15):
         
     except subprocess.TimeoutExpired:
         logger.error("[ERROR] SQL PLUS timeout (>%d segundos)", timeout)
+        logger.error("[ERROR] El comando tardó demasiado. Aumenta timeout_sqlplus en config.json")
         return False
     except Exception as e:
         logger.error("[ERROR] Error ejecutando SQL PLUS: %s", e)
@@ -116,29 +214,19 @@ def esperar_archivo(ruta_archivo, timeout=15, intervalo=1):
 
 def parsear_lista_workbooks(ruta_archivo, separador=','):
     """
-    Parsea archivo CSV/TSV/PIPE generado por SQL PLUS (VERSIÓN MEJORADA).
-    
-    Ahora SQL PLUS genera un formato LIMPIO:
-    ─────────────────────────────────────
-    WORKBOOK_LUID,WORKBOOK,RUTA_PROYECTO
-    cede88a2-52d7-439a-8d72-f16b42a73b89,Admin Insights Starter,Finance
-    def456ghi-789a-bcde-f012-3456789abcde,Dashboard_Budget,Finance
-    ghi789jkl-012b-cdef-3456-789abcdef012,Dashboard_RH,RRHH
-    ─────────────────────────────────────
-    
-    Mucho más simple de parsear con pandas.read_csv()
+    Parsea archivo CSV/TSV/PIPE generado por SQL PLUS
     """
     
     try:
         logger.info("[PARSEANDO] Archivo: %s", ruta_archivo)
         logger.info("[PARSEANDO] Separador: %r", separador)
         
-        # Leer como CSV (pandas lo hace MUCHO mejor)
+        # Leer como CSV
         df = pd.read_csv(
             ruta_archivo,
             sep=separador,
-            skipinitialspace=True,  # Elimina espacios después de separador
-            dtype=str,               # Todo como string
+            skipinitialspace=True,
+            dtype=str,
             encoding='utf-8'
         )
         
@@ -155,6 +243,10 @@ def parsear_lista_workbooks(ruta_archivo, separador=','):
             if col not in df.columns:
                 logger.error("[ERROR] Columna requerida no encontrada: %s", col)
                 logger.error("[INFO] Columnas disponibles: %s", ", ".join(df.columns))
+                logger.error("")
+                logger.error("Verifica tu archivo Descarga.sql:")
+                logger.error("- ¿Están todas las columnas en el SELECT?")
+                logger.error("- ¿El separador (SET COLSEP) es el correcto?")
                 return None
         
         # Si falta RUTA_PROYECTO, usar default
@@ -167,6 +259,12 @@ def parsear_lista_workbooks(ruta_archivo, separador=','):
         
     except Exception as e:
         logger.error("[ERROR] Error parseando archivo: %s", e)
+        logger.error("")
+        logger.error("Posibles causas:")
+        logger.error("- El archivo no existe")
+        logger.error("- El archivo está vacío")
+        logger.error("- El separador (--separador) es incorrecto")
+        logger.error("- El archivo tiene formato incorrecto")
         return None
 
 
@@ -213,6 +311,12 @@ def autenticar_tableau(config):
         
     except Exception as e:
         logger.error("[ERROR] Error al autenticar: %s", e)
+        logger.error("")
+        logger.error("Verifica en config.json:")
+        logger.error("- tableau_server: %s", config.get('tableau_server', 'NO DEFINIDO'))
+        logger.error("- tableau_token_name: %s", config.get('tableau_token_name', 'NO DEFINIDO'))
+        logger.error("- tableau_token: [oculto]")
+        logger.error("- tableau_site: %s", config.get('tableau_site', 'NO DEFINIDO'))
         sys.exit(1)
 
 
@@ -362,7 +466,7 @@ def main():
     """Orquestador principal"""
     
     parser = argparse.ArgumentParser(
-        description='Descarga workbooks Tableau usando SQL PLUS + Python (v2 MEJORADO)'
+        description='Descarga workbooks Tableau usando SQL PLUS + Python (v2 CORREGIDO)'
     )
     parser.add_argument(
         '--config',
@@ -384,7 +488,7 @@ def main():
     
     inicio_total = datetime.now()
     
-    # Cargar configuración
+    # Cargar y validar configuración
     logger.info("[CARGANDO] Configuración...")
     config = cargar_config(args.config)
     

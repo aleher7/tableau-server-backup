@@ -76,6 +76,15 @@ def main():
 
     print()
     print("="*70)
+    print("2.5 Comprobando qué librería 'jwt' está realmente instalada")
+    print("="*70)
+    print(f"Módulo cargado desde: {pyjwt.__file__}")
+    print(f"Versión (si aplica) : {getattr(pyjwt, '__version__', 'NO TIENE __version__ -> sospechoso')}")
+    print("PyJWT (la correcta) siempre tiene __version__ y expone jwt.encode()/jwt.decode().")
+    print("Si el archivo cargado NO está dentro de una carpeta 'PyJWT' o similar,")
+    print("es probable que tengas instalado el paquete 'jwt' incorrecto (no PyJWT).")
+    print()
+    print("="*70)
     print("3. Generando el JWT y mostrando su contenido (sin verificar firma)")
     print("="*70)
     ahora = int(time.time())
@@ -85,6 +94,16 @@ def main():
         'iss': app_id
     }
     token = pyjwt.encode(payload, contenido, algorithm='RS256')
+
+    print(f"Tipo de dato del token generado: {type(token)}")
+    if isinstance(token, bytes):
+        print("⚠️  El token es 'bytes', no 'str'. Con versiones antiguas de PyJWT")
+        print("   (anteriores a la 2.0) esto es normal, PERO hay que decodificarlo")
+        print("   a texto antes de usarlo en la cabecera Authorization, si no,")
+        print("   se envía literalmente como \"b'eyJhbGci...'\" y GitHub no lo puede leer.")
+        token = token.decode('utf-8')
+        print("   -> Se ha corregido automáticamente aquí para continuar la prueba.")
+    print(f"Primeros 20 caracteres del token: {token[:20]!r}")
 
     # Decodificamos el propio JWT que acabamos de generar, SOLO para
     # mostrar su contenido -- no verifica nada, es solo lectura del payload

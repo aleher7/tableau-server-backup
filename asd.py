@@ -1,87 +1,113 @@
 """
-Diagnóstico: lista todas las instalaciones REALES de tu GitHub App.
+Diagnóstico del error 401 al generar el token de la GitHub App.
 
-Sirve para averiguar el Installation ID correcto cuando el que se está
-usando da error 404. Solo necesita el App ID y el .pem -- NO necesita
-el installation_id (es precisamente lo que vamos a descubrir).
+Comprueba, en orden:
+  1. Si el .pem tiene formato correcto (cabecera/pie PEM válidos)
+  2. Si el reloj de este PC está desincronizado respecto al de GitHub
+     (causa nº1, con diferencia, de un 401 "raro")
+  3. Muestra el JWT decodificado (sin verificar) para que puedas comprobar
+     tú mismo que el App ID (claim 'iss') es el que esperas
+  4. Muestra la respuesta COMPLETA de error de GitHub (antes se recortaba
+     a 300 caracteres; el mensaje completo suele decir la causa exacta)
 
 USO:
-    python listar_installations_github_app.py
+    python diagnostico_401_github_app.py
 """
 
 import json
 import time
+from datetime import datetime, timezone
 import jwt as pyjwt
 import requests
 
 
-def generar_jwt_github_app(app_id, ruta_llave_privada):
+def main():
+    config = json.load(open('config.json'))
+    ruta_pem = config['github_private_key_path']
+    app_id = config['github_app_id']
+
+    print("="*70)
+    print("1. Comprobando el archivo .pem")
+    print("="*70)
+    with open(ruta_pem, 'r') as f:
+        contenido = f.read()
+
+    primera_linea = contenido.strip().splitlines()[0] if contenido.strip() else ""
+    ultima_linea = contenido.strip().splitlines()[-1] if contenido.strip() else ""
+
+    print(f"Primera línea del archivo: {primera_linea!r}")
+    print(f"Última línea del archivo : {ultima_linea!r}")
+
+    if "BEGIN RSA PRIVATE KEY" in contenido or "BEGIN PRIVATE KEY" in contenido:
+        print("✅ El archivo tiene cabecera PEM válida")
+    else:
+        print("❌ El archivo NO parece un .pem válido")
+        print("   (debería empezar por '-----BEGIN RSA PRIVATE KEY-----' o similar)")
+        return
+
+    print()
+    print("="*70)
+    print("2. Comprobando la hora de este PC frente a la hora real de GitHub")
+    print("="*70)
+    hora_local = datetime.now(timezone.utc)
+    print(f"Hora de este PC (UTC)      : {hora_local}")
+
+    try:
+        resp = requests.get("https://api.github.com", timeout=10)
+        hora_github = datetime.strptime(
+            resp.headers['Date'], '%a, %d %b %Y %H:%M:%S %Z'
+        ).replace(tzinfo=timezone.utc)
+        print(f"Hora real de GitHub (UTC)  : {hora_github}")
+
+        diferencia = abs((hora_local - hora_github).total_seconds())
+        print(f"Diferencia                 : {diferencia:.0f} segundos")
+
+        if diferencia > 60:
+            print()
+            print("❌ ¡AQUÍ ESTÁ EL PROBLEMA! El reloj de este PC está desincronizado")
+            print("   más de 60 segundos respecto a la hora real.")
+            print("   Solución en Windows:")
+            print("   Configuración > Hora e idioma > Fecha y hora > 'Sincronizar ahora'")
+            print("   (o revisa que la zona horaria configurada sea la correcta)")
+        else:
+            print("✅ El reloj está sincronizado correctamente (no es la causa)")
+    except Exception as e:
+        print(f"⚠️  No se pudo comprobar la hora de GitHub: {e}")
+
+    print()
+    print("="*70)
+    print("3. Generando el JWT y mostrando su contenido (sin verificar firma)")
+    print("="*70)
     ahora = int(time.time())
     payload = {
         'iat': ahora - 60,
         'exp': ahora + (10 * 60),
         'iss': app_id
     }
-    with open(ruta_llave_privada, 'r') as f:
-        llave_privada = f.read()
-    return pyjwt.encode(payload, llave_privada, algorithm='RS256')
+    token = pyjwt.encode(payload, contenido, algorithm='RS256')
 
+    # Decodificamos el propio JWT que acabamos de generar, SOLO para
+    # mostrar su contenido -- no verifica nada, es solo lectura del payload
+    decodificado = pyjwt.decode(token, options={"verify_signature": False})
+    print(f"Payload del JWT enviado a GitHub: {decodificado}")
+    print(f"  -> 'iss' (App ID usado)        : {decodificado['iss']!r}")
+    print("  Confirma que este es EXACTAMENTE tu App ID (revisa que no tenga")
+    print("  comillas de más, espacios, o que sea el Client ID por error)")
 
-def main():
-    config = json.load(open('config.json'))
-
-    jwt_token = generar_jwt_github_app(
-        config['github_app_id'],
-        config['github_private_key_path']
-    )
-
-    # Este endpoint devuelve TODAS las instalaciones de la App identificada
-    # por el JWT (es decir, por el App ID + .pem) -- no requiere adivinar
-    # ningún installation_id de antemano.
+    print()
+    print("="*70)
+    print("4. Enviando el JWT a GitHub y mostrando la respuesta COMPLETA")
+    print("="*70)
     url = "https://api.github.com/app/installations"
     headers = {
-        "Authorization": f"Bearer {jwt_token}",
+        "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28"
     }
-
     respuesta = requests.get(url, headers=headers, timeout=15)
-
-    print(f"Código de respuesta: {respuesta.status_code}")
-    print()
-
-    if respuesta.status_code == 401:
-        print("❌ 401 Unauthorized: el JWT fue RECHAZADO.")
-        print("   Esto significa que el problema está en github_app_id o en el .pem,")
-        print("   no en el installation_id. Revisa que:")
-        print("   - github_app_id sea EXACTAMENTE el App ID (un número), no el Client ID")
-        print("   - El .pem sea el correcto para esa App (si tienes varias llaves, prueba otra)")
-        return
-
-    if respuesta.status_code != 200:
-        print(f"❌ Error inesperado: {respuesta.text[:400]}")
-        return
-
-    instalaciones = respuesta.json()
-
-    if not instalaciones:
-        print("⚠️  El JWT es válido (App ID y .pem correctos), pero esta App")
-        print("   no está instalada en NINGÚN sitio todavía.")
-        print("   -> Pide que instalen la App en el repositorio/organización.")
-        return
-
-    print(f"✅ Se encontraron {len(instalaciones)} instalación/es de tu App:")
-    print()
-    for inst in instalaciones:
-        print(f"   Installation ID : {inst['id']}")
-        print(f"   Instalada en    : {inst['account']['login']}")
-        print(f"   Tipo de cuenta  : {inst['account']['type']}")
-        print(f"   Permisos        : {inst.get('permissions', {})}")
-        print("   " + "-"*50)
-
-    print()
-    print("Copia el 'Installation ID' correcto (el que corresponde a tu")
-    print("organización/repo) dentro de github_installation_id en config.json")
+    print(f"Código: {respuesta.status_code}")
+    print(f"Respuesta completa de GitHub:")
+    print(json.dumps(respuesta.json(), indent=2, ensure_ascii=False))
 
 
 if __name__ == '__main__':

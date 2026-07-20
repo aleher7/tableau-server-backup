@@ -34,6 +34,8 @@ import time
 from pathlib import Path
 from datetime import datetime
 import pandas as pd
+import jwt as pyjwt      # PyJWT: firma el token de autenticación de la GitHub App
+import requests          # Para llamar a la API REST de GitHub y pedir el token de instalación
 import re  # NOTA: actualmente no se usa 're' en ningún sitio del script.
            # Se puede eliminar este import sin que nada se rompa.
 
@@ -95,13 +97,25 @@ def validar_config(config):
         'tableau_site'
     ]
 
-    # Claves que NO son obligatorias: si faltan, se usa un valor razonable
-    # por defecto en vez de detener el script.
+    # Claves opcionales con valores por defecto.
+    # (github_enabled se valida aparte más abajo porque, si es true,
+    #  deja de ser "opcional": exige las 5 claves de GitHub App)
     claves_opcionales = {
         'directorio_descarga': './tableau_workbooks',
         'timeout_sqlplus': 15,
         'github_enabled': True
     }
+
+    # Claves SIN las cuales no se puede autenticar la GitHub App
+    # (solo se exigen si github_enabled es true; si está en false, se
+    #  ignoran por completo porque no se va a intentar subir nada)
+    claves_github_requeridas = [
+        'github_app_id',
+        'github_installation_id',
+        'github_private_key_path',
+        'github_owner',
+        'github_repo_name'
+    ]
 
     # --- Validar claves de SQL PLUS ---
     logger.info("[VERIFICANDO] Claves SQL PLUS...")
@@ -141,6 +155,25 @@ def validar_config(config):
             config[clave] = valor_default
         else:
             logger.info(" %s encontrada", clave)
+
+    # --- Validar claves de GitHub App (solo si github_enabled == True) ---
+    # Esto se comprueba DESPUÉS de rellenar los defaults, porque
+    # 'github_enabled' podría no venir en config.json y haberse rellenado
+    # con su valor por defecto (True) justo en el bucle de arriba.
+    if config.get('github_enabled'):
+        logger.info("[VERIFICANDO] Claves GitHub App (github_enabled=true)...")
+        for clave in claves_github_requeridas:
+            if clave not in config:
+                logger.error("[ERROR] Clave REQUERIDA no encontrada: %s", clave)
+                logger.error("")
+                logger.error("Por favor, agrega estas claves a tu config.json")
+                logger.error("(o pon \"github_enabled\": false si no quieres subir a GitHub):")
+                for c in claves_github_requeridas:
+                    if c not in config:
+                        logger.error('  "%s": "...",', c)
+                sys.exit(1)
+            else:
+                logger.info(" %s encontrada", clave)
 
     logger.info("[OK] Configuración validada correctamente")
     logger.info("")
@@ -555,17 +588,140 @@ def procesar_descargas(server, df, directorio_base):
     return estadisticas
 
 
+def generar_jwt_github_app(app_id, ruta_llave_privada):
+    """
+    Crea un JWT (JSON Web Token) firmado con la llave privada de la GitHub App.
+
+    Este JWT es como una "credencial de la app en general" — sirve para
+    demostrarle a GitHub "soy la App con este App ID", pero TODAVÍA no da
+    permiso para tocar ningún repositorio concreto. Solo es el paso
+    intermedio para pedir el token de instalación (ver función siguiente).
+
+    Dura muy poco a propósito (10 minutos): así, si alguien lo intercepta,
+    deja de servir casi enseguida. Por eso se genera uno nuevo cada vez que
+    se ejecuta el script, en vez de guardarlo.
+    """
+    ahora = int(time.time())
+
+    payload = {
+        'iat': ahora - 60,       # "issued at": se resta 1 minuto por si el
+                                  # reloj del servidor de GitHub va un poco
+                                  # adelantado respecto al de esta máquina
+        'exp': ahora + (10 * 60),  # "expira en": 10 minutos desde ahora (máximo permitido por GitHub)
+        'iss': app_id             # "issuer": el App ID, identifica QUÉ app está pidiendo esto
+    }
+
+    with open(ruta_llave_privada, 'r') as f:
+        llave_privada = f.read()
+
+    # algorithm='RS256' -> la llave privada de una GitHub App siempre es RSA,
+    # por eso se firma con este algoritmo (no vale HS256, que es de llave simétrica)
+    token = pyjwt.encode(payload, llave_privada, algorithm='RS256')
+    return token
+
+
+def obtener_installation_token(app_id, installation_id, ruta_llave_privada):
+    """
+    Cambia el JWT "genérico de la app" (función anterior) por un token de
+    instalación válido para el repositorio concreto donde se instaló la app.
+
+    Este SÍ es el token que se usa para hacer git push, equivalente en la
+    práctica a un Personal Access Token, pero con dos ventajas:
+      - Expira solo en ~1 hora (mucho más seguro que un PAT que dura meses)
+      - Solo tiene los permisos que el administrador le dio a la app al
+        instalarla (normalmente: leer/escribir contenido de ese repo, nada más)
+    """
+    jwt_token = generar_jwt_github_app(app_id, ruta_llave_privada)
+
+    url = f"https://api.github.com/app/installations/{installation_id}/access_tokens"
+    headers = {
+        "Authorization": f"Bearer {jwt_token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28"
+    }
+
+    logger.info("[GITHUB APP] Solicitando token de instalación...")
+    respuesta = requests.post(url, headers=headers, timeout=15)
+
+    if respuesta.status_code != 201:
+        # Causas típicas: App ID o Installation ID incorrectos, la llave
+        # privada no corresponde a esa app, o la app fue desinstalada del repo
+        logger.error(
+            "[ERROR] No se pudo obtener el token de instalación (código %d): %s",
+            respuesta.status_code, respuesta.text[:300]
+        )
+        return None
+
+    token = respuesta.json()['token']
+    logger.info("[OK] Token de instalación obtenido (válido ~1 hora)")
+    return token
+
+
+def listar_contenido_github(config, ruta_en_repo=""):
+    """
+    Consulta, vía la API REST de GitHub, qué archivos hay en el repositorio
+    (o en una subcarpeta concreta) SIN necesidad de clonarlo ni de que haya
+    ninguna sesión de usuario iniciada. Usa el mismo token de instalación
+    que subir_github(), reutilizando la misma GitHub App.
+
+    Parámetros:
+      ruta_en_repo -> subcarpeta del repo a listar. Con "" (vacío) lista
+                       la raíz del repositorio.
+
+    Devuelve: una lista de nombres de archivo/carpeta, o None si algo falla.
+    """
+    token = obtener_installation_token(
+        config['github_app_id'],
+        config['github_installation_id'],
+        config['github_private_key_path']
+    )
+
+    if token is None:
+        logger.error("[ERROR] No se pudo autenticar con GitHub App para listar contenido")
+        return None
+
+    owner = config['github_owner']
+    repo = config['github_repo_name']
+
+    # Endpoint "Contents API": devuelve lo que hay dentro de una ruta del repo,
+    # tal y como está en la rama por defecto (normalmente 'main')
+    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{ruta_en_repo}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28"
+    }
+
+    respuesta = requests.get(url, headers=headers, timeout=15)
+
+    if respuesta.status_code != 200:
+        logger.error(
+            "[ERROR] No se pudo listar el contenido (código %d): %s",
+            respuesta.status_code, respuesta.text[:300]
+        )
+        return None
+
+    elementos = respuesta.json()  # lista de dicts: uno por archivo/carpeta
+
+    for elemento in elementos:
+        tipo = "carpeta" if elemento['type'] == 'dir' else "archivo"
+        logger.info("  [%s] %s", tipo, elemento['path'])
+
+    # Devuelve solo los nombres/rutas, por si se quieren usar en código
+    return [elemento['path'] for elemento in elementos]
+
+
 def subir_github(directorio_base, config):
     """
-    Hace commit y push del contenido de directorio_base a GitHub.
+    Hace commit y push del contenido de directorio_base a GitHub, autenticando
+    con una GitHub App (App ID + Installation ID + llave privada .pem) en vez
+    de depender de credenciales git ya guardadas en Windows.
 
-    IMPORTANTE (ver aviso al principio del archivo): esta función usa
-    'directorio_base' como si fuera ya un repositorio git inicializado
-    (con 'git init' y 'git remote add origin ...' hechos de antemano a mano).
-    Las claves github_repo_path y github_token de config.json NO se leen
-    aquí — si quieres que el script las use de verdad (por ejemplo para
-    autenticar con el token en vez de depender de tus credenciales git
-    guardadas en Windows), hay que añadir ese código.
+    El token de instalación se pide DE NUEVO en cada ejecución del script
+    (dura solo ~1 hora, así que no tiene sentido guardarlo) y se usa
+    ÚNICAMENTE en la URL del push — nunca se guarda en el remote "origin"
+    del repositorio, para que no quede el token en texto plano dentro de
+    .git/config.
     """
 
     try:
@@ -573,24 +729,22 @@ def subir_github(directorio_base, config):
         logger.info("SUBIENDO A GITHUB")
         logger.info("="*60)
 
-        os.chdir(directorio_base)  # Se cambia el directorio de trabajo al de descargas
-                                    # (git necesita ejecutarse DENTRO del repositorio)
+        token = obtener_installation_token(
+            config['github_app_id'],
+            config['github_installation_id'],
+            config['github_private_key_path']
+        )
 
-        # Aquí subprocess.run() se llama con una LISTA (['git', 'add', '.'])
-        # en vez de un string con shell=True como en ejecutar_sqlplus().
-        # Es la forma más segura de ejecutar comandos simples sin shell:
-        # cada elemento de la lista es un argumento independiente, así que
-        # no hay riesgo de que espacios o caracteres especiales rompan el comando.
-        #
-        #   check=True        -> si git devuelve un código de error, lanza
-        #                        automáticamente una excepción (CalledProcessError),
-        #                        que cae en el except Exception de más abajo
-        #   capture_output=True -> guarda la salida de git en vez de imprimirla directo
+        if token is None:
+            logger.error("[ERROR] No se pudo autenticar con GitHub App, se aborta la subida")
+            return
+
+        os.chdir(directorio_base)  # git necesita ejecutarse DENTRO del repositorio
+
+        # Comandos simples (add, commit) no necesitan credenciales -> igual que antes
         logger.info("[GIT] git add .")
         subprocess.run(['git', 'add', '.'], check=True, capture_output=True)
 
-        # Se genera el mensaje de commit con fecha y hora exactas de esta
-        # ejecución, para poder identificar cada backup en el historial de git.
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         mensaje = f"Tableau Backup - {timestamp}"
 
@@ -599,24 +753,34 @@ def subir_github(directorio_base, config):
             ['git', 'commit', '-m', mensaje],
             check=True,
             capture_output=True,
-            text=True   # decodifica resultado.stdout como texto, para poder
-                        # comprobar su contenido en la siguiente línea (abajo)
+            text=True
         )
 
-        # Si no hubo cambios respecto al último commit, git avisa con este
-        # texto en vez de fallar; lo detectamos para no tratarlo como error.
         if "nothing to commit" in resultado.stdout.lower():
             logger.info("[AVISO] No hay cambios")
             return
 
-        logger.info("[GIT] git push")
-        subprocess.run(['git', 'push', 'origin', 'main'], check=True, capture_output=True)
+        # Aquí SÍ hace falta el token: se construye la URL de push con el
+        # token embebido como "usuario" (x-access-token es un usuario fijo
+        # que GitHub reconoce especialmente para tokens de GitHub App).
+        # No se toca el remote "origin" guardado en el repo -> el token no
+        # queda persistido en ningún archivo, solo se usa en esta llamada.
+        owner = config['github_owner']
+        repo = config['github_repo_name']
+        url_con_token = f"https://x-access-token:{token}@github.com/{owner}/{repo}.git"
+
+        logger.info("[GIT] git push (autenticado con GitHub App)")
+        subprocess.run(
+            ['git', 'push', url_con_token, 'main'],
+            check=True,
+            capture_output=True
+        )
 
         logger.info("[OK] Subido a GitHub")
 
     except Exception as e:
-        # Un fallo de GitHub (sin conexión, credenciales caducadas, conflicto
-        # de push, etc.) se registra pero NO detiene el script: los workbooks
+        # Un fallo de GitHub (sin conexión, token caducado, conflicto de
+        # push, etc.) se registra pero NO detiene el script: los workbooks
         # ya se descargaron localmente igualmente.
         logger.error("[ERROR] Error en GitHub: %s", e)
 

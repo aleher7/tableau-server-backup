@@ -760,6 +760,39 @@ def listar_contenido_github(config, ruta_en_repo=""):
     return [elemento['path'] for elemento in elementos]
 
 
+def ejecutar_git(comando):
+    """
+    Ejecuta un comando git MOSTRANDO su salida en tiempo real en la consola
+    (a diferencia de subprocess.run(capture_output=True), que la oculta por
+    completo hasta que el comando termina).
+
+    Por qué hace falta esto: con archivos grandes (cientos de MB), git tarda
+    comprimiendo/escribiendo objetos, y sin esto la consola se queda en
+    blanco varios minutos sin ninguna señal de que sigue trabajando --
+    parece "colgado" aunque no lo está, y tienta a pulsar Ctrl+C, lo que
+    SÍ puede cortar el proceso a medias y dejar el repositorio en mal estado.
+
+    Devuelve (codigo_salida, texto_completo_de_la_salida).
+    """
+    proceso = subprocess.Popen(
+        comando,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,  # combina stderr con stdout en el mismo flujo
+        text=True,
+        bufsize=1  # line-buffered: cada línea se entrega en cuanto aparece
+    )
+
+    lineas = []
+    for linea in proceso.stdout:
+        linea = linea.rstrip()
+        if linea:
+            logger.info("       git> %s", linea)  # se imprime AL MOMENTO, no al final
+            lineas.append(linea)
+
+    proceso.wait()  # espera a que el proceso termine del todo
+    return proceso.returncode, "\n".join(lineas)
+
+
 def subir_github(directorio_base, config, token=None, mensaje=None):
     """
     Hace commit y push del contenido de directorio_base a GitHub, autenticando
@@ -796,25 +829,26 @@ def subir_github(directorio_base, config, token=None, mensaje=None):
 
         os.chdir(directorio_base)  # git necesita ejecutarse DENTRO del repositorio
 
-        # Comandos simples (add, commit) no necesitan credenciales -> igual que antes
-        logger.info("[GIT] git add .")
-        subprocess.run(['git', 'add', '.'], check=True, capture_output=True)
+        logger.info("[GIT] git add . (puede tardar con archivos grandes -- se verá el avance abajo)")
+        codigo, salida = ejecutar_git(['git', 'add', '.'])
+        if codigo != 0:
+            logger.error("[ERROR] git add falló:\n%s", salida)
+            return False
 
         if mensaje is None:
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             mensaje = f"Tableau Backup - {timestamp}"
 
         logger.info("[GIT] git commit: %s", mensaje)
-        resultado = subprocess.run(
-            ['git', 'commit', '-m', mensaje],
-            check=True,
-            capture_output=True,
-            text=True
-        )
+        codigo, salida = ejecutar_git(['git', 'commit', '-m', mensaje])
 
-        if "nothing to commit" in resultado.stdout.lower():
+        if "nothing to commit" in salida.lower():
             logger.info("[AVISO] No hay cambios en este lote")
             return True
+
+        if codigo != 0:
+            logger.error("[ERROR] git commit falló:\n%s", salida)
+            return False
 
         # Aquí SÍ hace falta el token: se construye la URL de push con el
         # token embebido como "usuario" (x-access-token es un usuario fijo
@@ -828,31 +862,31 @@ def subir_github(directorio_base, config, token=None, mensaje=None):
         # subdominio de la empresa, igual que cuando clonas el repo a mano.
         url_con_token = f"https://x-access-token:{token}@cantabrialabs.ghe.com/{owner}/{repo}.git"
 
-        logger.info("[GIT] git push (autenticado con GitHub App)")
-        subprocess.run(
-            ['git', 'push', url_con_token, 'main'],
-            check=True,
-            capture_output=True,
-            text=True
-        )
+        logger.info("[GIT] git push (autenticado con GitHub App, puede tardar unos minutos)")
+        codigo, salida = ejecutar_git(['git', 'push', url_con_token, 'main'])
+
+        if codigo != 0:
+            # "fetch first" / "non-fast-forward" es el error más habitual:
+            # el remoto tiene contenido que el repo local no conoce todavía.
+            # Se detecta aquí para dar una instrucción clara en vez de solo
+            # el mensaje críptico de git.
+            if "fetch first" in salida.lower() or "non-fast-forward" in salida.lower():
+                logger.error("[ERROR] Push rechazado: el remoto tiene cambios que faltan en local.")
+                logger.error("[ERROR] Solución manual (una sola vez):")
+                logger.error("        git fetch origin")
+                logger.error("        git reset --mixed origin/main")
+                logger.error("        git add . && git commit -m \"sync\" && git push origin main")
+            else:
+                logger.error("[ERROR] git push falló:\n%s", salida)
+            return False
 
         logger.info("[OK] Subido a GitHub")
         return True
 
-    except subprocess.CalledProcessError as e:
-        # A diferencia de una excepción genérica, CalledProcessError SÍ trae
-        # la salida real de git en .stderr / .stdout -- es lo que hay que
-        # imprimir para saber el motivo EXACTO del fallo (permisos, rama
-        # inexistente, conflicto de historiales, etc.), en vez de solo
-        # el código de salida (que no dice nada por sí solo).
-        logger.error("[ERROR] Falló el comando: %s", " ".join(e.cmd))
-        logger.error("[ERROR] stderr de git: %s", e.stderr)
-        logger.error("[ERROR] stdout de git: %s", e.stdout)
-        return False
     except Exception as e:
-        # Un fallo de GitHub (sin conexión, token caducado, etc.) se registra
-        # pero NO detiene el script: los workbooks ya se descargaron
-        # localmente igualmente.
+        # Cualquier fallo no previsto (token caducado, sin conexión, etc.)
+        # se registra pero NO detiene el script: los workbooks ya se
+        # descargaron localmente igualmente.
         logger.error("[ERROR] Error en GitHub: %s", e)
         return False
 

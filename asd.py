@@ -779,6 +779,12 @@ def ejecutar_git(comando):
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,  # combina stderr con stdout en el mismo flujo
         text=True,
+        encoding='utf-8',   # git escribe en UTF-8; sin forzarlo, Python usa
+                             # la codificación por defecto de Windows (cp1252
+                             # en español), que no entiende acentos/símbolos
+                             # de git y puede quedarse esperando indefinidamente
+        errors='replace',   # si aun así aparece algún byte raro, lo sustituye
+                             # por un símbolo en vez de romper la lectura
         bufsize=1  # line-buffered: cada línea se entrega en cuanto aparece
     )
 

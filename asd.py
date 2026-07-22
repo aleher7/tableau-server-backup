@@ -74,7 +74,13 @@ def subir(lote, numero, extra_header, url, token):
     print(f"\n--- Lote {numero}: {len(lote)} archivo(s) ---")
     for f in lote:
         print(f"    {f}")
-    ejecutar(['git', 'add', '--'] + lote, token)
+    # --renormalize: fuerza a git a re-aplicar el .gitattributes (y por
+    # tanto el filtro de LFS) aunque ya exista en el repositorio un objeto
+    # con el mismo contenido creado ANTES de activar LFS -- sin esto, git
+    # reutiliza silenciosamente ese blob antiguo (sin pasar por LFS) y el
+    # archivo se cuela como blob normal, chocando otra vez con el límite
+    # de 100 MB de GitHub.
+    ejecutar(['git', 'add', '--renormalize', '--'] + lote, token)
     mensaje = f"Tableau Backup - lote {numero} - {time.strftime('%Y-%m-%d %H:%M:%S')}"
     codigo = ejecutar(['git', 'commit', '-m', mensaje], token)
     if codigo != 0:

@@ -164,3 +164,15 @@ for i in range(0, len(pequenos), TAMANO_LOTE):
     numero_lote += 1
 
 print("\n🎉 TODO SUBIDO")
+
+# Refrescamos la "memoria" local de git sobre dónde está origin/main de
+# verdad -- sin esto, un "git push <URL directa> main" (como hacemos aquí)
+# SUBE los datos correctamente, pero NO actualiza el puntero local
+# "origin/main" (eso solo pasa automático al usar el nombre "origin", no
+# una URL directa). Sin este paso, un "git status" posterior mostraría
+# "ahead of origin/main by N commits" aunque en realidad YA estén todos
+# subidos -- exactamente la confusión de "commits fantasma" de hoy.
+print("\n=== Actualizando la referencia local de origin/main ===")
+ejecutar(['git', '-c', extra_header, 'fetch', url, 'main'], token)
+ejecutar(['git', 'update-ref', 'refs/remotes/origin/main', 'FETCH_HEAD'], token)
+print("Listo -- 'git status' ahora reflejará el estado real.")

@@ -80,7 +80,18 @@ def subir(lote, numero, extra_header, url, token):
     # reutiliza silenciosamente ese blob antiguo (sin pasar por LFS) y el
     # archivo se cuela como blob normal, chocando otra vez con el límite
     # de 100 MB de GitHub.
-    ejecutar(['git', 'add', '--renormalize', '--'] + lote, token)
+    # NOTA: NO usar --renormalize aquí -- implica -u/--update, que solo
+    # afecta a archivos YA rastreados y NUNCA añade archivos nuevos. Como
+    # la mayoría de estos .twbx son "nuevos" en cada ejecución, --renormalize
+    # los ignoraba en silencio (sin error), y no se comiteaba nada.
+    #
+    # En su lugar: "git rm --cached" (si el archivo ya estaba rastreado de
+    # antes, por ejemplo como blob normal sin pasar por LFS) lo saca del
+    # índice, y el "git add" siguiente lo vuelve a añadir de cero, forzando
+    # que el filtro de LFS se aplique sí o sí. Si el archivo es nuevo,
+    # "--ignore-unmatch" evita que el rm falle por "no encontrado".
+    ejecutar(['git', 'rm', '-r', '--cached', '--ignore-unmatch', '--'] + lote, token)
+    ejecutar(['git', 'add', '--'] + lote, token)
     mensaje = f"Tableau Backup - lote {numero} - {time.strftime('%Y-%m-%d %H:%M:%S')}"
     codigo = ejecutar(['git', 'commit', '-m', mensaje], token)
     if codigo != 0:

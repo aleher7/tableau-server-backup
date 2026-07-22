@@ -25,12 +25,24 @@ llave = open(config['github_private_key_path'], 'rb').read()
 API = "https://api.cantabrialabs.ghe.com"
 owner, repo = config['github_owner'], config['github_repo_name']
 
-# Fija la carpeta de trabajo SIEMPRE en directorio_descarga (p.ej.
-# "Tableau Workbooks"), sin importar desde qué carpeta se haya lanzado
-# este script. Así "git status -- ." nunca ve, por accidente, los .py/.bat
-# /.sql sueltos que viven en la carpeta padre (TableauGitHub).
-os.chdir(config['directorio_descarga'])
-print(f"Trabajando en: {os.getcwd()}")
+# Averiguamos la raíz REAL del repositorio (donde vive .git) preguntándole
+# a git directamente, en vez de asumirla -- así evitamos el bug de rutas
+# duplicadas ("Tableau Workbooks/Tableau Workbooks/..."): git status
+# reporta las rutas relativas a la raíz del repo, así que hay que trabajar
+# SIEMPRE desde esa raíz para que "git add" interprete esas mismas rutas
+# de la misma forma (si no, git las interpreta relativas a la carpeta
+# actual, y con un os.chdir a una subcarpeta, la ruta se duplica).
+r = subprocess.run(['git', 'rev-parse', '--show-toplevel'],
+                    cwd=config['directorio_descarga'], capture_output=True, text=True)
+raiz_repo = r.stdout.strip().replace('/', os.sep)
+os.chdir(raiz_repo)
+
+# Ruta de la carpeta de descargas, relativa a la raíz del repo
+# (ej: "Tableau Workbooks") -- se usa para restringir el "git status" a
+# SOLO esa carpeta, sin ver config.json/.pem/scripts sueltos de al lado.
+carpeta_relativa = os.path.relpath(config['directorio_descarga'], raiz_repo)
+print(f"Raíz del repo: {raiz_repo}")
+print(f"Carpeta de trabajo (relativa): {carpeta_relativa}")
 
 
 def obtener_token():
@@ -93,7 +105,7 @@ ejecutar(['git', '-c', extra_header, 'fetch', url, 'main'], token)
 ejecutar(['git', 'reset', '--mixed', 'FETCH_HEAD'], token)
 
 resultado = subprocess.run(
-    ['git', 'status', '--porcelain', '--untracked-files=all', '--', '.'],
+    ['git', 'status', '--porcelain', '--untracked-files=all', '--', carpeta_relativa],
     capture_output=True, text=True
 )
 lineas = [l for l in resultado.stdout.splitlines() if l.strip()]

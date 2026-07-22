@@ -392,6 +392,69 @@ def parsear_lista_workbooks(ruta_archivo, separador=','):
         return None
 
 
+def sincronizar_con_remoto(directorio_base, config):
+    """
+    Pone la carpeta local EXACTAMENTE igual que GitHub, ANTES de descargar
+    nada nuevo de Tableau. Es la pieza clave para evitar los conflictos de
+    fusión que hemos ido viendo: en vez de descargar primero y luego intentar
+    "encajar" los cambios con lo que ya hay en GitHub (lo que obliga a git a
+    fusionar archivos binarios que cambian de bytes en cada descarga), se
+    parte siempre de un punto idéntico al remoto, así que el commit nuevo de
+    esta ejecución es simplemente "el siguiente" en la historia -- sin
+    fusiones, sin conflictos de tipo "add/add" o "modify/delete".
+
+    IMPORTANTE: usa --hard, que SÍ sobrescribe archivos locales para que
+    coincidan con el remoto. Como esto se ejecuta justo ANTES de descargar
+    (con la carpeta ya limpiada de la ejecución anterior), no hay riesgo de
+    perder nada -- los .twbx "viejos" que pudiera haber no son la fuente de
+    verdad, Tableau lo es.
+    """
+    if config is None or not config.get('github_enabled', True):
+        return True
+
+    try:
+        logger.info("="*60)
+        logger.info("SINCRONIZANDO CON GITHUB (antes de descargar)")
+        logger.info("="*60)
+
+        token = obtener_installation_token(
+            config['github_client_id'],
+            config['github_installation_id'],
+            config['github_private_key_path']
+        )
+        if token is None:
+            logger.error("[ERROR] No se pudo autenticar con GitHub App para sincronizar")
+            return False
+
+        os.chdir(directorio_base)
+
+        owner = config['github_owner']
+        repo = config['github_repo_name']
+        url_con_token = f"https://x-access-token:{token}@cantabrialabs.ghe.com/{owner}/{repo}.git"
+
+        # Por si quedó algún merge a medias de una ejecución anterior
+        ejecutar_git(['git', 'merge', '--abort'])
+
+        logger.info("[GIT] git fetch")
+        codigo, salida = ejecutar_git(['git', 'fetch', url_con_token, 'main'])
+        if codigo != 0:
+            logger.error("[ERROR] git fetch falló:\n%s", salida)
+            return False
+
+        logger.info("[GIT] git reset --hard FETCH_HEAD (alinear local con GitHub)")
+        codigo, salida = ejecutar_git(['git', 'reset', '--hard', 'FETCH_HEAD'])
+        if codigo != 0:
+            logger.error("[ERROR] git reset --hard falló:\n%s", salida)
+            return False
+
+        logger.info("[OK] Carpeta local sincronizada con GitHub")
+        return True
+
+    except Exception as e:
+        logger.error("[ERROR] Error sincronizando con GitHub: %s", e)
+        return False
+
+
 def limpiar_directorio(directorio_base):
     """
     Borra el CONTENIDO del directorio de descargas (todas las subcarpetas
@@ -1070,6 +1133,15 @@ def main():
     if df is None or len(df) == 0:
         logger.error("[FATAL] No se pudo parsear el archivo")
         sys.exit(1)
+
+    # ========================================================================
+    # PASO 3.5: SINCRONIZAR CON GITHUB (antes de descargar nada nuevo)
+    # ========================================================================
+    config_github = config if (config.get('github_enabled', True) and not args.sin_github) else None
+    if config_github is not None:
+        if not sincronizar_con_remoto(directorio_base, config_github):
+            logger.error("[FATAL] No se pudo sincronizar con GitHub -- se aborta para evitar conflictos")
+            sys.exit(1)
 
     # ========================================================================
     # PASO 4: LIMPIAR DIRECTORIO LOCAL DE DESCARGAS

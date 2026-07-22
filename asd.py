@@ -14,6 +14,7 @@ import base64
 import subprocess
 import jwt
 import requests
+import os
 from pathlib import Path
 
 TAMANO_LOTE = 10
@@ -23,6 +24,13 @@ config = json.load(open('config.json'))
 llave = open(config['github_private_key_path'], 'rb').read()
 API = "https://api.cantabrialabs.ghe.com"
 owner, repo = config['github_owner'], config['github_repo_name']
+
+# Fija la carpeta de trabajo SIEMPRE en directorio_descarga (p.ej.
+# "Tableau Workbooks"), sin importar desde qué carpeta se haya lanzado
+# este script. Así "git status -- ." nunca ve, por accidente, los .py/.bat
+# /.sql sueltos que viven en la carpeta padre (TableauGitHub).
+os.chdir(config['directorio_descarga'])
+print(f"Trabajando en: {os.getcwd()}")
 
 
 def obtener_token():

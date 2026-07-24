@@ -33,6 +33,8 @@ import pandas as pd
 import jwt as pyjwt
 import requests
 
+# La libreria de Tableau se importa dentro de un try para poder dar un mensaje
+# entendible si falta, en vez de un traceback de Python.
 try:
     import tableauserverclient as TSC
 except ImportError:
@@ -66,11 +68,13 @@ TAMANO_LOTE = 8
 # siempre esta en UTF-8 y un caracter no ASCII aborta la ejecucion entera.
 logging.basicConfig(
     level=logging.INFO,
+    # %(levelname)-5s reserva 5 huecos para el nivel, asi los mensajes quedan
+    # alineados en columna aunque unos pongan INFO y otros ERROR.
     format='%(asctime)s  %(levelname)-5s %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S',
     handlers=[
-        logging.FileHandler('tableau_sync.log', encoding='utf-8'),
-        logging.StreamHandler()
+        logging.FileHandler('tableau_sync.log', encoding='utf-8'),  # al fichero
+        logging.StreamHandler()                                     # a la pantalla
     ]
 )
 log = logging.getLogger(__name__)
@@ -87,6 +91,7 @@ def separador(titulo=""):
 def tamano_legible(ruta):
     """Devuelve el tamano de un fichero como texto ('12.4 MB')."""
     try:
+        # .stat() da la informacion del fichero; .st_size es el tamano en bytes
         mb = Path(ruta).stat().st_size / (1024 * 1024)
         return f"{mb:.1f} MB"
     except Exception:
@@ -95,6 +100,7 @@ def tamano_legible(ruta):
 
 def duracion_legible(segundos):
     """Convierte segundos en '12m 5s'."""
+    # divmod devuelve de una vez el cociente y el resto de la division
     minutos, seg = divmod(int(segundos), 60)
     return f"{minutos}m {seg}s" if minutos else f"{seg}s"
 
@@ -126,6 +132,9 @@ def cargar_config(fichero="config.json"):
         with open(fichero, 'r', encoding='utf-8') as f:
             config = json.load(f)
     except FileNotFoundError:
+        # os.getcwd() = carpeta desde la que se esta ejecutando el script.
+        # Se muestra porque la causa habitual es justamente esa: la tarea
+        # programada arranca desde otra carpeta y no encuentra el fichero.
         log.error("No se encuentra %s en %s", fichero, os.getcwd())
         log.error("Comprueba que la tarea programada tiene el campo 'Iniciar en' relleno")
         sys.exit(1)
@@ -133,7 +142,9 @@ def cargar_config(fichero="config.json"):
         log.error("El fichero %s tiene un error de sintaxis: %s", fichero, e)
         sys.exit(1)
 
-    # Rellenar opcionales antes de validar: github_enabled puede no venir
+    # setdefault anade la clave SOLO si no existe; si ya viene en el fichero,
+    # respeta el valor del usuario. Se hace antes de validar porque
+    # github_enabled decide si las claves de GitHub son obligatorias o no.
     for clave, valor in CLAVES_OPCIONALES.items():
         config.setdefault(clave, valor)
 
@@ -155,14 +166,14 @@ def cargar_config(fichero="config.json"):
 # ============================================================================
 
 def ejecutar_sqlplus(comando, timeout):
-    """
-    Lanza ConexionOracle.bat, que hace login en Oracle y ejecuta Descarga.sql.
-
-    shell=True porque el comando es un .bat de Windows.
-    """
+    """Lanza ConexionOracle.bat, que hace login en Oracle y ejecuta Descarga.sql."""
     try:
         resultado = subprocess.run(
-            comando, shell=True, capture_output=True, text=True, timeout=timeout
+            comando,
+            shell=True,             # necesario para ejecutar un .bat de Windows
+            capture_output=True,    # guarda la salida en vez de mostrarla
+            text=True,              # devuelve texto, no bytes
+            timeout=timeout,        # si tarda mas, lanza TimeoutExpired
         )
     except subprocess.TimeoutExpired:
         log.error("Oracle no respondio en %d segundos", timeout)
@@ -172,6 +183,9 @@ def ejecutar_sqlplus(comando, timeout):
         log.error("No se pudo lanzar el comando de Oracle: %s", e)
         return False
 
+    # Convencion universal: codigo de salida 0 = correcto, cualquier otro = error.
+    # Aqui se puede confiar en el porque Descarga.sql empieza con los dos
+    # WHENEVER que obligan a SQL*Plus a abortar ante cualquier fallo.
     if resultado.returncode != 0:
         log.error("Oracle devolvio un error (codigo %d)", resultado.returncode)
         log.error("Abre lista_workbooks.csv: el mensaje de Oracle esta dentro")
@@ -195,7 +209,7 @@ def leer_lista_workbooks(ruta, separador_csv=','):
     if not ruta.is_file():
         log.error("No se genero el fichero %s", ruta)
         return None
-    if ruta.stat().st_size == 0:
+    if ruta.stat().st_size == 0:       # st_size en bytes: 0 = fichero vacio
         log.error("El fichero %s esta vacio", ruta)
         return None
 
@@ -209,16 +223,24 @@ def leer_lista_workbooks(ruta, separador_csv=','):
                                     # entrecomillados, y sin esto una coma dentro
                                     # de un nombre partiria la fila
             keep_default_na=False,  # los campos vacios se quedan vacios, no NaN
-            skipinitialspace=True,
+            skipinitialspace=True,  # ignora los espacios que siguen a cada coma
         )
     except Exception as e:
         log.error("El fichero no tiene formato CSV valido: %s", e)
         return None
 
+    # Cabeceras a mayusculas y sin espacios, para que las comprobaciones de
+    # mas abajo funcionen aunque Oracle las devuelva de otra forma.
     df.columns = [str(c).strip().upper() for c in df.columns]
+
+    # .str aplica una operacion de texto a TODOS los valores de la columna de
+    # una vez, sin recorrerla. Aqui quita espacios sobrantes: un LUID con un
+    # espacio invisible al final no coincide con el real y produce un
+    # "workbook no encontrado" imposible de diagnosticar a simple vista.
     for columna in df.columns:
         df[columna] = df[columna].astype(str).str.strip()
 
+    # Resta de conjuntos: lo que hace falta menos lo que hay = lo que falta
     faltan = {"WORKBOOK_LUID", "WORKBOOK"} - set(df.columns)
     if faltan:
         log.error("La vista de Oracle no devuelve las columnas: %s", ", ".join(faltan))
@@ -228,9 +250,15 @@ def leer_lista_workbooks(ruta, separador_csv=','):
     if "RUTA_PROYECTO" not in df.columns:
         df["RUTA_PROYECTO"] = "default"
 
+    # df[condicion] devuelve solo las filas que cumplen la condicion.
     # Las filas sin LUID son las de 'carpeta intermedia' de la vista, que
     # existen solo como control visual al revisar la consulta en Oracle.
     df = df[(df["WORKBOOK_LUID"] != "") & (df["WORKBOOK"] != "")]
+
+    # drop_duplicates(subset=...) mira solo esa columna para decidir que es
+    # duplicado; keep='last' se queda con la ultima aparicion.
+    # reset_index(drop=True) renumera las filas de 0 en adelante y descarta la
+    # numeracion antigua, que quedo con huecos tras el filtrado anterior.
     df = df.drop_duplicates(subset=["WORKBOOK_LUID"], keep="last").reset_index(drop=True)
 
     return df
@@ -251,17 +279,25 @@ def obtener_token_github(config):
     documenta ambos como validos, pero con el App ID devuelve un
     "401 - A JSON web token could not be decoded" que no dice nada util.
     """
+    # time.time() da los segundos transcurridos desde 1970, que es el formato
+    # de fecha que exige el estandar JWT.
     ahora = int(time.time())
     payload = {
-        'iat': ahora - 60,   # 60s de margen por si el reloj va adelantado
-        'exp': ahora + 600,
+        'iat': ahora - 60,   # emitido: 60s de margen por si el reloj va adelantado
+        'exp': ahora + 600,  # caduca a los 10 minutos (maximo que admite GitHub)
         'iss': config['github_client_id'],
     }
 
+    # Modo binario ('rb'): pyjwt espera los bytes de la clave, no texto.
     with open(config['github_private_key_path'], 'rb') as f:
         llave = f.read()
 
+    # RS256 = firma asimetrica con RSA. Se firma con la clave privada que
+    # tenemos aqui, y GitHub lo verifica con la publica que guarda de la App.
     jwt_token = pyjwt.encode(payload, llave, algorithm='RS256')
+
+    # Las versiones de PyJWT anteriores a la 2.0 devuelven bytes en vez de
+    # texto. Si se enviaran tal cual, la cabecera saldria como "b'eyJ...'".
     if isinstance(jwt_token, bytes):
         jwt_token = jwt_token.decode('utf-8')
 
@@ -272,14 +308,18 @@ def obtener_token_github(config):
         "X-GitHub-Api-Version": GITHUB_API_VERSION,
     }
 
+    # POST y no GET porque esta llamada CREA algo nuevo: un token que antes no
+    # existia. Cada vez que se llama, GitHub genera uno distinto.
     respuesta = requests.post(url, headers=cabeceras, timeout=15)
 
+    # 201 = "creado". Esta llamada no devuelve 200.
     if respuesta.status_code != 201:
         log.error("GitHub rechazo la autenticacion (codigo %d)", respuesta.status_code)
         log.error("Respuesta: %s", respuesta.text[:200])
         log.error("Ejecuta 'python diagnostico_github.py' para localizar la causa")
         return None
 
+    # .json() convierte la respuesta (texto en formato JSON) en un diccionario
     return respuesta.json()['token']
 
 
@@ -296,6 +336,11 @@ def cabecera_git(token):
          almacen de objetos de Git LFS, que vive en otro dominio y usa sus
          propias URLs firmadas: chocan y la subida de LFS falla.
     """
+    # Tres conversiones encadenadas, en este orden:
+    #   .encode()    texto -> bytes (lo que b64encode necesita)
+    #   b64encode()  bytes -> bytes codificados en base64
+    #   .decode()    bytes -> texto otra vez, para meterlo en la cabecera
+    # Base64 no cifra nada: es el formato que exige la autenticacion HTTP Basic.
     credencial = base64.b64encode(f"x-access-token:{token}".encode()).decode()
     return f"http.https://{GITHUB_DOMINIO}.extraHeader=Authorization: Basic {credencial}"
 
@@ -311,7 +356,7 @@ def url_repo(config):
 
 def ocultar_secretos(texto, secretos):
     """Sustituye cualquier token por *** antes de imprimir o guardar nada."""
-    for secreto in secretos or []:
+    for secreto in secretos or []:   # 'secretos or []' evita fallar si llega None
         if secreto:
             texto = texto.replace(secreto, "***")
     return texto
@@ -321,28 +366,30 @@ def git(comando, secretos=None, mostrar=True):
     """
     Ejecuta un comando git mostrando su salida en tiempo real.
 
-    En vez de capturar la salida y mostrarla al final, se va imprimiendo
-    linea a linea: con archivos de cientos de MB, git tarda minutos
-    comprimiendo y sin esto la consola se queda en blanco, dando la
-    impresion de estar colgado.
-
-    encoding='utf-8' es necesario porque git escribe en UTF-8 y Python
-    usaria por defecto la codificacion de Windows en espanol (cp1252),
-    que se atasca con algunos caracteres.
+    Se usa Popen en vez de subprocess.run porque run espera a que el comando
+    TERMINE para devolver la salida. Con ficheros de cientos de MB, git tarda
+    minutos comprimiendo y la consola se quedaria en blanco todo ese rato,
+    dando la impresion de estar colgado.
 
     Devuelve (codigo_de_salida, salida_completa_ya_censurada).
     """
     proceso = subprocess.Popen(
         comando,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+        stdout=subprocess.PIPE,      # capturamos la salida normal
+        stderr=subprocess.STDOUT,    # y mezclamos los errores en el mismo flujo,
+                                     # porque git escribe el progreso en stderr
         text=True,
-        encoding='utf-8',
-        errors='replace',
-        bufsize=1,
+        encoding='utf-8',            # git escribe en UTF-8; sin forzarlo, Python
+                                     # usaria cp1252 (Windows en espanol) y se
+                                     # atasca al leer ciertos caracteres
+        errors='replace',            # si aun asi llega un byte raro, lo sustituye
+                                     # en vez de romper la lectura
+        bufsize=1,                   # entrega cada linea en cuanto aparece, sin
+                                     # esperar a llenar un bloque de memoria
     )
 
     lineas = []
+    # Este bucle NO espera a que git termine: lee segun van llegando las lineas
     for linea in proceso.stdout:
         linea = ocultar_secretos(linea.rstrip(), secretos)
         if linea:
@@ -350,7 +397,7 @@ def git(comando, secretos=None, mostrar=True):
             if mostrar:
                 log.info("        %s", linea)
 
-    proceso.wait()
+    proceso.wait()   # ya se leyo toda la salida; esperamos a que cierre el proceso
     return proceso.returncode, "\n".join(lineas)
 
 
@@ -372,18 +419,26 @@ def sincronizar_con_remoto(directorio, config, token):
     Usa --hard, que si sobrescribe ficheros locales. No hay riesgo: el paso
     siguiente vacia la carpeta igualmente y todo se vuelve a descargar.
     """
-    os.chdir(directorio)
+    os.chdir(directorio)   # git actua sobre la carpeta actual: hay que situarse dentro
     cabecera = cabecera_git(token)
     url = url_repo(config)
 
-    git(['git', 'merge', '--abort'], [token], mostrar=False)  # por si quedo algo a medias
+    # Por si una ejecucion anterior se corto en mitad de una fusion. Si no
+    # habia ninguna, git devuelve error y no pasa nada: se ignora.
+    git(['git', 'merge', '--abort'], [token], mostrar=False)
 
+    # 'git -c clave=valor' aplica un ajuste SOLO a este comando, sin dejarlo
+    # guardado en la configuracion del repositorio. Asi el token no persiste
+    # en ningun fichero del disco.
     codigo, salida = git(['git', '-c', cabecera, 'fetch', url, 'main'], [token], mostrar=False)
     if codigo != 0:
         log.error("No se pudo consultar el repositorio remoto")
         log.error("%s", salida)
         return False
 
+    # FETCH_HEAD es la referencia temporal que acaba de dejar el fetch: apunta
+    # a lo ultimo que hay en el remoto. --hard alinea con ello tanto el
+    # historial como los ficheros del disco.
     codigo, salida = git(['git', 'reset', '--hard', 'FETCH_HEAD'], [token], mostrar=False)
     if codigo != 0:
         log.error("No se pudo alinear la carpeta local con el repositorio")
@@ -411,14 +466,25 @@ def vaciar_directorio(directorio):
     ruta = Path(directorio)
 
     if ruta.exists():
+        # .iterdir() lista lo que hay dentro de la carpeta, un solo nivel
+        # (no entra en las subcarpetas).
         for elemento in ruta.iterdir():
             if elemento.name in PROTEGIDOS:
                 continue
             try:
-                shutil.rmtree(elemento) if elemento.is_dir() else elemento.unlink()
+                if elemento.is_dir():
+                    # rmtree borra la carpeta Y todo su contenido, recursivamente.
+                    # Es la unica forma: os.rmdir solo admite carpetas vacias.
+                    shutil.rmtree(elemento)
+                else:
+                    # unlink borra un fichero suelto (equivale a os.remove,
+                    # pero en la sintaxis de pathlib).
+                    elemento.unlink()
             except Exception as e:
                 log.warning("No se pudo borrar %s: %s", elemento.name, e)
 
+    # parents=True crea tambien las carpetas intermedias que falten;
+    # exist_ok=True evita el error si la carpeta ya existe.
     ruta.mkdir(parents=True, exist_ok=True)
 
 
@@ -456,24 +522,36 @@ def descargar_workbook(servidor, luid, destino):
     """
     try:
         destino = Path(destino)
+        # .parent es la carpeta que contiene el fichero. Hay que crearla antes,
+        # porque Tableau no reproduce la jerarquia de proyectos por su cuenta.
         destino.parent.mkdir(parents=True, exist_ok=True)
 
-        # La libreria crea a veces una carpeta con el nombre del workbook y
-        # mete el fichero dentro, asi que se descarga a una ruta temporal.
+        # .stem es el nombre del fichero SIN extension. Se descarga a esa ruta
+        # porque la libreria decide ella la extension final, y ademas a veces
+        # crea una carpeta con ese nombre y mete el fichero dentro.
         temporal = str(destino.parent / destino.stem)
         servidor.workbooks.download(luid, filepath=temporal)
 
         carpeta = Path(temporal)
         if carpeta.is_dir():
+            # .glob() busca por patron dentro de la carpeta. Se concatenan las
+            # dos listas para aceptar cualquiera de los dos formatos.
             encontrados = list(carpeta.glob('*.twbx')) + list(carpeta.glob('*.twb'))
             if not encontrados:
                 log.error("        Tableau no devolvio ningun fichero")
                 return None
+
+            # .with_suffix() devuelve la misma ruta cambiando la extension. Asi
+            # el fichero final conserva la que Tableau haya usado de verdad.
             final = destino.with_suffix(encontrados[0].suffix)
-            shutil.move(str(encontrados[0]), str(final))
+            shutil.move(str(encontrados[0]), str(final))   # mover, no copiar
+
+            # ignore_errors=True: si la carpeta temporal no se puede borrar no
+            # importa, el fichero bueno ya esta en su sitio.
             shutil.rmtree(carpeta, ignore_errors=True)
             return final
 
+        # Algunas versiones de la libreria dejan el fichero suelto, sin carpeta.
         for extension in ('.twbx', '.twb'):
             candidato = destino.with_suffix(extension)
             if candidato.exists():
@@ -501,18 +579,25 @@ def subir_a_github(directorio, config, token, mensaje):
     cabecera = cabecera_git(token)
     url = url_repo(config)
 
-    # Margen amplio para transferencias grandes, y sin corte por lentitud:
-    # por defecto git aborta si la velocidad baja de 1 KB/s durante 10s.
+    # Margen amplio para transferencias grandes, y sin corte por lentitud: por
+    # defecto git aborta si la velocidad baja de 1 KB/s durante 10 segundos.
+    # Estos ajustes SI quedan guardados en el repositorio (no llevan '-c'),
+    # asi que basta con aplicarlos; repetirlos cada vez no cuesta nada.
     for ajuste in [('http.postBuffer', '2147483648'),
                    ('http.lowSpeedLimit', '0'),
                    ('http.lowSpeedTime', '999999')]:
+        # El * desempaqueta la tupla en argumentos sueltos:
+        # ('http.postBuffer', '2147483648') pasa a ser dos elementos de la lista
         git(['git', 'config', *ajuste], mostrar=False)
 
     # rm --cached + add (y NO 'git add --renormalize'): --renormalize implica
     # -u, que solo actualiza ficheros ya rastreados y nunca anade nuevos. Como
     # la carpeta se vacia en cada ejecucion, casi todos los ficheros son
     # nuevos y --renormalize los ignoraria en silencio, sin comitear nada.
-    # Sacarlos del indice y volver a anadirlos fuerza ademas el filtro de LFS.
+    #
+    #   --cached          -> saca del indice de git, pero NO borra del disco
+    #   --ignore-unmatch  -> no falla si el fichero no estaba rastreado
+    # Sacarlos y volver a anadirlos fuerza ademas que se aplique el filtro de LFS.
     git(['git', 'rm', '-r', '--cached', '--ignore-unmatch', '.'], [token], mostrar=False)
 
     codigo, salida = git(['git', 'add', '.'], [token], mostrar=False)
@@ -522,6 +607,8 @@ def subir_a_github(directorio, config, token, mensaje):
         return False
 
     codigo, salida = git(['git', 'commit', '-m', mensaje], [token], mostrar=False)
+    # git devuelve codigo de error cuando no hay nada que comitear, pero eso no
+    # es un fallo real: hay que distinguirlo mirando el texto de la salida.
     if "nothing to commit" in salida.lower():
         log.info("        Sin cambios que subir")
         return True
@@ -533,6 +620,7 @@ def subir_a_github(directorio, config, token, mensaje):
     # -X ours: si hay conflicto, gana la version recien descargada. Es lo
     # correcto en un backup, y evita que git se pare intentando fusionar
     # ficheros binarios que cambian de bytes en cada exportacion.
+    # --no-edit: no abre el editor de texto para el mensaje de la fusion.
     git(['git', 'merge', '--abort'], [token], mostrar=False)
     codigo, salida = git(
         ['git', '-c', cabecera, 'pull', '--no-edit', '-X', 'ours', url, 'main'],
@@ -543,10 +631,11 @@ def subir_a_github(directorio, config, token, mensaje):
         log.error("        %s", salida)
         return False
 
+    # Este si se muestra en pantalla: es donde aparece el progreso de Git LFS
     codigo, salida = git(['git', '-c', cabecera, 'push', url, 'main'], [token])
 
-    # Un rechazo por 'fetch first' significa que el remoto avanzo entre el
-    # pull y el push. Se reintenta una vez antes de darlo por fallido.
+    # Un rechazo por 'fetch first' significa que el remoto avanzo entre el pull
+    # y el push. Se reintenta una vez antes de darlo por fallido.
     if codigo != 0 and ("fetch first" in salida.lower() or "non-fast-forward" in salida.lower()):
         log.info("        El repositorio avanzo mientras subiamos, reintentando")
         git(['git', '-c', cabecera, 'pull', '--no-edit', '-X', 'ours', url, 'main'],
@@ -576,6 +665,8 @@ def actualizar_referencia_remota(directorio, config, token):
     cabecera = cabecera_git(token)
     url = url_repo(config)
     git(['git', '-c', cabecera, 'fetch', url, 'main'], [token], mostrar=False)
+    # update-ref mueve a mano un puntero interno de git. Aqui apunta
+    # origin/main a lo que acaba de traer el fetch.
     git(['git', 'update-ref', 'refs/remotes/origin/main', 'FETCH_HEAD'], [token], mostrar=False)
 
 
@@ -602,6 +693,9 @@ def descargar_y_subir(servidor, df, directorio, config, subir):
             log.warning("Se descargara todo, pero no se subira nada a GitHub")
             subir = False
 
+    # .iterrows() recorre el DataFrame fila a fila y devuelve pares
+    # (indice, fila); el indice no se usa, de ahi el guion bajo.
+    # enumerate(..., start=1) anade el contador que se ve en el log.
     for numero, (_, fila) in enumerate(df.iterrows(), start=1):
         luid = fila['WORKBOOK_LUID']
         nombre = fila['WORKBOOK']
@@ -610,6 +704,8 @@ def descargar_y_subir(servidor, df, directorio, config, subir):
         log.info("  [%d/%d] %s", numero, stats['total'], nombre)
         log.info("        Proyecto: %s", proyecto)
 
+        # El operador / entre objetos Path une rutas con el separador correcto
+        # del sistema (\ en Windows), sin tener que escribirlo a mano.
         destino = Path(directorio) / proyecto / f"{nombre}.twbx"
         fichero = descargar_workbook(servidor, luid, destino)
 
@@ -621,6 +717,8 @@ def descargar_y_subir(servidor, df, directorio, config, subir):
             log.info("        LUID: %s", luid)   # para poder buscarlo en Tableau
 
         es_ultimo = (numero == stats['total'])
+        # % es el resto de la division: vale 0 cada TAMANO_LOTE vueltas.
+        # El 'or es_ultimo' asegura que los que sobren del ultimo lote suban tambien.
         if subir and (numero % TAMANO_LOTE == 0 or es_ultimo):
             log.info("  --- Subiendo lote (%d/%d workbooks procesados) ---",
                      numero, stats['total'])
@@ -667,6 +765,7 @@ def mostrar_resumen(stats, segundos):
 def main():
     parser = argparse.ArgumentParser(description="Backup de workbooks de Tableau a GitHub")
     parser.add_argument('--config', default='config.json', help="fichero de configuracion")
+    # action='store_true': la opcion no lleva valor. Si aparece vale True.
     parser.add_argument('--sin-github', action='store_true', help="descargar sin subir a GitHub")
     parser.add_argument('--separador', default=',', help="separador del CSV")
     args = parser.parse_args()
@@ -681,14 +780,16 @@ def main():
 
     # --- Paso 1: borrar la lista anterior ---------------------------------
     # Se borra ANTES de pedir la nueva. Si Oracle fallara y no regenerase el
-    # fichero, el paso 3 se encontraria con que no existe y abortaria, en
-    # vez de seguir trabajando en silencio con los datos de ayer.
+    # fichero, el paso 3 se encontraria con que no existe y abortaria, en vez
+    # de seguir trabajando en silencio con los datos de ayer.
     log.info("[1/8] Borrando la lista anterior")
     if lista.exists():
         try:
             lista.unlink()
             log.info("      Eliminada")
         except OSError as e:
+            # Pasa si el fichero esta abierto en otro programa (por ejemplo,
+            # alguien lo dejo abierto en Excel o en el Bloc de notas).
             log.warning("      No se pudo borrar (%s), se intentara sobrescribir", e)
     else:
         log.info("      No habia lista anterior")
@@ -736,6 +837,8 @@ def main():
         log.info("[7/8] Descargando (sin subir a GitHub)")
     stats = descargar_y_subir(servidor, df, directorio, config, subir)
 
+    # Cerrar sesion en Tableau para no dejarlas acumuladas en el servidor.
+    # Si falla no importa: caducan solas.
     try:
         servidor.auth.sign_out()
     except Exception:
@@ -746,5 +849,7 @@ def main():
     mostrar_resumen(stats, (datetime.now() - inicio).total_seconds())
 
 
+# Solo se ejecuta main() si el fichero se lanza directamente, no si algun dia
+# se importa desde otro script para reutilizar sus funciones.
 if __name__ == '__main__':
     main()

@@ -52,7 +52,7 @@ BEGIN
     -- es una version nueva que no se conocia.
     INSERT INTO MDM_TABLEAU_GIT_CONTENT
         (WORKBOOK_LUID, FILE_TYPE, NAME, VERSION, NAVIGATION,
-         DATE_UPLOAD, FLG_LAST_VERSION, FLG_DELETE, DATE_DELETE)
+         DATE_UPLOAD, FLG_LAST_VERSION, FLG_DELETE, DATE_DELETE, FLG_SUBIDO_GITHUB)
     SELECT
         d.WORKBOOK_LUID,
         d.TIPO_ITEM,
@@ -62,7 +62,8 @@ BEGIN
         v_hoy,
         0,      -- se recalcula en el PASO 2
         0,
-        NULL
+        NULL,
+        0       -- Python la pondra a 1 SOLO tras confirmar el push a GitHub
     FROM DESCARGA_WORKBOOKS d
     WHERE d.WORKBOOK_LUID IS NOT NULL
       AND NOT EXISTS (

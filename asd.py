@@ -1,285 +1,208 @@
-:: Subida del fichero a SQLDeveloper
-chcp 65001 > nul
-set NLS_LANG=AMERICAN_AMERICA.AL32UTF8
-cd C:\oracle\instantclient_23_0
-SQLPLUS CLABS_STG_PRO/CantabriaSTG2021Pro@golddb_high @"C:\tabcmd\TableauGitHub\Descarga.sql"
+SELECT 
+    V.*,
+    (CASE
+        WHEN V.FECHAEMISION_FACT IS NOT NULL
+        THEN V.FECHAEMISION_FACT
+        WHEN V.DOCENTRY_FACT IS NULL 
+        THEN    
+            (
+                CASE 
+                    WHEN V.CLIENT_NAME_CLI LIKE 'LIVERPOOL' AND V.PICKUPDATE_PICK IS NULL
+                    THEN V.CREATEDATE_PED
+                    WHEN V.CLIENT_NAME_CLI LIKE 'LIVERPOOL' AND V.PICKUPDATE_PICK IS NOT NULL
+                    THEN SYSDATE
+                    WHEN V.DOCSTATUS_PED = 'C'
+                    THEN V.CREATEDATE_PED
+                    WHEN V.DOCSTATUS_PED = 'O'
+                    THEN SYSDATE
+                    ELSE NULL
+                END
+            )
+        WHEN V.DOCENTRY_FACT IS NOT NULL AND V.FECHAEMISION_FACT IS NULL
+        THEN V.CREATEDATE_PED
+    END) AS FECHADEF,
+    (CASE WHEN V.DOCENTRY_FACT IS NOT NULL THEN 'SI' ELSE 'NO' END) AS TIENE_FACTURA,
+    (CASE 
+        WHEN V.DOCENTRY_FACT IS NULL AND V.DOCSTATUS_PED = 'O'
+        THEN 'Pendiente de facturar'
+        WHEN V.DOCSTATUS_PED = 'C' AND V.DOCENTRY_FACT IS NULL
+        THEN 'No facturado'
+        WHEN V.DOCENTRY_FACT IS NOT NULL AND V.LINETOTAL_PED > NVL(V.LINETOTAL_FACT,0)
+        THEN 'No facturado'
+        ELSE 'Facturado'
+    END) AS FACTURADO,
+    V.LINETOTAL_PED - NVL(V.LINETOTAL_FACT,0) AS IMPORTE_FALTANTE_FACTURA,
+    SUM(V.LINETOTAL_PED) OVER (PARTITION BY
+        (CASE 
+            WHEN V.FECHAEMISION_FACT IS NOT NULL THEN V.FECHAEMISION_FACT
+            WHEN V.DOCENTRY_FACT IS NULL THEN
+               (CASE 
+                    WHEN V.CLIENT_NAME_CLI LIKE 'LIVERPOOL' AND V.PICKUPDATE_PICK IS NULL
+                    THEN V.CREATEDATE_PED
+                    WHEN V.CLIENT_NAME_CLI LIKE 'LIVERPOOL' AND V.PICKUPDATE_PICK IS NOT NULL
+                    THEN SYSDATE
+                    WHEN V.DOCSTATUS_PED = 'C'
+                    THEN V.CREATEDATE_PED
+                    WHEN V.DOCSTATUS_PED = 'O'
+                    THEN SYSDATE
+                    ELSE NULL
+                END)
+        WHEN V.DOCENTRY_FACT IS NOT NULL AND V.FECHAEMISION_FACT IS NULL
+        THEN V.CREATEDATE_PED
+        END)
+    ) AS TOTAL_PEDIDOS
+FROM
+(
+SELECT
+PED.DOCENTRY_PED AS DOCENTRY_PED,
+PED.DOCNUM_PED AS DOCNUM_PED,
+PED.LINENUM_PED AS LINENUM_PED,
+PED.DOCDATE AS DOC_PED,
+PED.DOCDUEDATE AS DOCDUE_PED,
+PED.TAXDATE AS TAX_PED,
+PED.DOCSTATUS AS DOCSTATUS_PED,
+PED.CREATEDATE AS CREATEDATE_PED,
+PED.CANCELED_PED AS CANCELED_PED,
+PED.CARDCODE AS CARDCODE_PED,
+PED.CARDNAME AS CARDNAME_PED,
+PED.COMMENTS AS COMMENTS_PED,
+PED.ITEMCODE AS ITEMCODE_PED,
+PED.ITEMNAME AS ITEMNAME_PED,
+PED.ITEMCODE_AGROUPED AS ITEMCODE_AGROUPED_PED,
+PED.ITEMNAME_AGROUPED AS ITEMNAME_AGROUPED_PED,
+PED.ITEMCODE_GROUP AS ITEMCODE_GROUP_PED,
+PED.ITEMNAME_GROUP AS ITEMNAME_GROUP_PED,
+PED.BRAND AS BRAND_PED,
+PED.LINE AS LINE_PED,
+PED.RANGE AS RANGE_PED,
+PED.REGULATORY_STATUS AS REGULATORY_STATUS_PED,
+PED.THERAPEUTIC_AREA AS THERAPEUTIC_AREA_PED,
+PED.TYPE AS TYPE_PED,
+PED.SUBTYPE AS SUBTYPE_PED,
+PED.QUANTITY AS QUANTITY_PED,
+PED.OPENQTY AS OPENQTY_PED,
+PED.PRICE AS PRICE_PED,
+PED.PRICE * PED.QUANTITY AS LINETOTAL_PED,
+PED.ACCTCODE AS ACCTCODE_PED,
+PED.ACCTNAME AS ACCTNAME_PED,
+PED.OCRCODE AS OCRCODE_PED,
+PED.OCRNAME AS OCRNAME_PED,
+FACT_AGG.CANTIDAD_FACTURAS AS CANTIDAD_FACTURAS,
+FACT_AGG.DOCENTRY_FACT AS DOCENTRY_FACT,
+FACT_AGG.DOCNUM_FACT AS DOCNUM_FACT,
+FACT_AGG.FECHAEMISION_FACT AS FECHAEMISION_FACT,
+FACT_AGG.FACTURAS_ASOCIADAS AS FACTURAS_ASOCIADAS,
+NVL(FACT_AGG.TOT_PARTIDA,0) AS LINETOTAL_FACT,
+NC_AGG.TOTAL_NC AS TOTAL_NC,
+NC_AGG.CANTIDAD_NC AS CANTIDAD_NC,
+PICK_AGG.PICKUPDATE_PICK AS PICKUPDATE_PICK,
+CLI.CLIENT_CODE AS CLIENT_CODE_CLI,
+CLI.CLIENT_NAME AS CLIENT_NAME_CLI,
+CLI.VAT_TAX_ID AS VAT_TAX_ID_CLI,
+CLI.CLIENT_SUBTYPE AS CLIENT_SUBTYPE_CLI,
+CLI.CLIENT_SUBTYPE2 AS CLIENT_SUBTYPE2_CLI,
+CLI.STATUS AS STATUS_CLI,
+CLI.CURRENCY AS CURRENCY_CLI,
+CLI.GROUPED_CLIENT_CODE AS GROUPED_CLIENT_CODE_CLI,
+CLI.GROUPED_CLIENT_NAME AS GROUPED_CLIENT_NAME_CLI,
+CLI.DATE_CLIENT AS DATE_CLIENT_CLI,
+CLI.CLIENT_ASSIGNED_SALES_FORCE AS CLIENT_ASSIGNED_SALES_FORCE_CLI,
+CLI.NETWORK_TERRITORY AS NETWORK_TERRITORY_CLI,
+CLI.FINANCIAL_RISK AS FINANCIAL_RISK_CLI,
+CLI.ELECTRONIC_BILLING AS ELECTRONIC_BILLING_CLI,
+CLI.PAYMENT_CONDITIONS AS PAYMENT_CONDITIONS_CLI,
+CLI.ADDRESS AS ADDRESS_CLI,
+CLI.ADDRESS_TYPE AS ADDRESS_TYPE_CLI,
+CLI.DATE_ADDRESS AS DATE_ADDRESS_CLI,
+CLI.CONTINENT AS CONTINENT_CLI,
+CLI.COUNTRY AS COUNTRY_CLI,
+CLI.STATE AS STATE_CLI,
+CLI.CITY AS CITY_CLI,
+CLI.PHONE AS PHONE_CLI,
+CLI.EMAIL AS EMAIL_CLI,
+CLI.VALIDATE_STATUS AS VALIDATE_STATUS_CLI,
+CLI.ACCOUNT_NUM AS ACCOUNT_NUM_CLI,
+CLI.ACCOUNT_NAME AS ACCOUNT_NAME_CLI,
+CLI.VATGROUP  AS VATGROUP_CLI
+FROM
+STD_MEX_BI_PEDIDOS ped
+LEFT JOIN 
+(
+SELECT * FROM 
+STD_MEX_BI_CLIENTES
+WHERE 
+UPPER(ADDRESS_TYPE) LIKE '%FISCAL%'
+OR CLIENT_CODE IN (SELECT CLIENT_CODE FROM STD_MEX_BI_CLIENTES GROUP BY CLIENT_CODE HAVING COUNT(1)=1)
+OR (CLIENT_CODE IN (SELECT CLIENT_CODE FROM STD_MEX_BI_CLIENTES GROUP BY CLIENT_CODE HAVING COUNT(1)>1) 
+    AND  
+    CLIENT_CODE||'-'||ADDRESS_TYPE IN (
+        SELECT CLIENT_CODE||'-'||ADDRESS_TYPE 
+        FROM(
+        SELECT CLIENT_CODE, MAX(ADDRESS_TYPE) AS ADDRESS_TYPE 
+        FROM STD_MEX_BI_CLIENTES 
+        WHERE ADDRESS_TYPE<>'Ship To' 
+        GROUP BY CLIENT_CODE HAVING COUNT(1)=1)
+    )
+    )
+) 
+cli ON ped.CARDCODE = cli.CLIENT_CODE
 
-
-
-
-
-:: Lanza el subproceso de versionado (Actualizar_MDM_TABLEAU_GIT_CONTENT.sql)
-:: Analogo a ConexionOracle.bat -- usa las MISMAS credenciales de Oracle,
-:: no es un acceso nuevo. Se ejecuta ANTES de ConexionOracle.bat cada noche.
-chcp 65001 > nul
-set NLS_LANG=AMERICAN_AMERICA.AL32UTF8
-cd C:\oracle\instantclient_23_0
-SQLPLUS CLABS_STG_PRO/CantabriaSTG2021Pro@golddb_high @"C:\tabcmd\TableauGitHub\Actualizar_MDM_TABLEAU_GIT_CONTENT.sql"
-
-
-
-
-
-
-:: MarcarSubidoGitHub.bat
-::
-:: Lo llama Python (marcar_subido_en_oracle) DESPUES de confirmar que un
-:: push a GitHub tuvo exito, para poner FLG_SUBIDO_GITHUB=1 en las
-:: versiones incluidas en ese push.
-::
-:: A diferencia de ConexionOracle.bat y ActualizarGitContent.bat (que
-:: siempre ejecutan el MISMO .sql fijo), este recibe como primer argumento
-:: (%1) la ruta al .sql que Python genera en cada llamada, con el UPDATE
-:: concreto de esa tanda de versiones.
-::
-:: Mismas credenciales de Oracle que ConexionOracle.bat -- no es un acceso
-:: nuevo.
-
-chcp 65001 > nul
-set NLS_LANG=AMERICAN_AMERICA.AL32UTF8
-cd C:\oracle\instantclient_23_0
-
-SQLPLUS CLABS_STG_PRO/CantabriaSTG2021Pro@golddb_high @%1
-
-
-
-
-
-WHENEVER OSERROR EXIT FAILURE
-WHENEVER SQLERROR EXIT SQL.SQLCODE
-
-SET ECHO OFF
-SET FEEDBACK OFF
-SET VERIFY OFF
-SET HEADING ON 
-SET TERMOUT OFF
-
-SET MARKUP CSV ON DELIMITER ',' QUOTE ON
-
-SPOOL C:\tabcmd\TableauGitHub\lista_workbooks.csv
-
--- NUEVO: VERSION_ACTUAL y YA_SUBIDO vienen de DESCARGA_WORKBOOKS (LEFT JOIN
--- contra MDM_TABLEAU_GIT_CONTENT). El WHERE excluye las versiones que ya
--- estan subidas y vivas en GitHub (YA_SUBIDO='S') -- asi el CSV que lee
--- Python solo trae lo que de verdad hace falta descargar/subir hoy: las
--- filas de "carpeta intermedia" (YA_SUBIDO IS NULL) se siguen incluyendo
--- igual que antes, para no perder ninguna carpeta.
-SELECT WORKBOOK_LUID, WORKBOOK, RUTA_PROYECTO, RUTA_LOCAL_DESTINO, OWNER_EMAIL,
-       ULTIMA_ACTUALIZACION, TIPO_ITEM, VERSION_ACTUAL
-FROM DESCARGA_WORKBOOKS
-WHERE YA_SUBIDO IS NULL OR YA_SUBIDO = 'N';
-
-SPOOL OFF
-
-SET MARKUP CSV OFF
-
-EXIT
-
-
-
-
---------------------------------------------------------------------------------
--- Actualizar_MDM_TABLEAU_GIT_CONTENT.sql
---------------------------------------------------------------------------------
--- Subproceso nocturno, se ejecuta ANTES de Descarga.sql. Hace tres cosas,
--- en este orden, y confirma con COMMIT al final:
---
---   1. Registra las versiones NUEVAS detectadas en Tableau (comparando
---      ITEM_REVISION contra lo que ya hay guardado para ese WORKBOOK_LUID).
---   2. Recalcula que fila es la "ultima version" viva de cada workbook.
---   3. Aplica la politica de retencion y marca que hay que eliminar.
---
--- Un mismo workbook puede modificarse varias veces el mismo dia: no es un
--- problema, porque se compara VERSION exacta (=ITEM_REVISION), no la
--- fecha -- cada revision nueva de Tableau genera su propia fila.
---
--- Politica de retencion:
---   CASO A (workbook activo) -- el workbook sigue en Tableau y ha tenido
---     alguna version dentro de los ultimos 6 meses VENCIDOS (mes en curso
---     no cuenta como cumplido): se retiran solo las versiones individuales
---     mas antiguas que ese corte.
---   CASO B (workbook parado o borrado) -- el workbook ya no existe en
---     Tableau, O existe pero no ha tenido ninguna version nueva en los
---     ultimos 6 meses: se conservan unicamente sus 3 versiones mas
---     recientes, sea cual sea su antiguedad, y se retira el resto.
---------------------------------------------------------------------------------
-
-WHENEVER SQLERROR EXIT SQL.SQLCODE ROLLBACK;
-SET SERVEROUTPUT ON;
-
--- Sin esto, el entorno (golddb_high) ejecuta el INSERT del PASO 1 en modo
--- paralelo/direct-path por defecto. Eso deja la tabla bloqueada para
--- lectura/escritura DENTRO de la misma transaccion hasta que se hace
--- COMMIT -- y el UPDATE del PASO 2, que lee y modifica esa misma tabla
--- antes del COMMIT final, chocaba con eso (ORA-12838). Desactivando el
--- DML paralelo para esta sesion, el INSERT se ejecuta en modo normal y
--- el resto del bloque puede leer/modificar la tabla sin problema.
-ALTER SESSION DISABLE PARALLEL DML;
-
-DECLARE
-    v_fecha_corte TIMESTAMP;   -- limite de los "6 meses vencidos"
-    v_hoy         TIMESTAMP := SYSTIMESTAMP;
-BEGIN
-    -- Se trunca al primer dia del mes actual y se retrocede 6 meses
-    -- completos, para que el mes en curso nunca cuente como "cumplido".
-    v_fecha_corte := ADD_MONTHS(TRUNC(v_hoy, 'MM'), -6);
-
-    ----------------------------------------------------------------------
-    -- PASO 1: insertar las versiones nuevas
-    ----------------------------------------------------------------------
-    -- DESCARGA_WORKBOOKS.VERSION_ACTUAL es la version que hay AHORA en
-    -- Tableau. Si no existe ya una fila con ese WORKBOOK_LUID + VERSION,
-    -- es una version nueva que no se conocia.
-    INSERT INTO MDM_TABLEAU_GIT_CONTENT
-        (WORKBOOK_LUID, FILE_TYPE, NAME, VERSION, NAVIGATION,
-         DATE_UPLOAD, FLG_LAST_VERSION, FLG_DELETE, DATE_DELETE, FLG_SUBIDO_GITHUB)
+LEFT JOIN
+(
     SELECT
-        d.WORKBOOK_LUID,
-        d.TIPO_ITEM,
-        d.WORKBOOK || '_v' || d.VERSION_ACTUAL,   -- "Mi mundo_v3"
-        d.VERSION_ACTUAL,
-        d.RUTA_PROYECTO,
-        v_hoy,
-        0,      -- se recalcula en el PASO 2
-        0,
-        NULL,
-        0       -- Python la pondra a 1 SOLO tras confirmar el push a GitHub
-    FROM DESCARGA_WORKBOOKS d
-    WHERE d.WORKBOOK_LUID IS NOT NULL
-      AND NOT EXISTS (
-            SELECT 1
-            FROM MDM_TABLEAU_GIT_CONTENT g
-            WHERE g.WORKBOOK_LUID = d.WORKBOOK_LUID
-              AND g.VERSION       = d.VERSION_ACTUAL
-      );
+        pl.DOCENTRY_PED,
+        pl.LINENUM_PED,
+        COUNT(fact.DOCENTRY) AS CANTIDAD_FACTURAS,
+        SUM(fact.LINETOTAL) AS TOT_PARTIDA,
+        MAX(fact.DOCENTRY) AS DOCENTRY_FACT,
+        MAX(fact.DOCNUM) AS DOCNUM_FACT,
+        MAX(fact.U_FECHAEMISION) AS FECHAEMISION_FACT,
+        LISTAGG(fact.DOCNUM,', ') WITHIN GROUP (ORDER BY fact.DOCNUM) AS FACTURAS_ASOCIADAS
+    FROM 
+        STD_MEX_BI_PEDIDOS pl
+    LEFT JOIN STD_MEX_BI_ENTREGAS entr
+           ON entr.BASETYPE = '17' AND entr.BASEENTRY = pl.DOCENTRY_PED AND entr.BASELINE = pl.LINENUM_PED
+          AND entr.CANCELED = 'N'
+    LEFT JOIN STD_MEX_BI_FACTURAS_CLIENTES fact
+           ON fact.BASETYPE = '15' AND fact.BASEENTRY = entr.DOCENTRY AND fact.BASELINE = entr.LINENUM
+          AND fact.CANCELED = 'N'
+    GROUP BY pl.DOCENTRY_PED, pl.LINENUM_PED
+) FACT_AGG ON FACT_AGG.DOCENTRY_PED = ped.DOCENTRY_PED AND FACT_AGG.LINENUM_PED = ped.LINENUM_PED
 
-    DBMS_OUTPUT.PUT_LINE('Versiones nuevas insertadas: ' || SQL%ROWCOUNT);
+LEFT JOIN 
+(
+    SELECT
+        pl.DOCENTRY_PED,
+        pl.LINENUM_PED,
+        SUM(nc.LINETOTAL) AS TOTAL_NC,
+        COUNT(nc.DOCENTRY) AS CANTIDAD_NC
+    FROM STD_MEX_BI_PEDIDOS pl
+    LEFT JOIN STD_MEX_BI_ENTREGAS entr
+           ON entr.BASETYPE = '17' AND entr.BASEENTRY = pl.DOCENTRY_PED AND entr.BASELINE = pl.LINENUM_PED
+          AND entr.CANCELED = 'N'
+    LEFT JOIN STD_MEX_BI_FACTURAS_CLIENTES fact
+           ON fact.BASETYPE = '15' AND fact.BASEENTRY = entr.DOCENTRY AND fact.BASELINE = entr.LINENUM
+          AND fact.CANCELED = 'N'
+    LEFT JOIN STD_MEX_BI_NOTASCREDITO_CLIENTES nc
+           ON nc.BASETYPE = '13' AND nc.BASEENTRY = fact.DOCENTRY AND nc.BASELINE = fact.LINENUM
+          AND nc.CANCELED = 'N'
+    GROUP BY pl.DOCENTRY_PED, pl.LINENUM_PED
+) NC_AGG ON NC_AGG.DOCENTRY_PED = ped.DOCENTRY_PED AND NC_AGG.LINENUM_PED = ped.LINENUM_PED
 
-    ----------------------------------------------------------------------
-    -- PASO 2: recalcular FLG_LAST_VERSION (solo entre versiones vivas)
-    ----------------------------------------------------------------------
-    UPDATE MDM_TABLEAU_GIT_CONTENT g
-    SET g.FLG_LAST_VERSION = CASE
-        WHEN g.VERSION = (
-            SELECT MAX(g2.VERSION)
-            FROM MDM_TABLEAU_GIT_CONTENT g2
-            WHERE g2.WORKBOOK_LUID = g.WORKBOOK_LUID
-              AND g2.FLG_DELETE = 0
-        ) THEN 1
-        ELSE 0
-    END
-    WHERE g.FLG_DELETE = 0;
-
-    DBMS_OUTPUT.PUT_LINE('FLG_LAST_VERSION recalculado: ' || SQL%ROWCOUNT || ' filas');
-
-    ----------------------------------------------------------------------
-    -- PASO 3: politica de retencion
-    ----------------------------------------------------------------------
-
-    -- CASO A: version individual mas antigua que el corte, en un workbook
-    -- que SI ha tenido alguna version dentro de los ultimos 6 meses.
-    UPDATE MDM_TABLEAU_GIT_CONTENT g
-    SET g.FLG_DELETE = 1, g.DATE_DELETE = v_hoy
-    WHERE g.FLG_DELETE = 0
-      AND g.DATE_UPLOAD < v_fecha_corte
-      AND EXISTS (
-            SELECT 1 FROM DESCARGA_WORKBOOKS d
-            WHERE d.WORKBOOK_LUID = g.WORKBOOK_LUID
-      )
-      AND EXISTS (
-            SELECT 1
-            FROM MDM_TABLEAU_GIT_CONTENT g2
-            WHERE g2.WORKBOOK_LUID = g.WORKBOOK_LUID
-              AND g2.FLG_DELETE = 0
-              AND g2.DATE_UPLOAD >= v_fecha_corte
-      );
-
-    DBMS_OUTPUT.PUT_LINE('Caso A (workbook activo, version vieja retirada): ' || SQL%ROWCOUNT);
-
-    -- CASO B: todo lo que sobre de las 3 versiones mas recientes, en
-    -- workbooks borrados de Tableau o sin actividad en los ultimos 6 meses.
-    UPDATE MDM_TABLEAU_GIT_CONTENT g
-    SET g.FLG_DELETE = 1, g.DATE_DELETE = v_hoy
-    WHERE g.FLG_DELETE = 0
-      AND (
-            NOT EXISTS (   -- ya no existe en Tableau
-                SELECT 1 FROM DESCARGA_WORKBOOKS d
-                WHERE d.WORKBOOK_LUID = g.WORKBOOK_LUID
-            )
-            OR NOT EXISTS (   -- existe, pero sin version en los ultimos 6 meses
-                SELECT 1
-                FROM MDM_TABLEAU_GIT_CONTENT g2
-                WHERE g2.WORKBOOK_LUID = g.WORKBOOK_LUID
-                  AND g2.FLG_DELETE = 0
-                  AND g2.DATE_UPLOAD >= v_fecha_corte
-            )
-      )
-      AND g.VERSION NOT IN (
-            SELECT VERSION FROM (
-                SELECT g3.VERSION,
-                       ROW_NUMBER() OVER (
-                           PARTITION BY g3.WORKBOOK_LUID
-                           ORDER BY g3.VERSION DESC
-                       ) AS RN
-                FROM MDM_TABLEAU_GIT_CONTENT g3
-                WHERE g3.WORKBOOK_LUID = g.WORKBOOK_LUID
-                  AND g3.FLG_DELETE = 0
-            )
-            WHERE RN <= 3
-      );
-
-    DBMS_OUTPUT.PUT_LINE('Caso B (workbook parado/borrado, exceso sobre 3 versiones): ' || SQL%ROWCOUNT);
-
-    -- Se repite el PASO 2: el PASO 3 puede haber retirado la version que
-    -- antes era la "ultima viva" de algun workbook.
-    UPDATE MDM_TABLEAU_GIT_CONTENT g
-    SET g.FLG_LAST_VERSION = CASE
-        WHEN g.VERSION = (
-            SELECT MAX(g2.VERSION)
-            FROM MDM_TABLEAU_GIT_CONTENT g2
-            WHERE g2.WORKBOOK_LUID = g.WORKBOOK_LUID
-              AND g2.FLG_DELETE = 0
-        ) THEN 1
-        ELSE 0
-    END
-    WHERE g.FLG_DELETE = 0;
-
-    COMMIT;
-    DBMS_OUTPUT.PUT_LINE('MDM_TABLEAU_GIT_CONTENT actualizada y confirmada.');
-END;
-/
-
-----------------------------------------------------------------------------
--- Volcar a CSV las versiones marcadas para eliminar HOY
-----------------------------------------------------------------------------
--- Es lo unico que necesita Python para saber que archivo (.twbx/.twb) tiene
--- que retirar de GitHub en la ejecucion de esta noche. TRUNC(DATE_DELETE) =
--- TRUNC(SYSDATE) filtra solo las marcadas hoy, no las de noches anteriores.
-SET MARKUP CSV ON DELIMITER ',' QUOTE ON
-SET HEADING ON
-SET FEEDBACK OFF
-SET TERMOUT OFF
-
-SPOOL C:\tabcmd\TableauGitHub\lista_workbooks_eliminar.csv
-
-SELECT WORKBOOK_LUID, NAME, NAVIGATION
-FROM MDM_TABLEAU_GIT_CONTENT
-WHERE FLG_DELETE = 1
-  AND TRUNC(DATE_DELETE) = TRUNC(SYSDATE);
-
-SPOOL OFF
-
-SET MARKUP CSV OFF
-
-EXIT;
-
-
-
-
-
-pandas
-tableauserverclient
-pyjwt
-cryptography
-requests
-
+LEFT JOIN
+(
+    SELECT
+        pl.DOCENTRY_PED,
+        pl.LINENUM_PED,
+        MAX(pick.UPDATEDATE) AS PICKUPDATE_PICK
+    FROM STD_MEX_BI_PEDIDOS pl
+    LEFT JOIN STD_MEX_BI_PICK pick ON pick.ORDERENTRY = pl.DOCENTRY_PED
+    GROUP BY pl.DOCENTRY_PED, pl.LINENUM_PED
+) PICK_AGG ON PICK_AGG.DOCENTRY_PED = ped.DOCENTRY_PED AND PICK_AGG.LINENUM_PED = ped.LINENUM_PED
+WHERE ped.CANCELED_PED = 'N'
+) V
+WHERE V.GROUPED_CLIENT_NAME_CLI LIKE 'LIVERPOOL' 
+  AND EXTRACT(MONTH FROM V.FECHADEF) = 8 
+  AND EXTRACT(YEAR FROM V.FECHADEF) = 2026 
+  AND V.DOCNUM_PED = '21750'
+;

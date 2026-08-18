@@ -15,8 +15,17 @@ Flujo completo:
       -> sube todo a GitHub por lotes, con Git LFS para los grandes
 
 A diferencia del sistema anterior (una sola version por workbook,
-sobrescrita cada noche), ahora conviven varias versiones de cada workbook
-en disco y en GitHub, y es Oracle quien decide cuales se conservan.
+sobrescrita cada noche), ahora conviven varias versiones de cada workbook:
+
+    Tableau Workbooks/
+    |-- Versiones/                          <- TODAS las versiones, planas,
+    |     Nombre_v1.twbx                       diferenciadas solo por nombre
+    |     Nombre_v2.twbx
+    |-- Development/.../Nombre.twbx         <- SOLO la mas reciente,
+    `-- Production/.../Nombre.twbx             nombre FIJO (sin "_vX")
+
+y es Oracle quien decide, via MDM_TABLEAU_GIT_CONTENT, cuales de las
+versiones de Versiones/ se conservan y cuales se retiran.
 
 Uso:
     python descargar_workbooks.py                  # proceso completo
@@ -67,6 +76,13 @@ GITHUB_API_VERSION = "2026-03-10"
 # Workbooks que se descargan antes de hacer cada commit + push.
 # No subir todo de golpe: un push de varios GB falla por timeout.
 TAMANO_LOTE = 8
+
+# Todas las versiones de todos los workbooks viven aqui, sin subcarpetas,
+# diferenciadas solo por el nombre ("Nombre_vX.twbx"). Es el archivo
+# historico completo. La version mas reciente de cada workbook se copia
+# ADEMAS a su carpeta de proyecto normal, con nombre FIJO (sin "_vX"), para
+# que siempre haya un unico sitio "de siempre" con el contenido actual.
+CARPETA_VERSIONES = "Versiones"
 
 
 # ============================================================================
@@ -540,6 +556,12 @@ def procesar_eliminaciones(directorio, lista_eliminar):
     """
     Borra del disco los archivos de las versiones marcadas para retirar.
 
+    Las versiones individuales viven todas en la carpeta plana Versiones/
+    (nunca en la carpeta de proyecto -- ahi solo esta la mas reciente, con
+    nombre fijo, y esa la gestiona el flujo normal de descarga, no la
+    retencion). Por eso aqui se borra siempre de Versiones/, ignorando el
+    proyecto del workbook.
+
     No hace falta hacer "git rm" a mano: el siguiente "git add -A" (en
     subir_a_github) detecta por si solo que el archivo desaparecio del
     disco y lo incluye en el commit como una eliminacion.
@@ -549,7 +571,7 @@ def procesar_eliminaciones(directorio, lista_eliminar):
     """
     borrados = 0
     for item in lista_eliminar:
-        base = Path(directorio) / item['proyecto'] / item['nombre']
+        base = Path(directorio) / CARPETA_VERSIONES / item['nombre']
         encontrado = False
         for extension in ('.twbx', '.twb'):
             candidato = base.with_suffix(extension)
@@ -848,33 +870,52 @@ def descargar_y_subir(servidor, df, directorio, config, subir, token):
         log.info("  [%d/%d] %s (v%s)", numero, stats['total'], nombre, version)
         log.info("        Proyecto: %s", proyecto)
 
-        # Sufijo de version SIN guion bajo antes de la "v": "Nombre_v3.twbx".
-        # Cada version es un archivo distinto que se conserva para siempre
-        # (hasta que la politica de retencion lo marque para eliminar) --
-        # por eso nunca se sobrescribe un archivo ya existente.
-        destino = Path(directorio) / proyecto / f"{nombre}_v{version}.twbx"
+        # Cada version vive SIEMPRE en Versiones/ (plana, sin subcarpetas,
+        # diferenciada solo por el nombre con sufijo "_vX"): es el archivo
+        # historico completo, nunca se sobrescribe ni se mueve de ahi.
+        ruta_version = Path(directorio) / CARPETA_VERSIONES / f"{nombre}_v{version}.twbx"
 
-        # Si ya existe en disco (con cualquiera de las dos extensiones),
+        # Si ya existe en Versiones/ (con cualquiera de las dos extensiones),
         # no hace falta volver a pedirselo a Tableau. Esto puede pasar si
         # una ejecucion anterior descargo el archivo pero fallo antes de
         # subirlo a GitHub: la vista ya lo habria excluido por YA_SUBIDO,
         # pero esta comprobacion es una red de seguridad adicional barata.
-        ya_en_disco = destino.exists() or destino.with_suffix('.twb').exists()
+        ya_en_disco = ruta_version.exists() or ruta_version.with_suffix('.twb').exists()
         if ya_en_disco:
+            fichero = ruta_version if ruta_version.exists() else ruta_version.with_suffix('.twb')
             stats['ok'] += 1
-            log.info("        Ya existe en disco, no se descarga de nuevo")
-            lote_pendiente_marcar.append((luid, version))
+            log.info("        Ya existe en Versiones/, no se descarga de nuevo")
         else:
-            fichero = descargar_workbook(servidor, luid, destino)
+            fichero = descargar_workbook(servidor, luid, ruta_version)
             if fichero:
                 stats['ok'] += 1
                 log.info("        Descargado (%s)", tamano_legible(fichero))
-                lote_pendiente_marcar.append((luid, version))
             else:
+                fichero = None
                 stats['error'] += 1
                 log.info("        LUID: %s", luid)   # para poder buscarlo en Tableau
-                # NO se anade a lote_pendiente_marcar: sin fichero, no hay
-                # nada que subir ni que marcar como subido en Oracle.
+
+        if fichero:
+            # Cada fila del CSV es, por definicion, la revision ACTUAL de
+            # ese workbook en Tableau (MDM_TABLEAU_SITE_CONTENT solo
+            # refleja el estado presente, nunca versiones antiguas) -- asi
+            # que toda descarga de esta lista ES la ultima version. Se
+            # copia (no se mueve) a su carpeta de proyecto normal, con
+            # nombre FIJO sin "_vX": ese archivo siempre representa "la
+            # version vigente ahora mismo", y se sobrescribe sin mas cada
+            # vez que hay una version nueva.
+            destino_final = Path(directorio) / proyecto / f"{nombre}{fichero.suffix}"
+            destino_final.parent.mkdir(parents=True, exist_ok=True)
+            # Si la version anterior tenia la OTRA extension (.twb <-> .twbx),
+            # se retira para no dejar dos copias con nombre distinto conviviendo.
+            otra_extension = '.twb' if fichero.suffix == '.twbx' else '.twbx'
+            destino_final.with_suffix(otra_extension).unlink(missing_ok=True)
+            shutil.copy2(fichero, destino_final)
+
+            lote_pendiente_marcar.append((luid, version))
+        # Si fichero es None (fallo la descarga), NO se anade a
+        # lote_pendiente_marcar: sin fichero, no hay nada que subir ni que
+        # marcar como subido en Oracle.
 
         es_ultimo = (numero == stats['total'])
         # % es el resto de la division: vale 0 cada TAMANO_LOTE vueltas.

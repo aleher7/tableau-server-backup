@@ -971,6 +971,55 @@ def mostrar_resumen(stats, segundos):
 # PROGRAMA PRINCIPAL
 # ============================================================================
 
+# ============================================================================
+# CANDADO: evita que dos ejecuciones corran a la vez
+# ============================================================================
+# Se guarda junto al propio script, no en directorio_descarga (asi funciona
+# incluso si config.json todavia no se ha podido leer).
+RUTA_CANDADO = Path(__file__).resolve().parent / "proceso.lock"
+
+
+def proceso_esta_vivo(pid):
+    """
+    Comprueba si un PID sigue activo en Windows, con 'tasklist' (no hace
+    falta ninguna libreria extra). Si por lo que sea no se puede comprobar,
+    se asume que SI sigue vivo -- mas vale un falso "esta ocupado" molesto
+    que dejar arrancar dos ejecuciones a la vez por error.
+    """
+    try:
+        salida = subprocess.run(
+            ['tasklist', '/FI', f'PID eq {pid}'],
+            capture_output=True, text=True, timeout=5,
+        )
+        return str(pid) in salida.stdout
+    except Exception:
+        return True
+
+
+def adquirir_candado():
+    """
+    Para el script si ya hay otra ejecucion en curso; si no, deja
+    constancia (PID propio) de que esta es la que esta corriendo ahora.
+    """
+    if RUTA_CANDADO.exists():
+        pid_anterior = RUTA_CANDADO.read_text().strip()
+        if pid_anterior.isdigit() and proceso_esta_vivo(int(pid_anterior)):
+            log.error("Ya hay una ejecucion en curso (PID %s). No se lanza una segunda.", pid_anterior)
+            log.error("Si tienes la certeza de que no hay ninguna corriendo de verdad,")
+            log.error("borra a mano: %s", RUTA_CANDADO)
+            sys.exit(1)
+        # El PID del candado ya no existe: es de una ejecucion anterior que
+        # se cerro sin limpiar (por ejemplo, un Ctrl+C brusco). Se ignora.
+        log.warning("Se encontro un candado de una ejecucion anterior ya no activa. Se ignora.")
+
+    RUTA_CANDADO.write_text(str(os.getpid()))
+
+
+def liberar_candado():
+    """Quita el candado al terminar, pase lo que pase (exito o error)."""
+    RUTA_CANDADO.unlink(missing_ok=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Backup de workbooks de Tableau a GitHub")
     parser.add_argument('--config', default='config.json', help="fichero de configuracion")
@@ -978,6 +1027,22 @@ def main():
     parser.add_argument('--sin-github', action='store_true', help="descargar sin subir a GitHub")
     parser.add_argument('--separador', default=',', help="separador del CSV")
     args = parser.parse_args()
+
+    # El candado se adquiere ANTES de nada mas: si ya hay otra ejecucion
+    # activa, el script se para aqui mismo sin llegar a tocar Oracle,
+    # Tableau ni GitHub.
+    adquirir_candado()
+    try:
+        _main_interno(args)
+    finally:
+        # 'finally' se ejecuta SIEMPRE, incluso si _main_interno llama a
+        # sys.exit() a mitad (eso lanza SystemExit, que un finally si
+        # captura) -- asi el candado nunca se queda "atascado" olvidado
+        # por un fallo a mitad de proceso.
+        liberar_candado()
+
+
+def _main_interno(args):
 
     inicio = datetime.now()
     separador("BACKUP TABLEAU -> GITHUB")

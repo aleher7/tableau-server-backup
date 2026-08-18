@@ -747,7 +747,15 @@ def subir_a_github(directorio, config, token, mensaje):
     codigo, salida = git(['git', 'commit', '-m', mensaje], [token], mostrar=False)
     # git devuelve codigo de error cuando no hay nada que comitear, pero eso no
     # es un fallo real: hay que distinguirlo mirando el texto de la salida.
-    if "nothing to commit" in salida.lower():
+    # git usa DOS mensajes distintos para "no hay nada que comitear", segun
+    # el caso -- "nothing to commit, working tree clean" cuando no hay ni
+    # siquiera archivos sueltos sin rastrear, y "nothing ADDED to commit
+    # but untracked files present" cuando si los hay pero ninguno se llego
+    # a anadir (por ejemplo, el CSV de eliminaciones que vive fuera de esta
+    # carpeta y "git add -A ." nunca alcanza). Hay que reconocer los dos;
+    # el segundo NO contiene el texto exacto "nothing to commit".
+    sin_cambios = "nothing to commit" in salida.lower() or "nothing added to commit" in salida.lower()
+    if sin_cambios:
         log.info("        Sin cambios que subir")
         return True
     if codigo != 0:

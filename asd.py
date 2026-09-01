@@ -1,39 +1,36 @@
 """
-Sube el backlog pendiente a GitHub, sin volver a descargar nada de Tableau.
-Separa los archivos GRANDES (van uno por uno) de los pequeños (van en
-lotes), para no acumular varios binarios pesados en el mismo push.
+Limpieza de archivos "_vX" sueltos fuera de Versiones/ -- esto puede pasar
+con restos de antes de que existiera esta carpeta, o de pruebas anteriores.
 
-Uso: python sincronizar_backlog_por_lotes.py
+El script:
+  1. Alinea el disco local EXACTAMENTE con GitHub (git reset --hard), para
+     partir de la realidad del remoto, no de lo que hubiera quedado local.
+  2. Borra los "_vX" sueltos que encuentre fuera de Versiones/.
+  3. Comitea y sube esa eliminacion a GitHub de verdad.
+
+Asi, la proxima vez que corra "descargar_workbooks.py" (que tambien hace
+"git reset --hard" en su PASO 4), no los va a volver a traer de vuelta,
+porque ya no estaran en el historial que trae ese reset.
+
+Uso: python limpiar_versiones_sueltas.py
 """
 
+import re
 import json
 import time
 import base64
 import subprocess
 import jwt
 import requests
-import os
 from pathlib import Path
 
-TAMANO_LOTE = 10
-UMBRAL_GRANDE_MB = 50  # archivos por encima de esto van solos, uno por push
+PATRON_VERSION = re.compile(r'_v\d+\.(twbx|twb)$', re.IGNORECASE)
 
 config = json.load(open('config.json'))
 llave = open(config['github_private_key_path'], 'rb').read()
 API = "https://api.cantabrialabs.ghe.com"
+DOMINIO = "cantabrialabs.ghe.com"
 owner, repo = config['github_owner'], config['github_repo_name']
-
-# Trabajar siempre desde la raiz REAL del repositorio (donde vive .git),
-# preguntandosela a git en vez de asumirla. Esto evita que "git status"
-# y "git add" usen sistemas de referencia de rutas distintos entre si
-# (el bug de "Tableau Workbooks/Tableau Workbooks/..." duplicado).
-r = subprocess.run(['git', 'rev-parse', '--show-toplevel'],
-                    cwd=config['directorio_descarga'], capture_output=True, text=True)
-raiz_repo = r.stdout.strip().replace('/', os.sep)
-os.chdir(raiz_repo)
-carpeta_relativa = os.path.relpath(config['directorio_descarga'], raiz_repo)
-print(f"Raiz del repo: {raiz_repo}")
-print(f"Carpeta de trabajo: {carpeta_relativa}")
 
 
 def obtener_token():
@@ -89,101 +86,63 @@ def ejecutar(cmd, secreto=None):
     r = subprocess.run(cmd, capture_output=True, text=True)
     salida = (redactar(r.stdout.strip(), secreto) + "\n" + redactar(r.stderr.strip(), secreto)).strip()
     if salida:
-        print(salida[-2000:])
+        print(salida[-1500:])
     return r.returncode
 
 
-def subir(lote, numero, extra_header, url, token):
-    """
-    Comitea y sube un lote de archivos al repositorio.
-
-    Args:
-        lote: lista de rutas (texto) de los archivos de este lote.
-        numero: numero de lote, solo para el mensaje del commit y el log.
-        extra_header: cabecera de autenticacion de git (ver cabecera_git
-            del script principal).
-        url: URL del repositorio remoto.
-        token: token de instalacion, usado para censurar la salida.
-
-    Returns:
-        True si el lote se subio (o no habia nada que comitear en el).
-        False si el push fallo.
-    """
-    print(f"\nLote {numero}: {len(lote)} archivo(s)")
-    for f in lote:
-        print(f"  {f}")
-    # "git rm --cached" saca del indice cualquier version anterior mal
-    # subida (por ejemplo como blob normal, sin pasar por LFS); el "git
-    # add" siguiente la vuelve a añadir de cero, forzando el filtro LFS.
-    ejecutar(['git', 'rm', '-r', '--cached', '--ignore-unmatch', '--'] + lote, token)
-    ejecutar(['git', 'add', '--'] + lote, token)
-    mensaje = f"Tableau Backup - lote {numero} - {time.strftime('%Y-%m-%d %H:%M:%S')}"
-    codigo = ejecutar(['git', 'commit', '-m', mensaje], token)
-    if codigo != 0:
-        print("Nada que comitear en este lote, se salta.")
-        return True
-    codigo = ejecutar(['git', '-c', extra_header, 'push', url, 'main'], token)
-    if codigo != 0:
-        print(f"Lote {numero} fallo al subir. Vuelve a ejecutar el script para reintentar.")
-        return False
-    print(f"Lote {numero} subido correctamente")
-    return True
-
-
 token = obtener_token()
-url = f"https://cantabrialabs.ghe.com/{owner}/{repo}.git"
+url = f"https://{DOMINIO}/{owner}/{repo}.git"
 credencial_b64 = base64.b64encode(f"x-access-token:{token}".encode()).decode()
-# La cabecera se restringe a este dominio (http.<URL>.extraHeader), no al
-# generico "http.extraHeader": si no, tambien se envia al almacen de
-# objetos de LFS (otro dominio), y choca con su propia autenticacion.
-extra_header = f"http.https://cantabrialabs.ghe.com.extraHeader=Authorization: Basic {credencial_b64}"
+extra_header = f"http.https://{DOMINIO}.extraHeader=Authorization: Basic {credencial_b64}"
 
-print("\nPaso 1: sincronizando con el remoto (los archivos locales no se borran)")
-ejecutar(['git', 'config', 'http.postBuffer', '2147483648'])
-ejecutar(['git', 'config', 'http.lowSpeedLimit', '0'])
-ejecutar(['git', 'config', 'http.lowSpeedTime', '999999'])
+directorio = Path(config['directorio_descarga'])
+carpeta_versiones = (directorio / "Versiones").resolve()
+
+r = subprocess.run(['git', 'rev-parse', '--show-toplevel'], cwd=directorio, capture_output=True, text=True)
+raiz_repo = r.stdout.strip()
+
+print("=== 1. Alineando el disco EXACTAMENTE con GitHub (git reset --hard) ===")
+import os
+os.chdir(raiz_repo)
 ejecutar(['git', 'merge', '--abort'], token)
 ejecutar(['git', '-c', extra_header, 'fetch', url, 'main'], token)
-ejecutar(['git', 'reset', '--mixed', 'FETCH_HEAD'], token)
+ejecutar(['git', 'reset', '--hard', 'FETCH_HEAD'], token)
 
-resultado = subprocess.run(
-    # "-z": rutas separadas por byte nulo, sin escapar caracteres
-    # especiales (tildes, ñ, etc.). Sin esto, una ruta con acentos llega
-    # codificada en octal y "git add" no la reconoce.
-    ['git', 'status', '--porcelain', '-z', '--untracked-files=all', '--', carpeta_relativa],
-    capture_output=True, text=True, encoding='utf-8'
-)
-entradas = [e for e in resultado.stdout.split('\0') if e.strip()]
-archivos = [e[3:] for e in entradas]
+print("\n=== 2. Buscando '_vX' sueltos fuera de Versiones/ ===")
+encontrados = []
+for archivo in directorio.rglob('*'):
+    if not archivo.is_file():
+        continue
+    if carpeta_versiones in archivo.resolve().parents:
+        continue
+    if PATRON_VERSION.search(archivo.name):
+        encontrados.append(archivo)
 
-grandes, pequenos = [], []
-for f in archivos:
-    ruta = Path(f)
-    tam_mb = ruta.stat().st_size / (1024 * 1024) if ruta.exists() else 0
-    (grandes if tam_mb > UMBRAL_GRANDE_MB else pequenos).append(f)
+print(f"Encontrados: {len(encontrados)}")
+for f in encontrados[:20]:
+    print(f"  {f.relative_to(directorio)}")
+if len(encontrados) > 20:
+    print(f"  ... y {len(encontrados) - 20} mas")
 
-print(f"\nPaso 2: {len(archivos)} archivos pendientes ({len(grandes)} grandes, {len(pequenos)} pequenos en lotes de {TAMANO_LOTE})")
+if not encontrados:
+    print("\nNada que limpiar. El remoto ya estaba correcto.")
+    exit()
 
-if not archivos:
-    print("No hay nada pendiente. El repositorio ya esta al dia.")
+print("\n=== 3. Borrando del disco ===")
+for f in encontrados:
+    f.unlink()
+print(f"{len(encontrados)} archivo(s) eliminados del disco.")
+
+print("\n=== 4. Comiteando y subiendo la eliminacion ===")
+ejecutar(['git', 'add', '-A', '.'], token)
+codigo = ejecutar(['git', 'commit', '-m', f'Retirar {len(encontrados)} version(es) sueltas fuera de Versiones/'], token)
+if codigo != 0:
+    print("Nada que comitear (raro llegados a este punto).")
 else:
-    numero_lote = 1
-    for f in grandes:
-        if not subir([f], numero_lote, extra_header, url, token):
-            exit(1)
-        numero_lote += 1
-    for i in range(0, len(pequenos), TAMANO_LOTE):
-        lote = pequenos[i:i + TAMANO_LOTE]
-        if not subir(lote, numero_lote, extra_header, url, token):
-            exit(1)
-        numero_lote += 1
-    print("\nTodo subido correctamente.")
-
-# Refrescar la referencia local de origin/main: un "git push a URL
-# directa" sube los datos pero no actualiza esta referencia por si sola
-# (eso solo pasa al empujar por el nombre "origin"). Sin este paso,
-# "git status" mostraria commits "por delante" aunque ya esten subidos.
-print("\nActualizando la referencia local de origin/main")
-ejecutar(['git', '-c', extra_header, 'fetch', url, 'main'], token)
-ejecutar(['git', 'update-ref', 'refs/remotes/origin/main', 'FETCH_HEAD'], token)
-print("Listo. git status ahora reflejara el estado real.")
+    codigo = ejecutar(['git', '-c', extra_header, 'push', url, 'main'], token)
+    if codigo == 0:
+        ejecutar(['git', '-c', extra_header, 'fetch', url, 'main'], token)
+        ejecutar(['git', 'update-ref', 'refs/remotes/origin/main', 'FETCH_HEAD'], token)
+        print("\nLimpieza subida a GitHub. Confirmado en el remoto de verdad.")
+    else:
+        print("\nFallo el push -- revisa el mensaje de arriba")

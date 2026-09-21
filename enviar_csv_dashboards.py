@@ -512,7 +512,16 @@ def fecha_actualizacion_fuentes(servidor, workbook_luid):
         LookupError: si la Metadata API no devuelve exactamente un workbook.
         RuntimeError: si la Metadata API devuelve errores.
     """
+    # Fuentes publicadas (upstreamDatasources) y embebidas en el propio
+    # workbook (embeddedDatasources): un workbook puede usar cualquiera.
     consulta = (
+        "query { workbooks(filter: {luid: %s}) { name "
+        "upstreamDatasources { name ... on PublishedDatasource "
+        "{ extractLastRefreshTime extractLastUpdateTime } } "
+        "embeddedDatasources { name hasExtracts "
+        "extractLastRefreshTime extractLastUpdateTime } } }"
+    ) % json.dumps(workbook_luid)
+    consulta_solo_publicadas = (
         "query { workbooks(filter: {luid: %s}) { name "
         "upstreamDatasources { name ... on PublishedDatasource "
         "{ extractLastRefreshTime extractLastUpdateTime } } } }"
@@ -520,13 +529,24 @@ def fecha_actualizacion_fuentes(servidor, workbook_luid):
 
     respuesta = servidor.metadata.query(consulta)
     if respuesta.get('errors'):
-        raise RuntimeError(f"Metadata API: {respuesta['errors']}")
+        # Si el esquema del servidor no admite algun campo de las embebidas,
+        # se reintenta solo con las publicadas (la consulta ya validada).
+        log.warning("        La Metadata API rechazo la consulta de fuentes embebidas: %s",
+                    respuesta['errors'])
+        respuesta = servidor.metadata.query(consulta_solo_publicadas)
+        if respuesta.get('errors'):
+            raise RuntimeError(f"Metadata API: {respuesta['errors']}")
     workbooks = respuesta['data']['workbooks']
     if len(workbooks) != 1:
         raise LookupError(f"Metadata API: {len(workbooks)} workbooks para el LUID {workbook_luid}")
 
+    publicadas = workbooks[0].get('upstreamDatasources') or []
+    embebidas = workbooks[0].get('embeddedDatasources') or []
+    if not publicadas and not embebidas:
+        log.warning("        La Metadata API no devuelve ninguna fuente de datos para este workbook")
+
     fechas = []
-    for fuente in workbooks[0]['upstreamDatasources']:
+    for fuente in publicadas + embebidas:
         marcas = [fuente.get('extractLastRefreshTime'), fuente.get('extractLastUpdateTime')]
         marcas = [a_fecha_local(m) for m in marcas if m]
         if not marcas:

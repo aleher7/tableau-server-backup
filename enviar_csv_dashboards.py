@@ -314,6 +314,9 @@ def conectar_tableau(config):
             site_id=config['tableau_site'],
         )
         servidor = TSC.Server(config['tableau_server'])
+        # Por defecto la libreria usa la API 2.4; la Metadata API pide 3.5 o
+        # superior. Esto la sube a la version que soporta el servidor.
+        servidor.use_server_version()
         servidor.auth.sign_in(auth)
         return servidor
     except Exception as e:

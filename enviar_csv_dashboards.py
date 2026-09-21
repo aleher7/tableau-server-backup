@@ -375,6 +375,21 @@ def ids_proyecto_por_ruta(servidor, ruta):
     rutas = {p.id: ruta_de(p) for p in proyectos.values()}
     objetivo = normalizar_ruta(ruta)
     ids = [i for i, r in rutas.items() if normalizar_ruta(r) == objetivo]
+
+    if not ids:
+        # Si el usuario del PAT no ve las carpetas padre, la ruta que se
+        # reconstruye llega truncada ('Informes Automaticos' en vez de la
+        # completa). Se acepta un proyecto cuya ruta visible sea la COLA de
+        # la configurada, pero solo si es unico: con dos candidatos no se
+        # adivina cual es.
+        colas = [i for i, r in rutas.items()
+                 if objetivo.endswith('/' + normalizar_ruta(r))]
+        if len(colas) == 1:
+            log.warning("        Ruta visible de '%s': '%s' (Tableau no muestra sus carpetas "
+                        "padre a este usuario). Se acepta por ser la unica con ese nombre",
+                        ruta.rsplit('/', 1)[-1], rutas[colas[0]])
+            ids = colas
+
     if not ids:
         hoja = objetivo.rsplit('/', 1)[-1]
         parecidas = [r for r in rutas.values() if normalizar_ruta(r).rsplit('/', 1)[-1] == hoja]

@@ -6,6 +6,14 @@
 
   "metodo_correo": "outlook",
   "remitente": "",
+
+  "smtp_servidor": "<solo si usas SMTP: servidor que te den en IT>",
+  "smtp_puerto": 587,
+  "smtp_starttls": true,
+  "smtp_ssl": false,
+  "smtp_usuario": "",
+  "smtp_password": "",
+
   "destinatarios": ["cliente@example.com"],
   "destinatarios_aviso": ["tu.correo@example.com"],
 

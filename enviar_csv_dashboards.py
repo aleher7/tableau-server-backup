@@ -32,6 +32,9 @@ Uso:
     python enviar_csv_dashboards.py --crosstab-excel "CdM SRI Marca MTD"
                                                         # prueba: baja ese informe
                                                         # como Excel (crosstab)
+    python enviar_csv_dashboards.py --probar-correo tu@correo.com --metodo-correo smtp
+                                                        # prueba solo el envio de
+                                                        # correo (sin Tableau)
     python enviar_csv_dashboards.py --forzar            # ignora lo ya enviado
     python enviar_csv_dashboards.py --aviso             # ultima pasada del dia:
                                                         # avisa al equipo de lo
@@ -95,6 +98,7 @@ CLAVES_OPCIONALES = {
     'separador_miles': False,
     'smtp_puerto': 25,
     'smtp_starttls': False,
+    'smtp_ssl': False,
     'smtp_usuario': '',
     'smtp_password': '',
     'destinatarios_aviso': [],
@@ -104,12 +108,14 @@ CLAVES_OPCIONALES = {
 }
 
 
-def cargar_config(fichero):
+def cargar_config(fichero, metodo_correo=None):
     """
     Carga config_envio.json, aplica valores por defecto y valida.
 
     Args:
         fichero: ruta del fichero de configuracion.
+        metodo_correo: si se indica ('outlook' o 'smtp'), sustituye al
+            'metodo_correo' del fichero solo en esta ejecucion.
 
     Returns:
         Diccionario de configuracion validado. Si algo falta o esta mal, el
@@ -128,6 +134,9 @@ def cargar_config(fichero):
 
     for clave, valor in CLAVES_OPCIONALES.items():
         config.setdefault(clave, valor)
+
+    if metodo_correo:
+        config['metodo_correo'] = metodo_correo
 
     if config['metodo_correo'] not in ('outlook', 'smtp'):
         log.error("'metodo_correo' debe ser 'outlook' o 'smtp'")
@@ -1206,12 +1215,48 @@ def enviar_correo_outlook(config, destinatarios, asunto, cuerpo, adjunto=None):
         return False
 
 
+def probar_correo(config, direccion):
+    """
+    Envia un correo de prueba con un CSV pequeno adjunto, sin tocar Tableau,
+    para comprobar un metodo de envio (Outlook o SMTP) y su rapidez.
+
+    Args:
+        config: diccionario de configuracion (con el 'metodo_correo' que se
+            quiere probar).
+        direccion: direccion de destino de la prueba. Se pide siempre
+            explicita para no mandar una prueba al cliente por error.
+
+    Returns:
+        True si el envio funciono. False si fallo.
+    """
+    ruta = Path(config['directorio_salida']) / "prueba_correo.csv"
+    escribir_filas_csv(ruta, [["columna_a", "columna_b"], ["1", "2"]], config['csv_separador'])
+
+    inicio = time.time()
+    correcto = enviar_correo(
+        config, [direccion], "Prueba de envio - CSV Tableau",
+        "Correo de prueba del proceso de envio de CSV de Tableau.\n"
+        f"Metodo usado: {config['metodo_correo']}.", ruta)
+    segundos = time.time() - inicio
+
+    if correcto:
+        log.info("PRUEBA CORRECTA con '%s' en %.1f s: revisa la bandeja de %s "
+                 "(y si aparecio algun aviso de seguridad)", config['metodo_correo'], segundos, direccion)
+    else:
+        log.error("PRUEBA FALLIDA con '%s' tras %.1f s", config['metodo_correo'], segundos)
+    return correcto
+
+
 def enviar_correo_smtp(config, destinatarios, asunto, cuerpo, adjunto=None):
     """
     Envia un correo por SMTP, con un CSV adjunto opcional.
 
-    La contrasena SMTP se toma de config['smtp_password'] o, si esta vacia,
-    de la variable de entorno SMTP_PASSWORD.
+    No usa Outlook, asi que no aparece el aviso de seguridad. La conexion
+    puede ser sin cifrar (puerto 25), con STARTTLS ('smtp_starttls', puerto
+    587 habitual) o con SSL directo ('smtp_ssl', puerto 465). La contrasena
+    SMTP se toma de config['smtp_password'] o, si esta vacia, de la variable
+    de entorno SMTP_PASSWORD. Con un servidor que autentica (Microsoft 365,
+    Gmail...), 'remitente' debe ser el buzon con el que se inicia sesion.
 
     Args:
         config: diccionario de configuracion con las claves smtp_*.
@@ -1239,8 +1284,9 @@ def enviar_correo_smtp(config, destinatarios, asunto, cuerpo, adjunto=None):
                                subtype=secundario, filename=adjunto.name)
 
     try:
-        with smtplib.SMTP(config['smtp_servidor'], int(config['smtp_puerto']), timeout=60) as smtp:
-            if config['smtp_starttls']:
+        conexion = smtplib.SMTP_SSL if config['smtp_ssl'] else smtplib.SMTP
+        with conexion(config['smtp_servidor'], int(config['smtp_puerto']), timeout=60) as smtp:
+            if config['smtp_starttls'] and not config['smtp_ssl']:
                 smtp.starttls()
             if config['smtp_usuario']:
                 smtp.login(config['smtp_usuario'],
@@ -1452,13 +1498,22 @@ def main():
     parser.add_argument('--crosstab-excel', metavar='INFORME',
                         help="prueba: descarga como Excel (crosstab) el informe con ese nombre, "
                              "para ver la disposicion del dashboard; no envia nada")
+    parser.add_argument('--metodo-correo', choices=['outlook', 'smtp'],
+                        help="usa este metodo de envio en esta ejecucion, sin cambiar "
+                             "config_envio.json")
+    parser.add_argument('--probar-correo', metavar='DIRECCION',
+                        help="envia un correo de prueba a esa direccion (sin usar Tableau) "
+                             "para comprobar el metodo de envio")
     parser.add_argument('--aviso', action='store_true',
                         help="envia a 'destinatarios_aviso' la lista de informes que no salieron "
                              "(usar solo en la ultima ejecucion del dia)")
     args = parser.parse_args()
 
     inicio = time.time()
-    config = cargar_config(args.config)
+    config = cargar_config(args.config, args.metodo_correo)
+
+    if args.probar_correo:
+        sys.exit(0 if probar_correo(config, args.probar_correo) else 1)
     hoy = date.fromisoformat(args.fecha) if args.fecha else date.today()
     hoy_txt = hoy.isoformat()
     enviar = not args.sin_enviar

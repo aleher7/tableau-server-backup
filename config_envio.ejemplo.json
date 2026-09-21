@@ -1,0 +1,28 @@
+{
+  "tableau_server": "<igual que en config.json del backup>",
+  "tableau_token_name": "<igual>",
+  "tableau_token": "<igual>",
+  "tableau_site": "<igual>",
+
+  "metodo_correo": "outlook",
+  "remitente": "",
+  "destinatarios": ["cliente@example.com"],
+  "destinatarios_aviso": ["tu.correo@example.com"],
+
+  "directorio_salida": "./csv_generados",
+  "archivo_estado": "./estado_envios.json",
+  "csv_separador": ";",
+
+  "proyecto_ruta": "Production/Dashboards/Ad hoc Reports/BI Local/BI España/Informes Automaticos",
+
+  "informes": [
+    { "nombre": "CdM Venta Interna Detalle Marca MTD" },
+    { "nombre": "CdM Venta Interna Detalle Marca YTD" },
+    { "nombre": "CdM Venta Interna Detalle Producto Agrupado MTD" },
+    { "nombre": "CdM Venta Interna Detalle Producto Agrupado YTD" },
+    { "nombre": "CdM SRI Marca MTD" },
+    { "nombre": "CdM SRI Marca YTD" },
+    { "nombre": "CdM SRI Producto Agrupado MTD" },
+    { "nombre": "CdM SRI Producto Agrupado YTD" }
+  ]
+}

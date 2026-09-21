@@ -29,6 +29,9 @@ Uso:
     python enviar_csv_dashboards.py --fecha 2026-09-21  # simular otro "hoy"
     python enviar_csv_dashboards.py --diagnostico       # que fuentes ve la
                                                         # Metadata API por informe
+    python enviar_csv_dashboards.py --crosstab-excel "CdM SRI Marca MTD"
+                                                        # prueba: baja ese informe
+                                                        # como Excel (crosstab)
     python enviar_csv_dashboards.py --forzar            # ignora lo ya enviado
     python enviar_csv_dashboards.py --aviso             # ultima pasada del dia:
                                                         # avisa al equipo de lo
@@ -49,6 +52,7 @@ import smtplib
 import argparse
 import mimetypes
 from io import StringIO
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from datetime import datetime, date
 from email.message import EmailMessage
@@ -84,6 +88,8 @@ CLAVES_OPCIONALES = {
     'archivo_estado': './estado_envios.json',
     'csv_separador': ';',
     'cache_maxima_minutos': 1,
+    'decimales_porcentaje': 1,
+    'decimales_numeros': 0,
     'smtp_puerto': 25,
     'smtp_starttls': False,
     'smtp_usuario': '',
@@ -300,6 +306,126 @@ def dar_formato_columnas(columnas, filas, renombrar=None, orden=None):
         primeras = [c for c in orden if c in columnas]
         columnas = primeras + [c for c in columnas if c not in primeras]
     return columnas, filas
+
+
+def formatear_porcentajes(filas, columnas_porcentaje, decimales=1):
+    """
+    Convierte en porcentaje (0.5 -> '50,0%') los valores de las columnas dadas.
+
+    Tableau entrega la fraccion sin formato (0.5) y no el porcentaje que se
+    ve en el dashboard. Los valores que ya llevan '%', los vacios y los que
+    no son un numero se dejan tal cual. El resultado usa coma decimal, y
+    Excel en espanol lo reconoce como numero con formato de porcentaje.
+
+    Al leer el numero de entrada: si trae coma y punto, el ultimo es el
+    decimal; si solo trae uno de los dos, se toma como decimal (en una
+    columna de porcentajes, '1.438' es 1,438 = 143,8%, no mil cuatrocientos).
+
+    Args:
+        filas: lista de diccionarios, una por fila. Se modifican en sitio.
+        columnas_porcentaje: nombres de las columnas a convertir.
+        decimales: decimales del porcentaje resultante.
+
+    Returns:
+        La misma lista de filas, con las columnas convertidas.
+    """
+    paso = Decimal(1).scaleb(-decimales)   # 0.1 para 1 decimal
+    for fila in filas:
+        for columna in columnas_porcentaje:
+            texto = (fila.get(columna) or '').strip()
+            if not texto or texto.endswith('%'):
+                continue
+            limpio = texto.replace(' ', '')
+            if ',' in limpio and '.' in limpio:
+                if limpio.rfind(',') > limpio.rfind('.'):
+                    limpio = limpio.replace('.', '').replace(',', '.')
+                else:
+                    limpio = limpio.replace(',', '')
+            else:
+                limpio = limpio.replace(',', '.')
+            try:
+                valor = (Decimal(limpio) * 100).quantize(paso, rounding=ROUND_HALF_UP)
+            except InvalidOperation:
+                continue
+            fila[columna] = f"{valor:.{decimales}f}".replace('.', ',') + '%'
+    return filas
+
+
+_NUMERO = re.compile(r'^[\s€$£]*[-+]?[\d.,]+[\s€$£]*$')
+
+
+def interpretar_numero(texto):
+    """
+    Lee un numero escrito en formato espanol o ingles, con o sin simbolo de
+    moneda, y lo devuelve como Decimal.
+
+    Reglas para separar miles de decimales: si trae coma y punto, el ultimo
+    es el decimal; si trae un solo tipo de separador repetido, o una vez con
+    exactamente 3 cifras detras, es de miles ('3.580.783', '1.438');
+    en cualquier otro caso es decimal ('1500,5', '1500.25'). Un decimal con
+    exactamente 3 cifras ('0,500') se leeria como miles: es la unica
+    ambiguedad, poco habitual en importes.
+
+    Args:
+        texto: valor tal como viene en el CSV.
+
+    Returns:
+        Decimal, o None si el texto no es un numero.
+    """
+    t = (texto or '').replace(' ', ' ')
+    if not _NUMERO.match(t):
+        return None
+    t = re.sub(r'[^\d,.+-]', '', t)
+    if ',' in t and '.' in t:
+        if t.rfind(',') > t.rfind('.'):
+            t = t.replace('.', '').replace(',', '.')
+        else:
+            t = t.replace(',', '')
+    else:
+        for sep in ',.':
+            if sep in t:
+                partes = t.split(sep)
+                if len(partes) > 2 or len(partes[-1]) == 3:
+                    t = t.replace(sep, '')
+                else:
+                    t = t.replace(sep, '.')
+    try:
+        return Decimal(t)
+    except InvalidOperation:
+        return None
+
+
+def redondear_numeros(filas, columnas_numericas, decimales=0):
+    """
+    Redondea a 'decimales' los valores numericos de las columnas dadas.
+
+    Los valores que no son un numero (vacios, 'Null'...) no se tocan. Los
+    que ya son enteros se dejan tal cual cuando decimales es 0, para no
+    alterar su formato. El resultado no lleva separador de miles ni simbolo
+    de moneda, y usa coma decimal si decimales > 0.
+
+    Args:
+        filas: lista de diccionarios, una por fila. Se modifican en sitio.
+        columnas_numericas: nombres de las columnas a redondear.
+        decimales: numero de decimales del resultado.
+
+    Returns:
+        La misma lista de filas, con las columnas redondeadas.
+    """
+    paso = Decimal(1).scaleb(-decimales)
+    for fila in filas:
+        for columna in columnas_numericas:
+            texto = fila.get(columna)
+            valor = interpretar_numero(texto)
+            if valor is None:
+                continue
+            if decimales == 0 and valor == valor.to_integral_value():
+                continue
+            redondeado = valor.quantize(paso, rounding=ROUND_HALF_UP)
+            if redondeado == 0:
+                redondeado = abs(redondeado)   # evita '-0'
+            fila[columna] = f"{redondeado:.{decimales}f}".replace('.', ',')
+    return filas
 
 
 def escribir_csv(ruta, columnas, filas, separador):
@@ -561,6 +687,28 @@ def descargar_tabla(servidor, vista, cache_maxima_minutos=1):
         opciones = None
     servidor.views.populate_csv(vista, opciones)
     return b"".join(vista.csv).decode('utf-8-sig')
+
+
+def descargar_crosstab_excel(servidor, vista, ruta, cache_maxima_minutos=1):
+    """
+    Descarga la vista como Excel (crosstab), tal como la exporta Tableau con
+    'Descargar > Crosstab': mismas columnas, mismo orden y mismos
+    encabezados que en el dashboard. Solo para comprobar como queda; no
+    forma parte del envio.
+
+    Args:
+        servidor: objeto Server ya autenticado.
+        vista: ViewItem devuelto por localizar_vista.
+        ruta: ruta del .xlsx a crear.
+        cache_maxima_minutos: antiguedad maxima admitida de la cache.
+
+    Returns:
+        No devuelve nada (escribe el fichero).
+    """
+    import tableauserverclient as TSC
+    servidor.views.populate_excel(vista, TSC.ExcelRequestOptions(maxage=cache_maxima_minutos))
+    Path(ruta).parent.mkdir(parents=True, exist_ok=True)
+    Path(ruta).write_bytes(b"".join(vista.excel))
 
 
 def fecha_por_tablas_origen(servidor, workbook_luid):
@@ -957,9 +1105,12 @@ def procesar_informe(servidor, config, informe, hoy, enviar):
 
     log.info("        Fecha de actualizacion correcta (%s), %d filas", fecha.strftime('%d/%m/%Y'), len(filas))
 
+    medidas_pivot = []   # columnas que han salido de pivotar 'Measure Names'
     if informe.get('pivotar_medidas', True):
         filas_largas = len(filas)
+        columnas_largas = columnas
         columnas, filas = pivotar_medidas(columnas, filas)
+        medidas_pivot = [c for c in columnas if c not in columnas_largas]
         if len(filas) != filas_largas:
             log.info("        Medidas pivotadas: %d filas largas -> %d filas, %d columnas",
                      filas_largas, len(filas), len(columnas))
@@ -969,6 +1120,30 @@ def procesar_informe(servidor, config, informe, hoy, enviar):
 
     columnas, filas = dar_formato_columnas(
         columnas, filas, informe.get('renombrar_columnas'), informe.get('orden_columnas'))
+
+    # Por defecto son porcentajes las columnas cuyo nombre empieza por '%'
+    # (p. ej. '% S/ Ppto'); 'columnas_porcentaje' lo fija a mano (con []
+    # se desactiva). Los nombres son los finales, tras renombrar.
+    columnas_pct = informe.get('columnas_porcentaje')
+    if columnas_pct is None:
+        columnas_pct = [c for c in columnas if c.lstrip().startswith('%')]
+    if columnas_pct:
+        formatear_porcentajes(filas, columnas_pct,
+                              informe.get('decimales_porcentaje', config['decimales_porcentaje']))
+        log.info("        Columnas de porcentaje: %s", ", ".join(columnas_pct))
+
+    # Importes: por defecto, las medidas que salen del pivotado (sin las de
+    # porcentaje). 'columnas_numericas' lo fija a mano; 'decimales_numeros'
+    # a null (None) desactiva el redondeo.
+    decimales = informe.get('decimales_numeros', config['decimales_numeros'])
+    columnas_num = informe.get('columnas_numericas')
+    if columnas_num is None:
+        renombrar = informe.get('renombrar_columnas') or {}
+        columnas_num = [renombrar.get(c, c) for c in medidas_pivot]
+    columnas_num = [c for c in columnas_num if c in columnas and c not in columnas_pct]
+    if decimales is not None and columnas_num:
+        redondear_numeros(filas, columnas_num, decimales)
+        log.info("        Columnas redondeadas a %d decimales: %s", decimales, ", ".join(columnas_num))
 
     ruta = Path(config['directorio_salida']) / f"{sanear_nombre_archivo(nombre)}_{hoy.isoformat()}.csv"
     escribir_csv(ruta, columnas, filas, config['csv_separador'])
@@ -1009,6 +1184,9 @@ def main():
     parser.add_argument('--diagnostico', action='store_true',
                         help="muestra de donde salen los datos de cada workbook segun la "
                              "Metadata API; no descarga ni envia nada")
+    parser.add_argument('--crosstab-excel', metavar='INFORME',
+                        help="prueba: descarga como Excel (crosstab) el informe con ese nombre, "
+                             "para ver la disposicion del dashboard; no envia nada")
     parser.add_argument('--aviso', action='store_true',
                         help="envia a 'destinatarios_aviso' la lista de informes que no salieron "
                              "(usar solo en la ultima ejecucion del dia)")
@@ -1023,6 +1201,27 @@ def main():
     log.info("=" * 60)
     log.info("ENVIO CSV DASHBOARDS - fecha de envio %s", hoy.strftime('%d/%m/%Y'))
     log.info("=" * 60)
+
+    if args.crosstab_excel:
+        elegidos = [i for i in config['informes'] if i['nombre'] == args.crosstab_excel]
+        if not elegidos:
+            log.error("No hay ningun informe llamado '%s' en config_envio.json", args.crosstab_excel)
+            sys.exit(1)
+        servidor = conectar_tableau(config)
+        try:
+            vista, _ = localizar_vista(servidor, config, elegidos[0])
+            ruta = Path(config['directorio_salida']) / f"{sanear_nombre_archivo(args.crosstab_excel)}_crosstab.xlsx"
+            descargar_crosstab_excel(servidor, vista, ruta, config['cache_maxima_minutos'])
+            log.info("Excel (crosstab) guardado en %s", ruta)
+        except Exception as e:
+            log.error("No se pudo descargar el Excel: %s", e)
+            sys.exit(1)
+        finally:
+            try:
+                servidor.auth.sign_out()
+            except Exception:
+                pass
+        return
 
     if args.diagnostico:
         servidor = conectar_tableau(config)

@@ -231,6 +231,77 @@ def leer_csv(contenido):
     return list(lector.fieldnames or []), filas
 
 
+def pivotar_medidas(columnas, filas, col_nombre='Measure Names', col_valor='Measure Values'):
+    """
+    Convierte el formato "largo" de Tableau en la tabla tal como se ve.
+
+    Cuando un dashboard tiene varias medidas como columnas, Tableau exporta
+    una fila por cada combinacion de dimensiones y medida, con las columnas
+    'Measure Names' (nombre de la medida) y 'Measure Values' (su valor).
+    Aqui se agrupan las filas por sus dimensiones y cada medida pasa a ser
+    una columna, en el orden en que aparecen.
+
+    Si el CSV no tiene esas dos columnas, se devuelve tal cual. Si el
+    pivotado fuera ambiguo (una medida repetida para las mismas
+    dimensiones, o con el mismo nombre que una dimension), tambien se
+    devuelve tal cual para no perder ni mezclar datos.
+
+    Args:
+        columnas: lista de nombres de columna del CSV.
+        filas: lista de diccionarios, una por fila.
+        col_nombre: nombre de la columna con el nombre de la medida.
+        col_valor: nombre de la columna con el valor de la medida.
+
+    Returns:
+        Tupla (columnas, filas) ya pivotada, o las originales si no
+        procede pivotar.
+    """
+    if col_nombre not in columnas or col_valor not in columnas:
+        return columnas, filas
+
+    dimensiones = [c for c in columnas if c not in (col_nombre, col_valor)]
+    medidas = []
+    grupos = {}
+    for fila in filas:
+        clave = tuple(fila[c] for c in dimensiones)
+        grupo = grupos.setdefault(clave, {c: fila[c] for c in dimensiones})
+        medida = fila[col_nombre]
+        if medida in grupo:
+            log.warning("        No se pivota: la medida '%s' se repite para las mismas dimensiones "
+                        "(o coincide con una dimension)", medida)
+            return columnas, filas
+        if medida not in medidas:
+            medidas.append(medida)
+        grupo[medida] = fila[col_valor]
+
+    return dimensiones + medidas, list(grupos.values())
+
+
+def dar_formato_columnas(columnas, filas, renombrar=None, orden=None):
+    """
+    Adapta los encabezados y el orden de columnas al aspecto del dashboard.
+
+    Args:
+        columnas: lista de nombres de columna.
+        filas: lista de diccionarios, una por fila.
+        renombrar: diccionario {nombre_en_el_CSV: nombre_final}, p. ej.
+            {"Linea Negocio": "Linea Negocio Act."}. Los que no aparecen no
+            cambian.
+        orden: lista de nombres FINALES en el orden deseado. Las columnas
+            que no aparezcan en la lista van al final, en su orden actual.
+
+    Returns:
+        Tupla (columnas, filas) con los nombres y el orden aplicados.
+    """
+    if renombrar:
+        columnas = [renombrar.get(c, c) for c in columnas]
+        filas = [{renombrar.get(k, k): v for k, v in f.items()} for f in filas]
+    if orden:
+        primeras = [c for c in orden if c in columnas]
+        columnas = primeras + [c for c in columnas if c not in primeras]
+    return columnas, filas
+
+
 def escribir_csv(ruta, columnas, filas, separador):
     """
     Guarda la tabla en CSV con UTF-8 con BOM, para que Excel lo abra bien.
@@ -886,8 +957,18 @@ def procesar_informe(servidor, config, informe, hoy, enviar):
 
     log.info("        Fecha de actualizacion correcta (%s), %d filas", fecha.strftime('%d/%m/%Y'), len(filas))
 
+    if informe.get('pivotar_medidas', True):
+        filas_largas = len(filas)
+        columnas, filas = pivotar_medidas(columnas, filas)
+        if len(filas) != filas_largas:
+            log.info("        Medidas pivotadas: %d filas largas -> %d filas, %d columnas",
+                     filas_largas, len(filas), len(columnas))
+
     if informe.get('excluir_columnas'):
         columnas = [c for c in columnas if c not in informe['excluir_columnas']]
+
+    columnas, filas = dar_formato_columnas(
+        columnas, filas, informe.get('renombrar_columnas'), informe.get('orden_columnas'))
 
     ruta = Path(config['directorio_salida']) / f"{sanear_nombre_archivo(nombre)}_{hoy.isoformat()}.csv"
     escribir_csv(ruta, columnas, filas, config['csv_separador'])

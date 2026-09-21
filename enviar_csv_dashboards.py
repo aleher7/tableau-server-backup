@@ -11,9 +11,10 @@ Flujo, para cada informe de la lista 'informes' de config_envio.json:
        Si no es hoy         -> NO se envia (la carga del dia no ha llegado o
                                ha fallado) y se anota en el log.
        Con varias fuentes de datos, todas deben estar actualizadas hoy.
-       Si el workbook no expone ninguna fuente con fecha, se puede indicar
-       'fuente_respaldo' (nombre de una fuente publicada, global o por
-       informe) y se usa la fecha de esa fuente, dejando aviso en el log.
+       Si el workbook lee EN VIVO de una base de datos (Tableau no guarda
+       fecha de refresco), se busca a traves de sus tablas de origen: se toma
+       el extracto publicado mas reciente que se alimenta de esas mismas
+       tablas, dejando aviso en el log. Sin configuracion por informe.
 
 El script es idempotente por dia: guarda en estado_envios.json que informes
 ya se enviaron hoy y no los repite. Por eso la tarea programada puede
@@ -82,6 +83,7 @@ CLAVES_OPCIONALES = {
     'directorio_salida': './csv_generados',
     'archivo_estado': './estado_envios.json',
     'csv_separador': ';',
+    'cache_maxima_minutos': 1,
     'smtp_puerto': 25,
     'smtp_starttls': False,
     'smtp_usuario': '',
@@ -464,64 +466,99 @@ def localizar_vista(servidor, config, informe):
     return vistas[0], workbooks[0].id
 
 
-def descargar_tabla(servidor, vista):
+def descargar_tabla(servidor, vista, cache_maxima_minutos=1):
     """
     Descarga los datos de una vista de Tableau como CSV.
+
+    Con 'maxAge' se limita la antiguedad de la cache de Tableau: en una
+    conexion en vivo, sin esto podria servirse un resultado de hace horas
+    aunque la base de datos ya se haya cargado.
 
     Args:
         servidor: objeto Server ya autenticado.
         vista: ViewItem devuelto por localizar_vista.
+        cache_maxima_minutos: antiguedad maxima admitida de la cache, en
+            minutos (minimo 1).
 
     Returns:
         Texto del CSV tal como lo entrega Tableau.
     """
-    servidor.views.populate_csv(vista)
+    try:
+        import tableauserverclient as TSC
+        opciones = TSC.CSVRequestOptions(maxage=cache_maxima_minutos)
+    except (ImportError, TypeError):   # libreria antigua sin maxage
+        opciones = None
+    servidor.views.populate_csv(vista, opciones)
     return b"".join(vista.csv).decode('utf-8-sig')
 
 
-def fecha_actualizacion_fuente_publicada(servidor, nombre, proyecto=None):
+def fecha_por_tablas_origen(servidor, workbook_luid):
     """
-    Consulta a la Metadata API la fecha de actualizacion de una fuente de
-    datos publicada, directamente por su nombre (sin pasar por un workbook).
+    Estima la fecha de actualizacion de un workbook que lee EN VIVO de una
+    base de datos (Tableau no guarda fecha de refresco en ese caso).
 
-    Se usa como respaldo cuando la Metadata API no devuelve ninguna fuente
-    con fecha para un workbook.
+    Se apoya en dos datos de la Metadata API: las tablas de origen del
+    workbook (upstreamTables) y, para cada tabla, las fuentes de datos que
+    dependen de ella (downstreamDatasources). De cada tabla se toma el
+    extracto PUBLICADO mas recientemente refrescado: si algun extracto
+    construido sobre esa tabla se ha refrescado hoy, la tabla ya tiene la
+    carga de hoy. Si el workbook lee de varias tablas, se devuelve la mas
+    antigua de ellas (todas deben estar al dia).
+
+    Es una comprobacion indirecta: no mira la base de datos, sino los
+    extractos que se alimentan de ella. Se deja constancia en el log.
 
     Args:
         servidor: objeto Server ya autenticado.
-        nombre: nombre de la fuente de datos publicada.
-        proyecto: nombre de su proyecto, solo si hay varias fuentes con el
-            mismo nombre.
+        workbook_luid: LUID del workbook.
 
     Returns:
-        Objeto date con la actualizacion mas reciente (entre
-        extractLastRefreshTime y extractLastUpdateTime). None si la fuente
-        no tiene extracto.
-
-    Raises:
-        LookupError: si no existe, o hay varias con ese nombre.
-        RuntimeError: si la Metadata API devuelve errores.
+        Objeto date, o None si el workbook no tiene tablas de origen o
+        alguna de ellas no tiene ningun extracto publicado del que fiarse
+        (en ese caso no se puede comprobar y se anota el motivo).
     """
     consulta = (
-        "query { publishedDatasources(filter: {name: %s}) "
-        "{ name projectName extractLastRefreshTime extractLastUpdateTime } }"
-    ) % json.dumps(nombre)
-    respuesta = servidor.metadata.query(consulta)
+        "query { workbooks(filter: {luid: %s}) { upstreamTables { name schema "
+        "downstreamDatasources { __typename name ... on PublishedDatasource "
+        "{ projectName hasExtracts extractLastRefreshTime extractLastUpdateTime } } } } }"
+    ) % json.dumps(workbook_luid)
+
+    try:
+        respuesta = servidor.metadata.query(consulta)
+    except Exception as e:
+        log.warning("        No se pudo consultar las tablas de origen: %s", e)
+        return None
     if respuesta.get('errors'):
-        raise RuntimeError(f"Metadata API: {respuesta['errors']}")
+        log.warning("        La Metadata API rechazo la consulta de tablas de origen: %s",
+                    respuesta['errors'])
+        return None
 
-    fuentes = respuesta['data']['publishedDatasources']
-    if proyecto:
-        fuentes = [f for f in fuentes if (f.get('projectName') or '').casefold() == proyecto.casefold()]
-    if len(fuentes) != 1:
-        raise LookupError(
-            f"fuente publicada '{nombre}': {len(fuentes)} coincidencias"
-            + (" en proyectos: " + ", ".join(str(f.get('projectName')) for f in fuentes)
-               if fuentes else ""))
+    tablas = ((respuesta['data']['workbooks'] or [{}])[0]).get('upstreamTables') or []
+    if not tablas:
+        log.info("        El workbook no tiene tablas de origen registradas")
+        return None
 
-    marcas = [fuentes[0].get('extractLastRefreshTime'), fuentes[0].get('extractLastUpdateTime')]
-    marcas = [a_fecha_local(m) for m in marcas if m]
-    return max(marcas) if marcas else None
+    fechas_tablas = []
+    for tabla in tablas:
+        etiqueta = f"{tabla.get('schema') or '?'}.{tabla['name']}"
+        candidatas = []
+        for fuente in tabla.get('downstreamDatasources') or []:
+            if fuente.get('__typename') != 'PublishedDatasource':
+                continue
+            marcas = [fuente.get('extractLastRefreshTime'), fuente.get('extractLastUpdateTime')]
+            marcas = [a_fecha_local(m) for m in marcas if m]
+            if marcas:
+                candidatas.append((max(marcas), fuente['name'], fuente.get('projectName')))
+        if not candidatas:
+            log.warning("        Tabla %s: ningun extracto publicado se alimenta de ella, "
+                        "no se puede comprobar su fecha", etiqueta)
+            return None
+        fecha, nombre, proyecto = max(candidatas)
+        log.warning("        Tabla %s (lectura en vivo): se toma la fecha del extracto publicado "
+                    "'%s' (%s), actualizado el %s", etiqueta, nombre, proyecto, fecha.strftime('%d/%m/%Y'))
+        fechas_tablas.append(fecha)
+
+    return min(fechas_tablas)
 
 
 def diagnosticar_informe(servidor, config, informe):
@@ -641,15 +678,26 @@ def fecha_actualizacion_fuentes(servidor, workbook_luid):
         log.warning("        La Metadata API no devuelve ninguna fuente de datos para este workbook")
 
     fechas = []
+    hay_en_vivo = not (publicadas or embebidas)
     for fuente in publicadas + embebidas:
         marcas = [fuente.get('extractLastRefreshTime'), fuente.get('extractLastUpdateTime')]
         marcas = [a_fecha_local(m) for m in marcas if m]
         if not marcas:
-            log.info("        Fuente '%s': sin fecha de extracto (conexion en vivo), se ignora",
-                     fuente['name'])
+            log.info("        Fuente '%s': sin fecha de extracto (conexion en vivo)", fuente['name'])
+            hay_en_vivo = True
             continue
         log.info("        Fuente '%s': actualizada el %s", fuente['name'], max(marcas).strftime('%d/%m/%Y'))
         fechas.append(max(marcas))
+
+    # Fuentes en vivo: Tableau no tiene fecha de refresco, se busca a traves
+    # de las tablas de origen (ver fecha_por_tablas_origen). Si no hay forma
+    # y el workbook tiene otras fuentes con fecha, la en vivo se ignora.
+    if hay_en_vivo:
+        fecha_tablas = fecha_por_tablas_origen(servidor, workbook_luid)
+        if fecha_tablas:
+            fechas.append(fecha_tablas)
+        elif fechas:
+            log.info("        Las fuentes en vivo no se pueden comprobar y se ignoran")
     return min(fechas) if fechas else None
 
 
@@ -795,28 +843,15 @@ def procesar_informe(servidor, config, informe, hoy, enviar):
         if not informe.get('fecha_columna'):
             fecha = fecha_actualizacion_fuentes(servidor, workbook_luid)
             if fecha is None:
-                # El workbook no expone ninguna fuente con fecha: se usa,
-                # si esta configurada, la fecha de una fuente publicada
-                # concreta. Se avisa siempre en el log porque es una
-                # suposicion del usuario (que el informe lee de esa fuente).
-                respaldo = informe.get('fuente_respaldo') or config.get('fuente_respaldo')
-                if respaldo:
-                    proyecto = informe.get('fuente_respaldo_proyecto') or config.get('fuente_respaldo_proyecto')
-                    fecha = fecha_actualizacion_fuente_publicada(servidor, respaldo, proyecto)
-                    if fecha:
-                        log.warning("        Sin fecha propia: se usa la fuente de respaldo '%s' (actualizada el %s)",
-                                    respaldo, fecha.strftime('%d/%m/%Y'))
-            if fecha is None:
-                log.error("        Ninguna fuente de datos del workbook tiene fecha de extracto")
-                log.error("        Opciones: 'fuente_respaldo' (nombre de una fuente publicada) "
-                          "o 'fecha_columna' (fecha dentro del dashboard). "
+                log.error("        No se puede comprobar la fecha de actualizacion de este workbook")
+                log.error("        Si la fecha esta dentro del dashboard, indica 'fecha_columna'. "
                           "Ejecuta con --diagnostico para ver de donde salen sus datos")
                 return 'error'
             if fecha != hoy:
                 log.warning("        DESCARTADO: datos actualizados el %s, no el %s",
                             fecha.strftime('%d/%m/%Y'), hoy.strftime('%d/%m/%Y'))
                 return 'descartado'
-        contenido = descargar_tabla(servidor, vista)
+        contenido = descargar_tabla(servidor, vista, config['cache_maxima_minutos'])
     except Exception as e:
         log.error("        Error al consultar Tableau: %s", e)
         return 'error'

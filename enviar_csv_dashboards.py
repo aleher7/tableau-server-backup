@@ -51,7 +51,7 @@ import unicodedata
 import smtplib
 import argparse
 import mimetypes
-from io import StringIO
+from io import BytesIO, StringIO
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from datetime import datetime, date
@@ -90,6 +90,7 @@ CLAVES_OPCIONALES = {
     'cache_maxima_minutos': 1,
     'decimales_porcentaje': 1,
     'decimales_numeros': 0,
+    'origen_datos': 'csv',
     'smtp_puerto': 25,
     'smtp_starttls': False,
     'smtp_usuario': '',
@@ -128,6 +129,12 @@ def cargar_config(fichero):
 
     if config['metodo_correo'] not in ('outlook', 'smtp'):
         log.error("'metodo_correo' debe ser 'outlook' o 'smtp'")
+        sys.exit(1)
+
+    origenes = [config['origen_datos']] + [i['origen_datos'] for i in config.get('informes', [])
+                                           if 'origen_datos' in i]
+    if any(o not in ('csv', 'crosstab') for o in origenes):
+        log.error("'origen_datos' debe ser 'csv' o 'crosstab'")
         sys.exit(1)
 
     obligatorias = CLAVES_TABLEAU + CLAVES_CORREO + ['informes']
@@ -428,6 +435,24 @@ def redondear_numeros(filas, columnas_numericas, decimales=0):
     return filas
 
 
+def escribir_filas_csv(ruta, filas, separador):
+    """
+    Guarda una tabla de texto (lista de listas) en CSV, UTF-8 con BOM.
+
+    Args:
+        ruta: ruta del fichero a crear.
+        filas: lista de filas, cada una una lista de textos (la primera es
+            la cabecera).
+        separador: caracter separador de columnas del CSV de salida.
+
+    Returns:
+        No devuelve nada.
+    """
+    Path(ruta).parent.mkdir(parents=True, exist_ok=True)
+    with open(ruta, 'w', encoding='utf-8-sig', newline='') as f:
+        csv.writer(f, delimiter=separador, quoting=csv.QUOTE_MINIMAL).writerows(filas)
+
+
 def escribir_csv(ruta, columnas, filas, separador):
     """
     Guarda la tabla en CSV con UTF-8 con BOM, para que Excel lo abra bien.
@@ -689,12 +714,29 @@ def descargar_tabla(servidor, vista, cache_maxima_minutos=1):
     return b"".join(vista.csv).decode('utf-8-sig')
 
 
-def descargar_crosstab_excel(servidor, vista, ruta, cache_maxima_minutos=1):
+def descargar_excel_bytes(servidor, vista, cache_maxima_minutos=1):
     """
     Descarga la vista como Excel (crosstab), tal como la exporta Tableau con
     'Descargar > Crosstab': mismas columnas, mismo orden y mismos
-    encabezados que en el dashboard. Solo para comprobar como queda; no
-    forma parte del envio.
+    encabezados y formatos de numero que en el dashboard.
+
+    Args:
+        servidor: objeto Server ya autenticado.
+        vista: ViewItem devuelto por localizar_vista.
+        cache_maxima_minutos: antiguedad maxima admitida de la cache.
+
+    Returns:
+        Contenido del fichero .xlsx, en bytes.
+    """
+    import tableauserverclient as TSC
+    servidor.views.populate_excel(vista, TSC.ExcelRequestOptions(maxage=cache_maxima_minutos))
+    return b"".join(vista.excel)
+
+
+def descargar_crosstab_excel(servidor, vista, ruta, cache_maxima_minutos=1):
+    """
+    Guarda en disco el Excel (crosstab) de una vista. Solo para comprobar
+    como queda (--crosstab-excel); no forma parte del envio.
 
     Args:
         servidor: objeto Server ya autenticado.
@@ -705,10 +747,113 @@ def descargar_crosstab_excel(servidor, vista, ruta, cache_maxima_minutos=1):
     Returns:
         No devuelve nada (escribe el fichero).
     """
-    import tableauserverclient as TSC
-    servidor.views.populate_excel(vista, TSC.ExcelRequestOptions(maxage=cache_maxima_minutos))
     Path(ruta).parent.mkdir(parents=True, exist_ok=True)
-    Path(ruta).write_bytes(b"".join(vista.excel))
+    Path(ruta).write_bytes(descargar_excel_bytes(servidor, vista, cache_maxima_minutos))
+
+
+_DECIMALES_FORMATO = re.compile(r'\.([0#?]+)')
+
+
+def numero_con_formato_excel(valor, formato):
+    """
+    Escribe un numero tal como lo mostraria Excel con su formato de celda,
+    pero sin separador de miles ni simbolo de moneda, y con coma decimal.
+
+    Se respetan dos cosas del formato: los decimales (0, 0.0, 0.00...) y el
+    porcentaje (un formato con '%' multiplica por 100 y anade el simbolo).
+    Con formato 'General' se escribe el numero con los decimales que tenga.
+
+    Args:
+        valor: numero de la celda (int, float o Decimal).
+        formato: formato de celda de Excel, p. ej. '#,##0 "€"' o '0.0%'.
+
+    Returns:
+        El numero como texto.
+    """
+    valor = Decimal(repr(valor)) if isinstance(valor, float) else Decimal(valor)
+    secciones = formato.split(';')
+    seccion = secciones[1] if valor < 0 and len(secciones) > 1 else secciones[0]
+    seccion = re.sub(r'"[^"]*"|\[[^\]]*\]|\\.', '', seccion)   # sin literales ni colores
+
+    if not re.search(r'[0#?]', seccion):   # 'General' o sin formato numerico
+        return format(valor.normalize(), 'f').replace('.', ',')
+
+    es_porcentaje = '%' in seccion
+    coincidencia = _DECIMALES_FORMATO.search(seccion)
+    decimales = len(coincidencia.group(1)) if coincidencia else 0
+    if es_porcentaje:
+        valor *= 100
+    valor = valor.quantize(Decimal(1).scaleb(-decimales), rounding=ROUND_HALF_UP)
+    if valor == 0:
+        valor = abs(valor)
+    return f"{valor:.{decimales}f}".replace('.', ',') + ('%' if es_porcentaje else '')
+
+
+def texto_celda_excel(celda):
+    """
+    Convierte una celda de openpyxl en el texto que va al CSV.
+
+    Args:
+        celda: celda de openpyxl (con .value y .number_format).
+
+    Returns:
+        Texto: vacio si no hay valor, fecha en dd/mm/aaaa, numeros segun su
+        formato de celda (ver numero_con_formato_excel) y el resto tal cual.
+    """
+    valor = celda.value
+    if valor is None:
+        return ''
+    if isinstance(valor, bool):
+        return 'TRUE' if valor else 'FALSE'
+    if isinstance(valor, datetime):
+        solo_fecha = valor.time() == datetime.min.time()
+        return valor.strftime('%d/%m/%Y' if solo_fecha else '%d/%m/%Y %H:%M:%S')
+    if isinstance(valor, date):
+        return valor.strftime('%d/%m/%Y')
+    if isinstance(valor, (int, float, Decimal)):
+        return numero_con_formato_excel(valor, celda.number_format or 'General')
+    return str(valor)
+
+
+def excel_a_filas(contenido, hoja=None):
+    """
+    Lee el Excel (crosstab) de Tableau y lo deja como una tabla de texto,
+    con la misma disposicion que en el dashboard.
+
+    Se quitan las filas vacias del principio y del final y las columnas
+    completamente vacias. Requiere 'pip install openpyxl'.
+
+    Args:
+        contenido: bytes del fichero .xlsx.
+        hoja: nombre de la hoja a leer; por defecto, la primera.
+
+    Returns:
+        Lista de filas, cada una una lista de textos, todas de la misma
+        longitud. La primera fila es la cabecera.
+
+    Raises:
+        RuntimeError: si falta openpyxl.
+    """
+    try:
+        from openpyxl import load_workbook
+    except ImportError:
+        raise RuntimeError("falta la libreria openpyxl (pip install openpyxl)")
+
+    libro = load_workbook(BytesIO(contenido), data_only=True)
+    hoja_excel = libro[hoja] if hoja else libro.worksheets[0]
+    filas = [[texto_celda_excel(c) for c in fila] for fila in hoja_excel.iter_rows()]
+
+    while filas and not any(filas[0]):
+        filas.pop(0)
+    while filas and not any(filas[-1]):
+        filas.pop()
+    if not filas:
+        return []
+
+    ancho = max(len(f) for f in filas)
+    filas = [f + [''] * (ancho - len(f)) for f in filas]
+    con_datos = [i for i in range(ancho) if any(f[i] for f in filas)]
+    return [[f[i] for i in con_datos] for f in filas]
 
 
 def fecha_por_tablas_origen(servidor, workbook_luid):
@@ -1060,6 +1205,9 @@ def procesar_informe(servidor, config, informe, hoy, enviar):
     """
     nombre = informe['nombre']
 
+    # 'fecha_columna' necesita las filas del CSV de datos, asi que fuerza ese origen.
+    origen = 'csv' if informe.get('fecha_columna') else informe.get('origen_datos', config['origen_datos'])
+
     # La fecha se comprueba ANTES de descargar la tabla: si no es la de hoy,
     # no hace falta bajar nada.
     try:
@@ -1075,10 +1223,31 @@ def procesar_informe(servidor, config, informe, hoy, enviar):
                 log.warning("        DESCARTADO: datos actualizados el %s, no el %s",
                             fecha.strftime('%d/%m/%Y'), hoy.strftime('%d/%m/%Y'))
                 return 'descartado'
-        contenido = descargar_tabla(servidor, vista, config['cache_maxima_minutos'])
+        if origen == 'crosstab':
+            contenido_excel = descargar_excel_bytes(servidor, vista, config['cache_maxima_minutos'])
+        else:
+            contenido = descargar_tabla(servidor, vista, config['cache_maxima_minutos'])
     except Exception as e:
         log.error("        Error al consultar Tableau: %s", e)
         return 'error'
+
+    ruta = Path(config['directorio_salida']) / f"{sanear_nombre_archivo(nombre)}_{hoy.isoformat()}.csv"
+
+    # Origen 'crosstab': el Excel que exporta Tableau ya tiene la disposicion
+    # del dashboard; solo se convierte a CSV, que es lo que se envia.
+    if origen == 'crosstab':
+        try:
+            tabla = excel_a_filas(contenido_excel, informe.get('hoja_excel'))
+        except Exception as e:
+            log.error("        No se pudo leer el Excel de Tableau: %s", e)
+            return 'error'
+        if len(tabla) < 2:
+            log.warning("        La tabla llego sin filas: no se envia")
+            return 'error'
+        log.info("        Fecha de actualizacion correcta (%s), %d filas (disposicion del dashboard)",
+                 fecha.strftime('%d/%m/%Y'), len(tabla) - 1)
+        escribir_filas_csv(ruta, tabla, config['csv_separador'])
+        return enviar_informe(config, informe, ruta, hoy, enviar)
 
     columnas, filas = leer_csv(contenido)
     if not filas:
@@ -1097,11 +1266,6 @@ def procesar_informe(servidor, config, informe, hoy, enviar):
             log.warning("        DESCARTADO: datos actualizados el %s, no el %s",
                         fecha.strftime('%d/%m/%Y'), hoy.strftime('%d/%m/%Y'))
             return 'descartado'
-
-    if fecha != hoy:
-        log.warning("        DESCARTADO: datos actualizados el %s, no el %s",
-                    fecha.strftime('%d/%m/%Y'), hoy.strftime('%d/%m/%Y'))
-        return 'descartado'
 
     log.info("        Fecha de actualizacion correcta (%s), %d filas", fecha.strftime('%d/%m/%Y'), len(filas))
 
@@ -1145,9 +1309,27 @@ def procesar_informe(servidor, config, informe, hoy, enviar):
         redondear_numeros(filas, columnas_num, decimales)
         log.info("        Columnas redondeadas a %d decimales: %s", decimales, ", ".join(columnas_num))
 
-    ruta = Path(config['directorio_salida']) / f"{sanear_nombre_archivo(nombre)}_{hoy.isoformat()}.csv"
     escribir_csv(ruta, columnas, filas, config['csv_separador'])
+    return enviar_informe(config, informe, ruta, hoy, enviar)
 
+
+def enviar_informe(config, informe, ruta, hoy, enviar):
+    """
+    Envia por correo el CSV ya generado de un informe (o, con --sin-enviar,
+    solo lo deja en disco).
+
+    Args:
+        config: diccionario de configuracion.
+        informe: diccionario del informe (una entrada de 'informes').
+        ruta: ruta del CSV generado.
+        hoy: objeto date del dia de envio.
+        enviar: si es False, no se envia nada.
+
+    Returns:
+        'enviado' si se envio (o si es una prueba sin envio), 'error' si
+        el correo fallo.
+    """
+    nombre = informe['nombre']
     if not enviar:
         log.info("        (modo --sin-enviar) CSV generado en %s", ruta)
         return 'enviado'

@@ -13,6 +13,8 @@
   "archivo_estado": "./estado_envios.json",
   "csv_separador": ";",
 
+  "origen_datos": "crosstab",
+
   "proyecto_ruta": "Production/Dashboards/Ad hoc Reports/BI Local/BI España/Informes Automaticos",
 
   "informes": [
@@ -20,14 +22,7 @@
     { "nombre": "CdM Venta Interna Detalle Marca YTD" },
     { "nombre": "CdM Venta Interna Detalle Producto Agrupado MTD" },
     { "nombre": "CdM Venta Interna Detalle Producto Agrupado YTD" },
-    {
-      "nombre": "CdM SRI Marca MTD",
-      "renombrar_columnas": { "Linea Negocio": "Linea Negocio Act." },
-      "orden_columnas": [
-        "Linea Negocio Act.", "Marca", "Uds Brutas", "Imp Neto", "Neto Ppto", "% S/ Ppto",
-        "Imp Neto AA", "% S/ AA Neto", "SRI", "% S/ SRI", "Imp Pend. Servir"
-      ]
-    },
+    { "nombre": "CdM SRI Marca MTD" },
     { "nombre": "CdM SRI Marca YTD" },
     { "nombre": "CdM SRI Producto Agrupado MTD" },
     { "nombre": "CdM SRI Producto Agrupado YTD" }

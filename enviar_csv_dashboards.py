@@ -91,6 +91,8 @@ CLAVES_OPCIONALES = {
     'decimales_porcentaje': 1,
     'decimales_numeros': 0,
     'origen_datos': 'csv',
+    'rellenar_etiquetas': True,
+    'separador_miles': False,
     'smtp_puerto': 25,
     'smtp_starttls': False,
     'smtp_usuario': '',
@@ -754,18 +756,23 @@ def descargar_crosstab_excel(servidor, vista, ruta, cache_maxima_minutos=1):
 _DECIMALES_FORMATO = re.compile(r'\.([0#?]+)')
 
 
-def numero_con_formato_excel(valor, formato):
+def numero_con_formato_excel(valor, formato, miles=False):
     """
     Escribe un numero tal como lo mostraria Excel con su formato de celda,
-    pero sin separador de miles ni simbolo de moneda, y con coma decimal.
+    pero sin simbolo de moneda, y con coma decimal.
 
-    Se respetan dos cosas del formato: los decimales (0, 0.0, 0.00...) y el
-    porcentaje (un formato con '%' multiplica por 100 y anade el simbolo).
+    Se respetan tres cosas del formato: los decimales (0, 0.0, 0.00...), el
+    porcentaje (un formato con '%' multiplica por 100 y anade el simbolo) y,
+    solo si se pide con 'miles', el separador de miles (punto), unicamente
+    cuando el propio formato de la celda lo lleva. Asi un ano o un codigo
+    (formato General o '0') nunca se convierten en '2.026'.
     Con formato 'General' se escribe el numero con los decimales que tenga.
 
     Args:
         valor: numero de la celda (int, float o Decimal).
         formato: formato de celda de Excel, p. ej. '#,##0 "€"' o '0.0%'.
+        miles: si es True, se pone punto de miles en las celdas cuyo
+            formato lo lleva (y no son porcentajes).
 
     Returns:
         El numero como texto.
@@ -786,15 +793,19 @@ def numero_con_formato_excel(valor, formato):
     valor = valor.quantize(Decimal(1).scaleb(-decimales), rounding=ROUND_HALF_UP)
     if valor == 0:
         valor = abs(valor)
+    if miles and not es_porcentaje and ',' in seccion:
+        texto = f"{valor:,.{decimales}f}"   # 3,580,783.49 -> 3.580.783,49
+        return texto.replace(',', '\0').replace('.', ',').replace('\0', '.')
     return f"{valor:.{decimales}f}".replace('.', ',') + ('%' if es_porcentaje else '')
 
 
-def texto_celda_excel(celda):
+def texto_celda_excel(celda, miles=False):
     """
     Convierte una celda de openpyxl en el texto que va al CSV.
 
     Args:
         celda: celda de openpyxl (con .value y .number_format).
+        miles: si es True, separador de miles en los formatos que lo llevan.
 
     Returns:
         Texto: vacio si no hay valor, fecha en dd/mm/aaaa, numeros segun su
@@ -811,11 +822,67 @@ def texto_celda_excel(celda):
     if isinstance(valor, date):
         return valor.strftime('%d/%m/%Y')
     if isinstance(valor, (int, float, Decimal)):
-        return numero_con_formato_excel(valor, celda.number_format or 'General')
+        return numero_con_formato_excel(valor, celda.number_format or 'General', miles)
     return str(valor)
 
 
-def excel_a_filas(contenido, hoja=None):
+def columnas_de_etiquetas(tabla):
+    """
+    Detecta las columnas de etiquetas de una tabla: las de la izquierda que
+    solo contienen texto (Linea de negocio, Marca...), hasta la primera que
+    contiene numeros o porcentajes.
+
+    Args:
+        tabla: lista de filas (listas de texto); la primera es la cabecera.
+
+    Returns:
+        Lista de indices de columna, de izquierda a derecha.
+    """
+    indices = []
+    for i in range(len(tabla[0])):
+        valores = [f[i] for f in tabla[1:] if f[i]]
+        if not valores or any(interpretar_numero(v.replace('%', '')) is not None for v in valores):
+            break
+        indices.append(i)
+    return indices
+
+
+def rellenar_etiquetas(tabla, indices):
+    """
+    Repite las etiquetas de grupo en todas las filas.
+
+    En un dashboard, 'PROMO' aparece una vez y las filas de debajo quedan en
+    blanco; en un CSV cada fila debe llevar su etiqueta para poder filtrar,
+    ordenar o hacer tablas dinamicas. Una celda en blanco se rellena con el
+    valor de arriba solo si todas las columnas de etiqueta a su izquierda
+    tambien estan en blanco en esa fila (es decir, la fila sigue en el mismo
+    grupo). Asi una fila de total ('Total general' | vacio) no hereda la
+    marca de la fila anterior.
+
+    Args:
+        tabla: lista de filas (listas de texto); la primera es la cabecera.
+            Se modifica en sitio.
+        indices: indices de las columnas de etiqueta, de izquierda a derecha.
+
+    Returns:
+        Numero de celdas rellenadas.
+    """
+    ultimo = {}
+    rellenadas = 0
+    for fila in tabla[1:]:
+        if not any(fila):
+            continue
+        original = list(fila)
+        for k, i in enumerate(indices):
+            if original[i]:
+                ultimo[i] = original[i]
+            elif i in ultimo and not any(original[j] for j in indices[:k]):
+                fila[i] = ultimo[i]
+                rellenadas += 1
+    return rellenadas
+
+
+def excel_a_filas(contenido, hoja=None, miles=False):
     """
     Lee el Excel (crosstab) de Tableau y lo deja como una tabla de texto,
     con la misma disposicion que en el dashboard.
@@ -826,6 +893,7 @@ def excel_a_filas(contenido, hoja=None):
     Args:
         contenido: bytes del fichero .xlsx.
         hoja: nombre de la hoja a leer; por defecto, la primera.
+        miles: si es True, separador de miles en los formatos que lo llevan.
 
     Returns:
         Lista de filas, cada una una lista de textos, todas de la misma
@@ -841,7 +909,7 @@ def excel_a_filas(contenido, hoja=None):
 
     libro = load_workbook(BytesIO(contenido), data_only=True)
     hoja_excel = libro[hoja] if hoja else libro.worksheets[0]
-    filas = [[texto_celda_excel(c) for c in fila] for fila in hoja_excel.iter_rows()]
+    filas = [[texto_celda_excel(c, miles) for c in fila] for fila in hoja_excel.iter_rows()]
 
     while filas and not any(filas[0]):
         filas.pop(0)
@@ -1237,13 +1305,28 @@ def procesar_informe(servidor, config, informe, hoy, enviar):
     # del dashboard; solo se convierte a CSV, que es lo que se envia.
     if origen == 'crosstab':
         try:
-            tabla = excel_a_filas(contenido_excel, informe.get('hoja_excel'))
+            tabla = excel_a_filas(contenido_excel, informe.get('hoja_excel'),
+                                  informe.get('separador_miles', config['separador_miles']))
         except Exception as e:
             log.error("        No se pudo leer el Excel de Tableau: %s", e)
             return 'error'
         if len(tabla) < 2:
             log.warning("        La tabla llego sin filas: no se envia")
             return 'error'
+
+        # Etiquetas de grupo (PROMO, NO PROMO...) repetidas en cada fila.
+        # 'rellenar_columnas' fija cuales (por nombre de cabecera); con []
+        # se desactiva; por defecto, las columnas de texto de la izquierda.
+        rellenar = informe.get('rellenar_columnas')
+        if rellenar is None and config['rellenar_etiquetas']:
+            indices = columnas_de_etiquetas(tabla)
+        else:
+            indices = [tabla[0].index(n) for n in (rellenar or []) if n in tabla[0]]
+        if indices:
+            repetidas = rellenar_etiquetas(tabla, indices)
+            if repetidas:
+                log.info("        Etiquetas repetidas en cada fila (%s): %d celdas rellenadas",
+                         ", ".join(tabla[0][i] for i in indices), repetidas)
         log.info("        Fecha de actualizacion correcta (%s), %d filas (disposicion del dashboard)",
                  fecha.strftime('%d/%m/%Y'), len(tabla) - 1)
         escribir_filas_csv(ruta, tabla, config['csv_separador'])

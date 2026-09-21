@@ -11,6 +11,9 @@ Flujo, para cada informe de la lista 'informes' de config_envio.json:
        Si no es hoy         -> NO se envia (la carga del dia no ha llegado o
                                ha fallado) y se anota en el log.
        Con varias fuentes de datos, todas deben estar actualizadas hoy.
+       Si el workbook no expone ninguna fuente con fecha, se puede indicar
+       'fuente_respaldo' (nombre de una fuente publicada, global o por
+       informe) y se usa la fecha de esa fuente, dejando aviso en el log.
 
 El script es idempotente por dia: guarda en estado_envios.json que informes
 ya se enviaron hoy y no los repite. Por eso la tarea programada puede
@@ -23,6 +26,8 @@ Uso:
     python enviar_csv_dashboards.py --sin-enviar        # prueba: descarga y
                                                         # comprueba, no envia
     python enviar_csv_dashboards.py --fecha 2026-09-21  # simular otro "hoy"
+    python enviar_csv_dashboards.py --diagnostico       # que fuentes ve la
+                                                        # Metadata API por informe
     python enviar_csv_dashboards.py --forzar            # ignora lo ya enviado
     python enviar_csv_dashboards.py --aviso             # ultima pasada del dia:
                                                         # avisa al equipo de lo
@@ -474,6 +479,96 @@ def descargar_tabla(servidor, vista):
     return b"".join(vista.csv).decode('utf-8-sig')
 
 
+def fecha_actualizacion_fuente_publicada(servidor, nombre, proyecto=None):
+    """
+    Consulta a la Metadata API la fecha de actualizacion de una fuente de
+    datos publicada, directamente por su nombre (sin pasar por un workbook).
+
+    Se usa como respaldo cuando la Metadata API no devuelve ninguna fuente
+    con fecha para un workbook.
+
+    Args:
+        servidor: objeto Server ya autenticado.
+        nombre: nombre de la fuente de datos publicada.
+        proyecto: nombre de su proyecto, solo si hay varias fuentes con el
+            mismo nombre.
+
+    Returns:
+        Objeto date con la actualizacion mas reciente (entre
+        extractLastRefreshTime y extractLastUpdateTime). None si la fuente
+        no tiene extracto.
+
+    Raises:
+        LookupError: si no existe, o hay varias con ese nombre.
+        RuntimeError: si la Metadata API devuelve errores.
+    """
+    consulta = (
+        "query { publishedDatasources(filter: {name: %s}) "
+        "{ name projectName extractLastRefreshTime extractLastUpdateTime } }"
+    ) % json.dumps(nombre)
+    respuesta = servidor.metadata.query(consulta)
+    if respuesta.get('errors'):
+        raise RuntimeError(f"Metadata API: {respuesta['errors']}")
+
+    fuentes = respuesta['data']['publishedDatasources']
+    if proyecto:
+        fuentes = [f for f in fuentes if (f.get('projectName') or '').casefold() == proyecto.casefold()]
+    if len(fuentes) != 1:
+        raise LookupError(
+            f"fuente publicada '{nombre}': {len(fuentes)} coincidencias"
+            + (" en proyectos: " + ", ".join(str(f.get('projectName')) for f in fuentes)
+               if fuentes else ""))
+
+    marcas = [fuentes[0].get('extractLastRefreshTime'), fuentes[0].get('extractLastUpdateTime')]
+    marcas = [a_fecha_local(m) for m in marcas if m]
+    return max(marcas) if marcas else None
+
+
+def diagnosticar_informe(servidor, config, informe):
+    """
+    Muestra en el log que ve la Metadata API para el workbook de un informe:
+    fuentes publicadas, fuentes embebidas (con o sin extracto) y bases de
+    datos/tablas de origen. No envia nada. Sirve para saber de donde salen
+    de verdad los datos de un workbook cuya fecha no se puede leer.
+
+    Args:
+        servidor: objeto Server ya autenticado.
+        config: diccionario de configuracion.
+        informe: diccionario del informe (una entrada de 'informes').
+
+    Returns:
+        No devuelve nada (escribe en el log).
+    """
+    try:
+        _, workbook_luid = localizar_vista(servidor, config, informe)
+    except Exception as e:
+        log.error("        No se pudo localizar el workbook: %s", e)
+        return
+
+    bloques = {
+        "fuentes publicadas": "upstreamDatasources { name ... on PublishedDatasource "
+                              "{ projectName extractLastRefreshTime extractLastUpdateTime } }",
+        "fuentes embebidas": "embeddedDatasources { name hasExtracts "
+                             "extractLastRefreshTime extractLastUpdateTime }",
+        "bases de datos y tablas": "upstreamDatabases { name connectionType } "
+                                   "upstreamTables { name schema }",
+    }
+    for titulo, cuerpo in bloques.items():
+        consulta = ("query { workbooks(filter: {luid: %s}) { name %s } }"
+                    % (json.dumps(workbook_luid), cuerpo))
+        try:
+            respuesta = servidor.metadata.query(consulta)
+        except Exception as e:
+            log.info("        [%s] fallo la consulta: %s", titulo, e)
+            continue
+        if respuesta.get('errors'):
+            log.info("        [%s] la API rechazo la consulta: %s", titulo, respuesta['errors'])
+            continue
+        datos = (respuesta['data']['workbooks'] or [{}])[0]
+        datos.pop('name', None)
+        log.info("        [%s] %s", titulo, json.dumps(datos, ensure_ascii=False))
+
+
 def a_fecha_local(texto):
     """
     Convierte una marca de tiempo de la Metadata API (UTC, ISO 8601) en la
@@ -700,8 +795,22 @@ def procesar_informe(servidor, config, informe, hoy, enviar):
         if not informe.get('fecha_columna'):
             fecha = fecha_actualizacion_fuentes(servidor, workbook_luid)
             if fecha is None:
+                # El workbook no expone ninguna fuente con fecha: se usa,
+                # si esta configurada, la fecha de una fuente publicada
+                # concreta. Se avisa siempre en el log porque es una
+                # suposicion del usuario (que el informe lee de esa fuente).
+                respaldo = informe.get('fuente_respaldo') or config.get('fuente_respaldo')
+                if respaldo:
+                    proyecto = informe.get('fuente_respaldo_proyecto') or config.get('fuente_respaldo_proyecto')
+                    fecha = fecha_actualizacion_fuente_publicada(servidor, respaldo, proyecto)
+                    if fecha:
+                        log.warning("        Sin fecha propia: se usa la fuente de respaldo '%s' (actualizada el %s)",
+                                    respaldo, fecha.strftime('%d/%m/%Y'))
+            if fecha is None:
                 log.error("        Ninguna fuente de datos del workbook tiene fecha de extracto")
-                log.error("        Usa 'fecha_columna' si la fecha esta en el propio dashboard")
+                log.error("        Opciones: 'fuente_respaldo' (nombre de una fuente publicada) "
+                          "o 'fecha_columna' (fecha dentro del dashboard). "
+                          "Ejecuta con --diagnostico para ver de donde salen sus datos")
                 return 'error'
             if fecha != hoy:
                 log.warning("        DESCARTADO: datos actualizados el %s, no el %s",
@@ -776,6 +885,9 @@ def main():
     parser.add_argument('--fecha', help="simula otro dia de envio (YYYY-MM-DD)")
     parser.add_argument('--forzar', action='store_true',
                         help="ignora los informes ya enviados hoy")
+    parser.add_argument('--diagnostico', action='store_true',
+                        help="muestra de donde salen los datos de cada workbook segun la "
+                             "Metadata API; no descarga ni envia nada")
     parser.add_argument('--aviso', action='store_true',
                         help="envia a 'destinatarios_aviso' la lista de informes que no salieron "
                              "(usar solo en la ultima ejecucion del dia)")
@@ -790,6 +902,17 @@ def main():
     log.info("=" * 60)
     log.info("ENVIO CSV DASHBOARDS - fecha de envio %s", hoy.strftime('%d/%m/%Y'))
     log.info("=" * 60)
+
+    if args.diagnostico:
+        servidor = conectar_tableau(config)
+        for numero, informe in enumerate(config['informes'], start=1):
+            log.info("[%d/%d] %s", numero, len(config['informes']), informe['nombre'])
+            diagnosticar_informe(servidor, config, informe)
+        try:
+            servidor.auth.sign_out()
+        except Exception:
+            pass
+        return
 
     estado = cargar_estado(config['archivo_estado'])
     ya_enviados = set() if args.forzar or not enviar else set(estado.get(hoy_txt, []))

@@ -538,10 +538,12 @@ def fecha_por_tablas_origen(servidor, workbook_luid):
         log.info("        El workbook no tiene tablas de origen registradas")
         return None
 
-    fechas_tablas = []
+    # Tableau puede registrar la misma tabla varias veces en un workbook (una
+    # por conexion): se agrupan por esquema.nombre para que cuenten como una.
+    por_tabla = {}
     for tabla in tablas:
         etiqueta = f"{tabla.get('schema') or '?'}.{tabla['name']}"
-        candidatas = []
+        candidatas = por_tabla.setdefault(etiqueta, [])
         for fuente in tabla.get('downstreamDatasources') or []:
             if fuente.get('__typename') != 'PublishedDatasource':
                 continue
@@ -549,6 +551,9 @@ def fecha_por_tablas_origen(servidor, workbook_luid):
             marcas = [a_fecha_local(m) for m in marcas if m]
             if marcas:
                 candidatas.append((max(marcas), fuente['name'], fuente.get('projectName')))
+
+    fechas_tablas = []
+    for etiqueta, candidatas in por_tabla.items():
         if not candidatas:
             log.warning("        Tabla %s: ningun extracto publicado se alimenta de ella, "
                         "no se puede comprobar su fecha", etiqueta)

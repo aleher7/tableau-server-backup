@@ -1214,20 +1214,29 @@ def enviar_correo_outlook(config, destinatarios, asunto, cuerpo, adjunto=None):
         log.error("        Falta pywin32 para usar Outlook (pip install pywin32)")
         return False
 
+    # Cada paso se prueba por separado y con su propio mensaje: un error
+    # generico de COM ("Error en la operacion", sin mas detalle) no dice en
+    # que paso ha fallado si se captura todo junto.
     try:
         outlook = win32com.client.Dispatch("Outlook.Application")
         espacio = outlook.GetNamespace("MAPI")
-        if not entrar_en_perfil_outlook(espacio, config.get('outlook_perfil')):
-            return False
-        cuentas = _cuentas_outlook(espacio)
-        log.info("        Outlook: cuentas del perfil: %s", ", ".join(c[0] for c in cuentas) or "(ninguna)")
-        if not cuentas:
-            log.error("        El perfil de Outlook no tiene ninguna cuenta de correo: el mensaje "
-                      "no llegaria a ningun sitio aunque Outlook diga que lo envio")
-            log.error("        Busca el nombre del perfil correcto (Panel de control > Correo > "
-                      "Mostrar perfiles) y fijalo con 'outlook_perfil' en la configuracion")
-            return False
+    except Exception as e:
+        log.error("        No se pudo abrir Outlook: %s", e)
+        return False
 
+    if not entrar_en_perfil_outlook(espacio, config.get('outlook_perfil')):
+        return False
+
+    cuentas = _cuentas_outlook(espacio)
+    log.info("        Outlook: cuentas del perfil: %s", ", ".join(c[0] for c in cuentas) or "(ninguna)")
+    if not cuentas:
+        log.error("        El perfil de Outlook no tiene ninguna cuenta de correo: el mensaje "
+                  "no llegaria a ningun sitio aunque Outlook diga que lo envio")
+        log.error("        Busca el nombre del perfil correcto (Panel de control > Correo > "
+                  "Mostrar perfiles) y fijalo con 'outlook_perfil' en la configuracion")
+        return False
+
+    try:
         mensaje = outlook.CreateItem(0)   # 0 = olMailItem
         mensaje.To = "; ".join(destinatarios)
         mensaje.Subject = asunto
@@ -1240,17 +1249,39 @@ def enviar_correo_outlook(config, destinatarios, asunto, cuerpo, adjunto=None):
             mensaje.SendUsingAccount = cuenta[0]
         if config.get('remitente'):
             mensaje.SentOnBehalfOfName = config['remitente']
-        if adjunto:
-            mensaje.Attachments.Add(str(Path(adjunto).resolve()))
+    except Exception as e:
+        log.error("        No se pudo preparar el mensaje: %s", e)
+        return False
 
+    if adjunto:
+        try:
+            mensaje.Attachments.Add(str(Path(adjunto).resolve()))
+        except Exception as e:
+            log.error("        No se pudo adjuntar '%s': %s", adjunto, e)
+            return False
+
+    try:
         en_salida_antes = set(_ids_en_carpeta(espacio, 4, asunto))   # 4 = olFolderOutbox
         enviados_antes = set(_ids_en_carpeta(espacio, 5, asunto))    # 5 = olFolderSentMail
-        mensaje.Send()
-        try:
-            espacio.SendAndReceive(False)   # fuerza el envio ahora, sin esperar al ciclo de Outlook
-        except Exception:
-            pass
+    except Exception as e:
+        log.error("        No se pudo leer la Bandeja de salida / Elementos enviados: %s", e)
+        return False
 
+    try:
+        mensaje.Send()
+    except Exception as e:
+        log.error("        Outlook rechazo el envio (en mensaje.Send()): %s", e)
+        log.error("        Si nunca aparecio un aviso de seguridad en pantalla, puede ser una "
+                  "politica de 'Object Model Guard'/antivirus que BLOQUEA el envio automatizado en "
+                  "silencio en vez de preguntar: consultalo con el equipo de IT")
+        return False
+
+    try:
+        espacio.SendAndReceive(False)   # fuerza el envio ahora, sin esperar al ciclo de Outlook
+    except Exception:
+        pass
+
+    try:
         limite = time.time() + config['outlook_espera_segundos']
         while True:
             pendientes = [i for i in _ids_en_carpeta(espacio, 4, asunto) if i not in en_salida_antes]
@@ -1275,7 +1306,7 @@ def enviar_correo_outlook(config, destinatarios, asunto, cuerpo, adjunto=None):
                         "(puede tardar, o guardarse en otra cuenta/carpeta: revisa 'remitente')")
         return True
     except Exception as e:
-        log.error("        No se pudo enviar con Outlook: %s", e)
+        log.error("        El mensaje se envio, pero no se pudo confirmar del todo: %s", e)
         return False
 
 
@@ -1473,7 +1504,11 @@ def probar_correo(config, direccion):
         True si el envio funciono. False si fallo.
     """
     ruta = Path(config['directorio_salida']) / "prueba_correo.csv"
-    escribir_filas_csv(ruta, [["columna_a", "columna_b"], ["1", "2"]], config['csv_separador'])
+    try:
+        escribir_filas_csv(ruta, [["columna_a", "columna_b"], ["1", "2"]], config['csv_separador'])
+    except PermissionError:
+        log.error("No se pudo escribir %s: esta abierto en otro programa (ciérralo e intenta de nuevo)", ruta)
+        return False
 
     inicio = time.time()
     correcto = enviar_correo(
@@ -1618,7 +1653,12 @@ def procesar_informe(servidor, config, informe, hoy, enviar):
                          ", ".join(tabla[0][i] for i in indices), repetidas)
         log.info("        Fecha de actualizacion correcta (%s), %d filas (disposicion del dashboard)",
                  fecha.strftime('%d/%m/%Y'), len(tabla) - 1)
-        escribir_filas_csv(ruta, tabla, config['csv_separador'])
+        try:
+            escribir_filas_csv(ruta, tabla, config['csv_separador'])
+        except PermissionError:
+            log.error("        No se pudo escribir %s: esta abierto en otro programa (ciérralo e "
+                      "intenta de nuevo)", ruta)
+            return 'error'
         return enviar_informe(config, informe, ruta, hoy, enviar)
 
     columnas, filas = leer_csv(contenido)
@@ -1681,7 +1721,12 @@ def procesar_informe(servidor, config, informe, hoy, enviar):
         redondear_numeros(filas, columnas_num, decimales)
         log.info("        Columnas redondeadas a %d decimales: %s", decimales, ", ".join(columnas_num))
 
-    escribir_csv(ruta, columnas, filas, config['csv_separador'])
+    try:
+        escribir_csv(ruta, columnas, filas, config['csv_separador'])
+    except PermissionError:
+        log.error("        No se pudo escribir %s: esta abierto en otro programa (ciérralo e "
+                  "intenta de nuevo)", ruta)
+        return 'error'
     return enviar_informe(config, informe, ruta, hoy, enviar)
 
 

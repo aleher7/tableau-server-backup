@@ -91,6 +91,7 @@ CLAVES_OPCIONALES = {
     'metodo_correo': 'outlook',
     'remitente': '',
     'outlook_cuenta': '',
+    'outlook_perfil': '',
     'outlook_espera_segundos': 30,
     'directorio_salida': './csv_generados',
     'archivo_estado': './estado_envios.json',
@@ -1216,8 +1217,16 @@ def enviar_correo_outlook(config, destinatarios, asunto, cuerpo, adjunto=None):
     try:
         outlook = win32com.client.Dispatch("Outlook.Application")
         espacio = outlook.GetNamespace("MAPI")
+        if not entrar_en_perfil_outlook(espacio, config.get('outlook_perfil')):
+            return False
         cuentas = _cuentas_outlook(espacio)
         log.info("        Outlook: cuentas del perfil: %s", ", ".join(c[0] for c in cuentas) or "(ninguna)")
+        if not cuentas:
+            log.error("        El perfil de Outlook no tiene ninguna cuenta de correo: el mensaje "
+                      "no llegaria a ningun sitio aunque Outlook diga que lo envio")
+            log.error("        Busca el nombre del perfil correcto (Panel de control > Correo > "
+                      "Mostrar perfiles) y fijalo con 'outlook_perfil' en la configuracion")
+            return False
 
         mensaje = outlook.CreateItem(0)   # 0 = olMailItem
         mensaje.To = "; ".join(destinatarios)
@@ -1267,6 +1276,39 @@ def enviar_correo_outlook(config, destinatarios, asunto, cuerpo, adjunto=None):
         return True
     except Exception as e:
         log.error("        No se pudo enviar con Outlook: %s", e)
+        return False
+
+
+def entrar_en_perfil_outlook(espacio, perfil):
+    """
+    Fuerza la sesion de Outlook a usar un perfil concreto, por su nombre.
+
+    Sin esto, cuando la automatizacion arranca Outlook sin que hubiera
+    ninguna instancia abierta, Windows puede usar un perfil por defecto
+    distinto del que el usuario usa a diario (por ejemplo, uno vacio, sin
+    ninguna cuenta, si el usuario trabaja normalmente con 'Nuevo Outlook').
+    Ver diagnosticar_outlook() para localizar el nombre del perfil correcto.
+
+    Args:
+        espacio: objeto Namespace MAPI de Outlook.
+        perfil: nombre del perfil a usar. Si esta vacio, no hace nada (se
+            deja la sesion tal como la abrio Outlook).
+
+    Returns:
+        True si no habia que cambiar de perfil, o si el cambio funciono.
+        False si el perfil indicado no se pudo abrir.
+    """
+    if not perfil:
+        return True
+    try:
+        # Profile, Password ('' = no aplica en un perfil normal), ShowDialog,
+        # NewSession (True: fuerza una sesion nueva con este perfil, en vez
+        # de reutilizar la que Outlook ya tuviera abierta).
+        espacio.Logon(perfil, "", False, True)
+        log.info("        Outlook: sesion abierta con el perfil '%s'", perfil)
+        return True
+    except Exception as e:
+        log.error("        No se pudo abrir el perfil de Outlook '%s': %s", perfil, e)
         return False
 
 
@@ -1367,6 +1409,8 @@ def diagnosticar_outlook(config):
                     "falta el Outlook clasico) o si tienes mas de un perfil de Outlook en el equipo")
 
     espacio = outlook.GetNamespace("MAPI")
+    if not entrar_en_perfil_outlook(espacio, config.get('outlook_perfil')):
+        return
 
     try:
         log.info("Usuario actual del perfil: %s <%s>",

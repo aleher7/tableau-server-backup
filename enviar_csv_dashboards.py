@@ -35,6 +35,9 @@ Uso:
     python enviar_csv_dashboards.py --probar-correo tu@correo.com --metodo-correo smtp
                                                         # prueba solo el envio de
                                                         # correo (sin Tableau)
+    python enviar_csv_dashboards.py --diagnostico-outlook
+                                                        # con Outlook: que perfil/buzon
+                                                        # usa la automatizacion
     python enviar_csv_dashboards.py --forzar            # ignora lo ya enviado
     python enviar_csv_dashboards.py --aviso             # ultima pasada del dia:
                                                         # avisa al equipo de lo
@@ -87,6 +90,8 @@ CLAVES_SMTP = ['smtp_servidor', 'remitente']
 CLAVES_OPCIONALES = {
     'metodo_correo': 'outlook',
     'remitente': '',
+    'outlook_cuenta': '',
+    'outlook_espera_segundos': 30,
     'directorio_salida': './csv_generados',
     'archivo_estado': './estado_envios.json',
     'csv_separador': ';',
@@ -1177,20 +1182,30 @@ def enviar_correo_outlook(config, destinatarios, asunto, cuerpo, adjunto=None):
     Envia un correo con el Outlook de escritorio instalado en este equipo
     (automatizacion COM, requiere 'pip install pywin32').
 
-    Sale desde la cuenta predeterminada de Outlook, o desde
-    config['remitente'] si se indica (buzon compartido o alias con permiso
-    'Enviar como'). Outlook debe poder abrirse con el usuario que ejecuta la
+    Sale desde la cuenta predeterminada del perfil de Outlook. Con
+    config['outlook_cuenta'] (direccion de correo) se elige otra cuenta del
+    mismo perfil; con config['remitente'] se envia "en nombre de" un buzon
+    compartido o alias con permiso. Para una cuenta normal, 'remitente' debe
+    ir vacio. Outlook debe poder abrirse con el usuario que ejecuta la
     tarea programada.
 
+    'Send()' solo deja el mensaje en la Bandeja de salida: no garantiza que
+    haya salido. Por eso se lanza un envio/recepcion y se espera hasta
+    config['outlook_espera_segundos'] a que el mensaje salga de la Bandeja
+    de salida. Si no sale, se retira de ella (para no duplicarlo si el proceso
+    se reintenta) y se devuelve False.
+
     Args:
-        config: diccionario de configuracion ('remitente' opcional).
+        config: diccionario de configuracion ('remitente', 'outlook_cuenta'
+            y 'outlook_espera_segundos').
         destinatarios: lista de direcciones de destino.
         asunto: asunto del mensaje.
         cuerpo: texto plano del mensaje.
         adjunto: ruta de un fichero a adjuntar, o None.
 
     Returns:
-        True si Outlook acepto el mensaje. False si fallo.
+        True si el mensaje salio de la Bandeja de salida. False si fallo o
+        no salio a tiempo.
     """
     try:
         import win32com.client
@@ -1200,19 +1215,203 @@ def enviar_correo_outlook(config, destinatarios, asunto, cuerpo, adjunto=None):
 
     try:
         outlook = win32com.client.Dispatch("Outlook.Application")
+        espacio = outlook.GetNamespace("MAPI")
+        cuentas = _cuentas_outlook(espacio)
+        log.info("        Outlook: cuentas del perfil: %s", ", ".join(c[0] for c in cuentas) or "(ninguna)")
+
         mensaje = outlook.CreateItem(0)   # 0 = olMailItem
         mensaje.To = "; ".join(destinatarios)
         mensaje.Subject = asunto
         mensaje.Body = cuerpo
+        if config.get('outlook_cuenta'):
+            cuenta = [c[1] for c in cuentas if c[0].lower() == config['outlook_cuenta'].lower()]
+            if not cuenta:
+                log.error("        La cuenta '%s' no esta en el perfil de Outlook", config['outlook_cuenta'])
+                return False
+            mensaje.SendUsingAccount = cuenta[0]
         if config.get('remitente'):
             mensaje.SentOnBehalfOfName = config['remitente']
         if adjunto:
             mensaje.Attachments.Add(str(Path(adjunto).resolve()))
+
+        en_salida_antes = set(_ids_en_carpeta(espacio, 4, asunto))   # 4 = olFolderOutbox
+        enviados_antes = set(_ids_en_carpeta(espacio, 5, asunto))    # 5 = olFolderSentMail
         mensaje.Send()
+        try:
+            espacio.SendAndReceive(False)   # fuerza el envio ahora, sin esperar al ciclo de Outlook
+        except Exception:
+            pass
+
+        limite = time.time() + config['outlook_espera_segundos']
+        while True:
+            pendientes = [i for i in _ids_en_carpeta(espacio, 4, asunto) if i not in en_salida_antes]
+            if not pendientes:
+                break
+            if time.time() > limite:
+                for entrada in pendientes:
+                    try:
+                        espacio.GetItemFromID(entrada).Delete()
+                    except Exception:
+                        pass
+                log.error("        El correo no salio de la Bandeja de salida en %d s (Outlook sin "
+                          "conexion, en pausa o bloqueado por un aviso). Se ha retirado de la "
+                          "Bandeja de salida para no duplicarlo; se reintentara", config['outlook_espera_segundos'])
+                return False
+            time.sleep(1)
+
+        if set(_ids_en_carpeta(espacio, 5, asunto)) - enviados_antes:
+            log.info("        Outlook lo ha enviado y esta en Elementos enviados")
+        else:
+            log.warning("        Outlook lo ha enviado, pero aun no aparece en Elementos enviados "
+                        "(puede tardar, o guardarse en otra cuenta/carpeta: revisa 'remitente')")
         return True
     except Exception as e:
         log.error("        No se pudo enviar con Outlook: %s", e)
         return False
+
+
+def _cuentas_outlook(espacio):
+    """
+    Lista las cuentas de correo del perfil de Outlook.
+
+    Args:
+        espacio: objeto Namespace MAPI de Outlook.
+
+    Returns:
+        Lista de tuplas (direccion_smtp, objeto_cuenta). Vacia si no se
+        pueden leer.
+    """
+    cuentas = []
+    try:
+        for i in range(1, espacio.Accounts.Count + 1):
+            cuenta = espacio.Accounts.Item(i)
+            cuentas.append((str(cuenta.SmtpAddress), cuenta))
+    except Exception:
+        pass
+    return cuentas
+
+
+def _ids_en_carpeta(espacio, carpeta, asunto):
+    """
+    Identificadores de los mensajes con un asunto dado en una carpeta
+    predeterminada de Outlook.
+
+    Args:
+        espacio: objeto Namespace MAPI de Outlook.
+        carpeta: codigo de carpeta de Outlook (4 = Bandeja de salida,
+            5 = Elementos enviados).
+        asunto: asunto exacto a buscar.
+
+    Returns:
+        Lista de EntryID de los mensajes que coinciden.
+    """
+    ids = []
+    elementos = espacio.GetDefaultFolder(carpeta).Items
+    for k in range(1, elementos.Count + 1):
+        try:
+            elemento = elementos.Item(k)
+            if elemento.Subject == asunto:
+                ids.append(elemento.EntryID)
+        except Exception:
+            continue
+    return ids
+
+
+def diagnosticar_outlook(config):
+    """
+    Muestra que Outlook ve realmente la automatizacion: si se conecta a uno
+    YA ABIERTO en pantalla o lanza uno nuevo en segundo plano, que buzones
+    tiene el perfil, cual es el buzon por defecto, y el contenido reciente
+    de Elementos enviados y de la Bandeja de salida.
+
+    Sirve para el caso de que el script diga "enviado" pero el correo no
+    aparezca en ningun sitio: normalmente significa que la automatizacion
+    esta usando un Outlook o un perfil distinto del que el usuario tiene
+    abierto en su pantalla. No envia nada.
+
+    Args:
+        config: diccionario de configuracion ('outlook_cuenta', 'remitente').
+
+    Returns:
+        No devuelve nada (escribe en el log).
+    """
+    try:
+        import win32com.client
+    except ImportError:
+        log.error("Falta pywin32 para usar Outlook (pip install pywin32)")
+        return
+
+    ya_abierto = True
+    try:
+        outlook = win32com.client.GetActiveObject("Outlook.Application")
+    except Exception:
+        ya_abierto = False
+        try:
+            outlook = win32com.client.Dispatch("Outlook.Application")
+        except Exception as e:
+            log.error("No se pudo abrir Outlook: %s", e)
+            return
+
+    try:
+        log.info("Version de Outlook: %s", outlook.Version)
+    except Exception:
+        pass
+
+    if ya_abierto:
+        log.info("Conectado a un Outlook YA ABIERTO en este equipo (el mismo que ves en pantalla)")
+    else:
+        log.warning("No habia ningun Outlook abierto: la automatizacion ha lanzado UNO NUEVO en "
+                    "segundo plano, sin ventana visible")
+        log.warning("Si tu Outlook habitual esta abierto aparte, es muy probable que sean sesiones "
+                    "distintas: revisa si usas 'Nuevo Outlook' (no compatible con este metodo, hace "
+                    "falta el Outlook clasico) o si tienes mas de un perfil de Outlook en el equipo")
+
+    espacio = outlook.GetNamespace("MAPI")
+
+    try:
+        log.info("Usuario actual del perfil: %s <%s>",
+                 espacio.CurrentUser.Name, espacio.CurrentUser.Address)
+    except Exception:
+        pass
+
+    try:
+        id_por_defecto = espacio.DefaultStore.StoreID
+        log.info("Buzones (almacenes) del perfil:")
+        for tienda in espacio.Stores:
+            marca = "  <- POR DEFECTO (aqui escribe la automatizacion)" if tienda.StoreID == id_por_defecto else ""
+            log.info("  - %s%s", tienda.DisplayName, marca)
+    except Exception as e:
+        log.warning("No se pudieron listar los buzones del perfil: %s", e)
+
+    cuentas = _cuentas_outlook(espacio)
+    log.info("Cuentas de correo configuradas: %s", ", ".join(c[0] for c in cuentas) or "(ninguna)")
+    if config.get('outlook_cuenta'):
+        if config['outlook_cuenta'].lower() in (c[0].lower() for c in cuentas):
+            log.info("'outlook_cuenta' (%s) SI esta en el perfil", config['outlook_cuenta'])
+        else:
+            log.error("'outlook_cuenta' (%s) NO esta en el perfil: los envios fallarian",
+                      config['outlook_cuenta'])
+    else:
+        log.info("'outlook_cuenta' no esta fijada: se usa el buzon por defecto de arriba")
+
+    for nombre, codigo in [("Elementos enviados", 5), ("Bandeja de salida", 4)]:
+        try:
+            carpeta = espacio.GetDefaultFolder(codigo)
+            elementos = carpeta.Items
+            total = elementos.Count
+            log.info("%s: %s (%d elemento(s))", nombre, carpeta.FolderPath, total)
+            try:
+                elementos.Sort("[CreationTime]", True)
+            except Exception:
+                pass
+            for k in range(1, min(total, 5) + 1):
+                try:
+                    e = elementos.Item(k)
+                    log.info("    - %s | %s", getattr(e, 'CreationTime', '?'), e.Subject)
+                except Exception:
+                    continue
+        except Exception as e:
+            log.warning("No se pudo leer '%s': %s", nombre, e)
 
 
 def probar_correo(config, direccion):
@@ -1504,6 +1703,9 @@ def main():
     parser.add_argument('--probar-correo', metavar='DIRECCION',
                         help="envia un correo de prueba a esa direccion (sin usar Tableau) "
                              "para comprobar el metodo de envio")
+    parser.add_argument('--diagnostico-outlook', action='store_true',
+                        help="muestra que perfil/buzon de Outlook usa la automatizacion y el "
+                             "contenido reciente de Elementos enviados; no envia nada")
     parser.add_argument('--aviso', action='store_true',
                         help="envia a 'destinatarios_aviso' la lista de informes que no salieron "
                              "(usar solo en la ultima ejecucion del dia)")
@@ -1511,6 +1713,10 @@ def main():
 
     inicio = time.time()
     config = cargar_config(args.config, args.metodo_correo)
+
+    if args.diagnostico_outlook:
+        diagnosticar_outlook(config)
+        return
 
     if args.probar_correo:
         sys.exit(0 if probar_correo(config, args.probar_correo) else 1)

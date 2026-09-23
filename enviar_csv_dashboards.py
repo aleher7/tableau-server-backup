@@ -2,31 +2,26 @@
 ENVIO DIARIO POR CORREO DE TABLAS DE TABLEAU EN CSV
 ====================================================
 
-Flujo, para cada informe de la lista 'informes' de config_envio.json (por su
+Flujo, para la lista 'informes' de config_envio.json (cada uno por su
 'nombre', localizado en Tableau dentro de la carpeta 'proyecto_ruta'):
-    1. Consulta a la Metadata API de Tableau la fecha de actualizacion de las
-       fuentes de datos de las que depende el workbook (extractLastRefreshTime
-       / extractLastUpdateTime).
-    2. Si esa fecha es HOY  -> descarga la tabla en CSV, lista para enviar.
-       Si no es hoy         -> NO se envia (la carga del dia no ha llegado o
-                               ha fallado) y se anota en el log.
-       Con varias fuentes de datos, todas deben estar actualizadas hoy.
+    1. Los 8 informes comparten la misma fuente de datos, asi que su fecha
+       de actualizacion se comprueba UNA sola vez (consultando la Metadata
+       API con el primer informe pendiente), no una vez por informe.
        Si el workbook lee EN VIVO de una base de datos (Tableau no guarda
        fecha de refresco), se busca a traves de sus tablas de origen: se toma
        el extracto publicado mas reciente que se alimenta de esas mismas
-       tablas, dejando aviso en el log. Sin configuracion por informe.
-    3. Los 8 informes comparten la misma fuente de datos: si en esta pasada
-       ALGUN informe se descarta por no estar actualizado a hoy, no se envia
-       NINGUN correo, bajo ninguna circunstancia -- ni siquiera con los
-       informes que si estaban listos. Se reintentan todos juntos en la
-       siguiente pasada, cuando la fuente ya este al dia para todos.
-    4. Si (y solo si) NINGUN informe se descarto por fecha, los que quedaron
-       listos se agrupan por destinatarios y se envian en el MENOR numero de
+       tablas, dejando aviso en el log.
+    2. Si esa fecha NO es HOY (la carga del dia no ha llegado o ha fallado),
+       no se descarga ni se envia nada, bajo ninguna circunstancia: se anota
+       en el log y se reintenta todo junto en la siguiente pasada.
+    3. Si es HOY, se descarga la tabla en CSV de cada uno de los 8 informes
+       (misma disposicion visual que el dashboard) y los que quedan listos
+       se agrupan por destinatarios y se envian en el MENOR numero de
        correos posible (uno por grupo, con todos sus CSV adjuntos), siempre
-       por Microsoft Graph. Si alguno de los informes fallo por un problema
-       TECNICO (no por fecha), el correo de ese grupo incluye un aviso con su
-       nombre y que se reintentara mas tarde; esto no bloquea el envio de los
-       demas.
+       por Microsoft Graph. Si alguno de los informes falla por un problema
+       TECNICO al descargarlo (no por fecha, que ya se sabe que esta bien),
+       el correo de ese grupo incluye un aviso con su nombre y que se
+       reintentara mas tarde; esto no bloquea el envio de los demas.
 
 El script es idempotente por dia: guarda en estado_envios.json que informes
 ya se enviaron hoy y no los repite. Por eso la tarea programada puede
@@ -980,18 +975,23 @@ def probar_correo(config, direccion):
 # PROCESO DE UN INFORME
 # ============================================================================
 
-def preparar_informe(servidor, config, informe, hoy):
+def preparar_informe(servidor, config, informe, hoy, fecha=None):
     """
-    Descarga un informe, comprueba su fecha y, si esta al dia, genera su
-    CSV. No envia nada: main() agrupa los informes que preparar_informe()
-    deja listos en la misma pasada y los manda en el menor numero de
-    correos posible (ver enviar_lote).
+    Descarga un informe y, si esta al dia, genera su CSV. No envia nada:
+    main() agrupa los informes que preparar_informe() deja listos en la
+    misma pasada y los manda en el menor numero de correos posible (ver
+    enviar_lote).
 
     Args:
         servidor: objeto Server ya autenticado.
         config: diccionario de configuracion.
         informe: diccionario del informe (una entrada de 'informes').
         hoy: objeto date del dia de envio.
+        fecha: fecha de actualizacion ya comprobada (los 8 informes
+            comparten la misma fuente, asi que main() la comprueba UNA sola
+            vez y la pasa aqui para los demas, sin repetir la consulta a la
+            Metadata API por cada informe). Si es None, se comprueba aqui
+            mismo (uso suelto, p.ej. desde procesar_informe).
 
     Returns:
         Tupla (estado, ruta). estado es uno de: 'listo' (con la ruta del
@@ -1005,15 +1005,16 @@ def preparar_informe(servidor, config, informe, hoy):
     # no hace falta bajar nada.
     try:
         vista, workbook_luid = localizar_vista(servidor, config, informe)
-        fecha = fecha_actualizacion_fuentes(servidor, workbook_luid)
         if fecha is None:
-            log.error("        No se puede comprobar la fecha de actualizacion de este workbook")
-            log.error("        Ejecuta con --diagnostico para ver de donde salen sus datos")
-            return 'error', None
-        if fecha != hoy:
-            log.warning("        DESCARTADO: datos actualizados el %s, no el %s",
-                        fecha.strftime('%d/%m/%Y'), hoy.strftime('%d/%m/%Y'))
-            return 'descartado', None
+            fecha = fecha_actualizacion_fuentes(servidor, workbook_luid)
+            if fecha is None:
+                log.error("        No se puede comprobar la fecha de actualizacion de este workbook")
+                log.error("        Ejecuta con --diagnostico para ver de donde salen sus datos")
+                return 'error', None
+            if fecha != hoy:
+                log.warning("        DESCARTADO: datos actualizados el %s, no el %s",
+                            fecha.strftime('%d/%m/%Y'), hoy.strftime('%d/%m/%Y'))
+                return 'descartado', None
         contenido_excel = descargar_excel_bytes(servidor, vista, config['cache_maxima_minutos'])
     except Exception as e:
         log.error("        Error al consultar Tableau: %s", e)
@@ -1255,57 +1256,66 @@ def main():
         if i['nombre'] in ya_enviados:
             log.info("[ya enviado hoy] %s", i['nombre'])
 
-    resultados = {'enviado': [], 'descartado': [], 'error': [], 'bloqueado': []}
+    resultados = {'enviado': [], 'descartado': [], 'error': []}
     if pendientes:
         servidor = conectar_tableau(config)
-        listos = []     # [(informe, ruta), ...] listos para enviar en esta pasada
-        fallidos = []   # informes con error tecnico en esta pasada
-        for numero, informe in enumerate(pendientes, start=1):
-            log.info("[%d/%d] %s", numero, len(pendientes), informe['nombre'])
-            estado_informe, ruta = preparar_informe(servidor, config, informe, hoy)
-            if estado_informe == 'listo':
-                if enviar:
-                    listos.append((informe, ruta))
-                else:
-                    log.info("        (modo --sin-enviar) CSV generado en %s", ruta)
-                    resultados['enviado'].append(informe['nombre'])
-            else:
-                resultados[estado_informe].append(informe['nombre'])
-                if estado_informe == 'error':
-                    fallidos.append(informe)
         try:
-            servidor.auth.sign_out()
-        except Exception:
-            pass
+            # Los 8 informes comparten la misma fuente de datos: se comprueba
+            # su fecha UNA sola vez, con el primer informe pendiente, en vez
+            # de una consulta a la Metadata API por cada uno de los 8.
+            informe_referencia = pendientes[0]
+            fecha_fuente = None
+            try:
+                _, workbook_referencia = localizar_vista(servidor, config, informe_referencia)
+                fecha_fuente = fecha_actualizacion_fuentes(servidor, workbook_referencia)
+            except Exception as e:
+                log.error("No se pudo comprobar la fecha de la fuente compartida (via '%s'): %s",
+                          informe_referencia['nombre'], e)
 
-        # Los 8 informes comparten la misma fuente de datos: si alguno se ha
-        # descartado por no estar actualizado a hoy, la fuente en su conjunto
-        # no esta lista, y no se envia NINGUN correo esta pasada -- ni
-        # siquiera con los informes que si salieron bien. Se reintentaran
-        # todos juntos en la siguiente pasada, cuando la fuente ya este al
-        # dia para todos.
-        if listos and resultados['descartado']:
-            log.warning("        BLOQUEADO: la fuente compartida aun no esta actualizada a hoy "
-                        "(%s) -- no se envia ningun correo esta pasada, aunque %d informe(s) "
-                        "estuvieran listos", ", ".join(resultados['descartado']), len(listos))
-            resultados['bloqueado'] = [informe['nombre'] for informe, _ in listos]
-            listos = []
-        elif not enviar and resultados['enviado'] and resultados['descartado']:
-            log.warning("        (modo --sin-enviar) en un envio real, estos %d informe(s) NO se "
-                        "enviarian: la fuente compartida aun no esta actualizada a hoy (%s)",
-                        len(resultados['enviado']), ", ".join(resultados['descartado']))
+            if fecha_fuente is None:
+                log.error("No se puede comprobar la fecha de actualizacion de la fuente compartida")
+                log.error("Ejecuta con --diagnostico para ver de donde salen los datos")
+                resultados['error'].extend(i['nombre'] for i in pendientes)
+            elif fecha_fuente != hoy:
+                log.warning("DESCARTADO: la fuente compartida esta actualizada el %s, no el %s -- "
+                            "no se envia ningun correo esta pasada", fecha_fuente.strftime('%d/%m/%Y'),
+                            hoy.strftime('%d/%m/%Y'))
+                resultados['descartado'].extend(i['nombre'] for i in pendientes)
+            else:
+                log.info("Fuente compartida actualizada correctamente (%s)",
+                        fecha_fuente.strftime('%d/%m/%Y'))
+                listos = []     # [(informe, ruta), ...] listos para enviar en esta pasada
+                fallidos = []   # informes con error tecnico en esta pasada
+                for numero, informe in enumerate(pendientes, start=1):
+                    log.info("[%d/%d] %s", numero, len(pendientes), informe['nombre'])
+                    estado_informe, ruta = preparar_informe(servidor, config, informe, hoy, fecha_fuente)
+                    if estado_informe == 'listo':
+                        if enviar:
+                            listos.append((informe, ruta))
+                        else:
+                            log.info("        (modo --sin-enviar) CSV generado en %s", ruta)
+                            resultados['enviado'].append(informe['nombre'])
+                    else:
+                        resultados[estado_informe].append(informe['nombre'])
+                        if estado_informe == 'error':
+                            fallidos.append(informe)
 
-        # Se agrupan aqui, tras cerrar la sesion de Tableau: el envio de
-        # correo no necesita ya ninguna conexion con Tableau.
-        if listos:
-            resultados_envio = enviar_lote(config, listos, hoy, fallidos, estado, hoy_txt)
-            for nombre, resultado in resultados_envio.items():
-                resultados[resultado].append(nombre)
+                # Se agrupan aqui: el envio de correo no necesita conexion
+                # con Tableau, pero se hace dentro del 'try' para cerrar la
+                # sesion despues, ya se haya podido enviar o no.
+                if listos:
+                    resultados_envio = enviar_lote(config, listos, hoy, fallidos, estado, hoy_txt)
+                    for nombre, resultado in resultados_envio.items():
+                        resultados[resultado].append(nombre)
+        finally:
+            try:
+                servidor.auth.sign_out()
+            except Exception:
+                pass
 
     log.info("=" * 60)
-    log.info("RESUMEN: enviados %d | descartados por fecha %d | bloqueados (fuente no lista) %d | "
-             "errores %d | ya enviados hoy %d | %ds",
-             len(resultados['enviado']), len(resultados['descartado']), len(resultados['bloqueado']),
+    log.info("RESUMEN: enviados %d | descartados por fecha %d | errores %d | ya enviados hoy %d | %ds",
+             len(resultados['enviado']), len(resultados['descartado']),
              len(resultados['error']), len(ya_enviados), int(time.time() - inicio))
     log.info("=" * 60)
 

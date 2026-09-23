@@ -4,15 +4,10 @@
   "tableau_token": "<igual>",
   "tableau_site": "<igual>",
 
-  "metodo_correo": "outlook",
-  "remitente": "",
-
-  "smtp_servidor": "<solo si usas SMTP: servidor que te den en IT>",
-  "smtp_puerto": 587,
-  "smtp_starttls": true,
-  "smtp_ssl": false,
-  "smtp_usuario": "",
-  "smtp_password": "",
+  "graph_tenant_id": "<datos de la aplicacion que registre IT>",
+  "graph_client_id": "",
+  "graph_client_secret": "",
+  "graph_remitente": "<buzon (UPN) autorizado a enviar, p. ej. envio.csv@cantabrialabs.es>",
 
   "destinatarios": ["cliente@example.com"],
   "destinatarios_aviso": ["tu.correo@example.com"],

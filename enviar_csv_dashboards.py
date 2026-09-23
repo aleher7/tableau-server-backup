@@ -7,7 +7,7 @@ Flujo, para cada informe de la lista 'informes' de config_envio.json:
        fuentes de datos de las que depende el workbook (extractLastRefreshTime
        / extractLastUpdateTime). Si un informe indica 'fecha_columna', la
        fecha se lee en cambio de esa columna de la propia tabla.
-    2. Si esa fecha es HOY  -> descarga la tabla en CSV y la envia por correo.
+    2. Si esa fecha es HOY  -> descarga la tabla en CSV, lista para enviar.
        Si no es hoy         -> NO se envia (la carga del dia no ha llegado o
                                ha fallado) y se anota en el log.
        Con varias fuentes de datos, todas deben estar actualizadas hoy.
@@ -15,6 +15,11 @@ Flujo, para cada informe de la lista 'informes' de config_envio.json:
        fecha de refresco), se busca a traves de sus tablas de origen: se toma
        el extracto publicado mas reciente que se alimenta de esas mismas
        tablas, dejando aviso en el log. Sin configuracion por informe.
+    3. Los informes listos en esta pasada se agrupan por destinatarios y se
+       envian en el MENOR numero de correos posible (uno por grupo, con
+       todos sus CSV adjuntos), siempre por Microsoft Graph. Si alguno de
+       los informes fallo por un problema tecnico, el correo de ese grupo
+       incluye un aviso con su nombre y que se reintentara mas tarde.
 
 El script es idempotente por dia: guarda en estado_envios.json que informes
 ya se enviaron hoy y no los repite. Por eso la tarea programada puede
@@ -32,20 +37,16 @@ Uso:
     python enviar_csv_dashboards.py --crosstab-excel "CdM SRI Marca MTD"
                                                         # prueba: baja ese informe
                                                         # como Excel (crosstab)
-    python enviar_csv_dashboards.py --probar-correo tu@correo.com --metodo-correo smtp
+    python enviar_csv_dashboards.py --probar-correo tu@correo.com
                                                         # prueba solo el envio de
-                                                        # correo (sin Tableau); tambien
-                                                        # vale 'outlook' o 'graph'
-    python enviar_csv_dashboards.py --diagnostico-outlook
-                                                        # con Outlook: que perfil/buzon
-                                                        # usa la automatizacion
+                                                        # correo por Graph (sin Tableau)
     python enviar_csv_dashboards.py --forzar            # ignora lo ya enviado
     python enviar_csv_dashboards.py --aviso             # ultima pasada del dia:
                                                         # avisa al equipo de lo
                                                         # que no salio
 
 Codigo de salida: 0 si todo fue bien (incluidos los informes descartados por
-fecha, que es un caso normal), 1 si hubo errores tecnicos (Tableau, SMTP...).
+fecha, que es un caso normal), 1 si hubo errores tecnicos (Tableau, Graph...).
 """
 
 import re
@@ -56,15 +57,12 @@ import time
 import base64
 import logging
 import unicodedata
-import smtplib
 import argparse
-import mimetypes
 import requests
 from io import BytesIO, StringIO
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from datetime import datetime, date
-from email.message import EmailMessage
 
 
 # ============================================================================
@@ -89,19 +87,9 @@ log = logging.getLogger(__name__)
 
 CLAVES_TABLEAU = ['tableau_server', 'tableau_token_name', 'tableau_token', 'tableau_site']
 CLAVES_CORREO = ['destinatarios']
-CLAVES_SMTP = ['smtp_servidor', 'remitente']
 CLAVES_GRAPH = ['graph_tenant_id', 'graph_client_id', 'graph_remitente']
-METODOS_CORREO = ('outlook', 'smtp', 'graph')
 CLAVES_OPCIONALES = {
-    'metodo_correo': 'outlook',
-    'remitente': '',
-    'outlook_cuenta': '',
-    'outlook_perfil': '',
-    'outlook_espera_segundos': 30,
-    'graph_tenant_id': '',
-    'graph_client_id': '',
     'graph_client_secret': '',
-    'graph_remitente': '',
     'directorio_salida': './csv_generados',
     'archivo_estado': './estado_envios.json',
     'csv_separador': ';',
@@ -111,11 +99,6 @@ CLAVES_OPCIONALES = {
     'origen_datos': 'csv',
     'rellenar_etiquetas': True,
     'separador_miles': False,
-    'smtp_puerto': 25,
-    'smtp_starttls': False,
-    'smtp_ssl': False,
-    'smtp_usuario': '',
-    'smtp_password': '',
     'destinatarios_aviso': [],
     # Formatos con los que se intenta interpretar la fecha de actualizacion
     # que devuelve Tableau (depende del idioma de la cuenta que exporta).
@@ -123,14 +106,12 @@ CLAVES_OPCIONALES = {
 }
 
 
-def cargar_config(fichero, metodo_correo=None):
+def cargar_config(fichero):
     """
     Carga config_envio.json, aplica valores por defecto y valida.
 
     Args:
         fichero: ruta del fichero de configuracion.
-        metodo_correo: si se indica ('outlook', 'smtp' o 'graph'), sustituye
-            al 'metodo_correo' del fichero solo en esta ejecucion.
 
     Returns:
         Diccionario de configuracion validado. Si algo falta o esta mal, el
@@ -150,35 +131,23 @@ def cargar_config(fichero, metodo_correo=None):
     for clave, valor in CLAVES_OPCIONALES.items():
         config.setdefault(clave, valor)
 
-    if metodo_correo:
-        config['metodo_correo'] = metodo_correo
-
-    if config['metodo_correo'] not in METODOS_CORREO:
-        log.error("'metodo_correo' debe ser 'outlook', 'smtp' o 'graph'")
-        sys.exit(1)
-
     origenes = [config['origen_datos']] + [i['origen_datos'] for i in config.get('informes', [])
                                            if 'origen_datos' in i]
     if any(o not in ('csv', 'crosstab') for o in origenes):
         log.error("'origen_datos' debe ser 'csv' o 'crosstab'")
         sys.exit(1)
 
-    obligatorias = CLAVES_TABLEAU + CLAVES_CORREO + ['informes']
-    if config['metodo_correo'] == 'smtp':
-        obligatorias += CLAVES_SMTP
-    elif config['metodo_correo'] == 'graph':
-        obligatorias += CLAVES_GRAPH
+    obligatorias = CLAVES_TABLEAU + CLAVES_CORREO + CLAVES_GRAPH + ['informes']
     faltan = [c for c in obligatorias if c not in config or config[c] in ('', [])]
     if faltan:
         log.error("Faltan claves obligatorias en %s: %s", fichero, ", ".join(faltan))
         sys.exit(1)
 
-    if config['metodo_correo'] == 'graph':
-        import os
-        if not config['graph_client_secret'] and not os.environ.get('GRAPH_CLIENT_SECRET'):
-            log.error("Falta 'graph_client_secret' en %s (o la variable de entorno "
-                      "GRAPH_CLIENT_SECRET)", fichero)
-            sys.exit(1)
+    import os
+    if not config['graph_client_secret'] and not os.environ.get('GRAPH_CLIENT_SECRET'):
+        log.error("Falta 'graph_client_secret' en %s (o la variable de entorno "
+                  "GRAPH_CLIENT_SECRET)", fichero)
+        sys.exit(1)
 
     if not config['informes']:
         log.error("La lista 'informes' esta vacia")
@@ -1175,27 +1144,25 @@ def fecha_actualizacion_fuentes(servidor, workbook_luid):
 # CORREO
 # ============================================================================
 
-def enviar_correo(config, destinatarios, asunto, cuerpo, adjunto=None):
+def enviar_correo(config, destinatarios, asunto, cuerpo, adjuntos=None):
     """
-    Envia un correo con el metodo de config['metodo_correo'] ('outlook' por
-    defecto, o 'smtp' o 'graph').
+    Envia un correo con Microsoft Graph. Punto unico de envio del script:
+    el resto del codigo llama siempre a esta funcion, nunca directamente a
+    enviar_correo_graph.
 
     Args:
         config: diccionario de configuracion.
         destinatarios: lista de direcciones de destino.
         asunto: asunto del mensaje.
         cuerpo: texto plano del mensaje.
-        adjunto: ruta de un fichero a adjuntar, o None.
+        adjuntos: lista de rutas de ficheros a adjuntar (un correo puede
+            llevar varios, p. ej. un informe por cada uno). None o lista
+            vacia si no lleva ninguno.
 
     Returns:
-        True si el correo se envio (o se dejo en la cola de Outlook). False
-        si fallo.
+        True si Microsoft Graph acepto el envio. False si fallo.
     """
-    if config['metodo_correo'] == 'smtp':
-        return enviar_correo_smtp(config, destinatarios, asunto, cuerpo, adjunto)
-    if config['metodo_correo'] == 'graph':
-        return enviar_correo_graph(config, destinatarios, asunto, cuerpo, adjunto)
-    return enviar_correo_outlook(config, destinatarios, asunto, cuerpo, adjunto)
+    return enviar_correo_graph(config, destinatarios, asunto, cuerpo, adjuntos)
 
 
 def obtener_token_graph(config):
@@ -1236,7 +1203,7 @@ def obtener_token_graph(config):
     return respuesta.json()['access_token']
 
 
-def enviar_correo_graph(config, destinatarios, asunto, cuerpo, adjunto=None):
+def enviar_correo_graph(config, destinatarios, asunto, cuerpo, adjuntos=None):
     """
     Envia un correo con Microsoft Graph (API REST): no usa Outlook ni SMTP,
     asi que no depende de ningun perfil ni aviso de seguridad de escritorio.
@@ -1253,7 +1220,7 @@ def enviar_correo_graph(config, destinatarios, asunto, cuerpo, adjunto=None):
         destinatarios: lista de direcciones de destino.
         asunto: asunto del mensaje.
         cuerpo: texto plano del mensaje.
-        adjunto: ruta de un fichero a adjuntar, o None.
+        adjuntos: lista de rutas de ficheros a adjuntar, o None.
 
     Returns:
         True si Microsoft Graph acepto el envio. False si fallo.
@@ -1267,13 +1234,12 @@ def enviar_correo_graph(config, destinatarios, asunto, cuerpo, adjunto=None):
         'body': {'contentType': 'Text', 'content': cuerpo},
         'toRecipients': [{'emailAddress': {'address': d}} for d in destinatarios],
     }
-    if adjunto:
-        adjunto = Path(adjunto)
+    if adjuntos:
         mensaje['attachments'] = [{
             '@odata.type': '#microsoft.graph.fileAttachment',
-            'name': adjunto.name,
-            'contentBytes': base64.b64encode(adjunto.read_bytes()).decode('ascii'),
-        }]
+            'name': Path(a).name,
+            'contentBytes': base64.b64encode(Path(a).read_bytes()).decode('ascii'),
+        } for a in adjuntos]
 
     url = f"https://graph.microsoft.com/v1.0/users/{config['graph_remitente']}/sendMail"
     cabeceras = {'Authorization': f"Bearer {token}", 'Content-Type': 'application/json'}
@@ -1296,325 +1262,13 @@ def enviar_correo_graph(config, destinatarios, asunto, cuerpo, adjunto=None):
     return True
 
 
-def enviar_correo_outlook(config, destinatarios, asunto, cuerpo, adjunto=None):
-    """
-    Envia un correo con el Outlook de escritorio instalado en este equipo
-    (automatizacion COM, requiere 'pip install pywin32').
-
-    Sale desde la cuenta predeterminada del perfil de Outlook. Con
-    config['outlook_cuenta'] (direccion de correo) se elige otra cuenta del
-    mismo perfil; con config['remitente'] se envia "en nombre de" un buzon
-    compartido o alias con permiso. Para una cuenta normal, 'remitente' debe
-    ir vacio. Outlook debe poder abrirse con el usuario que ejecuta la
-    tarea programada.
-
-    'Send()' solo deja el mensaje en la Bandeja de salida: no garantiza que
-    haya salido. Por eso se lanza un envio/recepcion y se espera hasta
-    config['outlook_espera_segundos'] a que el mensaje salga de la Bandeja
-    de salida. Si no sale, se retira de ella (para no duplicarlo si el proceso
-    se reintenta) y se devuelve False.
-
-    Args:
-        config: diccionario de configuracion ('remitente', 'outlook_cuenta'
-            y 'outlook_espera_segundos').
-        destinatarios: lista de direcciones de destino.
-        asunto: asunto del mensaje.
-        cuerpo: texto plano del mensaje.
-        adjunto: ruta de un fichero a adjuntar, o None.
-
-    Returns:
-        True si el mensaje salio de la Bandeja de salida. False si fallo o
-        no salio a tiempo.
-    """
-    try:
-        import win32com.client
-    except ImportError:
-        log.error("        Falta pywin32 para usar Outlook (pip install pywin32)")
-        return False
-
-    # Cada paso se prueba por separado y con su propio mensaje: un error
-    # generico de COM ("Error en la operacion", sin mas detalle) no dice en
-    # que paso ha fallado si se captura todo junto.
-    try:
-        outlook = win32com.client.Dispatch("Outlook.Application")
-        espacio = outlook.GetNamespace("MAPI")
-    except Exception as e:
-        log.error("        No se pudo abrir Outlook: %s", e)
-        return False
-
-    if not entrar_en_perfil_outlook(espacio, config.get('outlook_perfil')):
-        return False
-
-    cuentas = _cuentas_outlook(espacio)
-    log.info("        Outlook: cuentas del perfil: %s", ", ".join(c[0] for c in cuentas) or "(ninguna)")
-    if not cuentas:
-        log.error("        El perfil de Outlook no tiene ninguna cuenta de correo: el mensaje "
-                  "no llegaria a ningun sitio aunque Outlook diga que lo envio")
-        log.error("        Busca el nombre del perfil correcto (Panel de control > Correo > "
-                  "Mostrar perfiles) y fijalo con 'outlook_perfil' en la configuracion")
-        return False
-
-    try:
-        mensaje = outlook.CreateItem(0)   # 0 = olMailItem
-        mensaje.To = "; ".join(destinatarios)
-        mensaje.Subject = asunto
-        mensaje.Body = cuerpo
-        if config.get('outlook_cuenta'):
-            cuenta = [c[1] for c in cuentas if c[0].lower() == config['outlook_cuenta'].lower()]
-            if not cuenta:
-                log.error("        La cuenta '%s' no esta en el perfil de Outlook", config['outlook_cuenta'])
-                return False
-            mensaje.SendUsingAccount = cuenta[0]
-        if config.get('remitente'):
-            mensaje.SentOnBehalfOfName = config['remitente']
-    except Exception as e:
-        log.error("        No se pudo preparar el mensaje: %s", e)
-        return False
-
-    if adjunto:
-        try:
-            mensaje.Attachments.Add(str(Path(adjunto).resolve()))
-        except Exception as e:
-            log.error("        No se pudo adjuntar '%s': %s", adjunto, e)
-            return False
-
-    try:
-        en_salida_antes = set(_ids_en_carpeta(espacio, 4, asunto))   # 4 = olFolderOutbox
-        enviados_antes = set(_ids_en_carpeta(espacio, 5, asunto))    # 5 = olFolderSentMail
-    except Exception as e:
-        log.error("        No se pudo leer la Bandeja de salida / Elementos enviados: %s", e)
-        return False
-
-    try:
-        mensaje.Send()
-    except Exception as e:
-        log.error("        Outlook rechazo el envio (en mensaje.Send()): %s", e)
-        log.error("        Si nunca aparecio un aviso de seguridad en pantalla, puede ser una "
-                  "politica de 'Object Model Guard'/antivirus que BLOQUEA el envio automatizado en "
-                  "silencio en vez de preguntar: consultalo con el equipo de IT")
-        return False
-
-    try:
-        espacio.SendAndReceive(False)   # fuerza el envio ahora, sin esperar al ciclo de Outlook
-    except Exception:
-        pass
-
-    try:
-        limite = time.time() + config['outlook_espera_segundos']
-        while True:
-            pendientes = [i for i in _ids_en_carpeta(espacio, 4, asunto) if i not in en_salida_antes]
-            if not pendientes:
-                break
-            if time.time() > limite:
-                for entrada in pendientes:
-                    try:
-                        espacio.GetItemFromID(entrada).Delete()
-                    except Exception:
-                        pass
-                log.error("        El correo no salio de la Bandeja de salida en %d s (Outlook sin "
-                          "conexion, en pausa o bloqueado por un aviso). Se ha retirado de la "
-                          "Bandeja de salida para no duplicarlo; se reintentara", config['outlook_espera_segundos'])
-                return False
-            time.sleep(1)
-
-        if set(_ids_en_carpeta(espacio, 5, asunto)) - enviados_antes:
-            log.info("        Outlook lo ha enviado y esta en Elementos enviados")
-        else:
-            log.warning("        Outlook lo ha enviado, pero aun no aparece en Elementos enviados "
-                        "(puede tardar, o guardarse en otra cuenta/carpeta: revisa 'remitente')")
-        return True
-    except Exception as e:
-        log.error("        El mensaje se envio, pero no se pudo confirmar del todo: %s", e)
-        return False
-
-
-def entrar_en_perfil_outlook(espacio, perfil):
-    """
-    Fuerza la sesion de Outlook a usar un perfil concreto, por su nombre.
-
-    Sin esto, cuando la automatizacion arranca Outlook sin que hubiera
-    ninguna instancia abierta, Windows puede usar un perfil por defecto
-    distinto del que el usuario usa a diario (por ejemplo, uno vacio, sin
-    ninguna cuenta, si el usuario trabaja normalmente con 'Nuevo Outlook').
-    Ver diagnosticar_outlook() para localizar el nombre del perfil correcto.
-
-    Args:
-        espacio: objeto Namespace MAPI de Outlook.
-        perfil: nombre del perfil a usar. Si esta vacio, no hace nada (se
-            deja la sesion tal como la abrio Outlook).
-
-    Returns:
-        True si no habia que cambiar de perfil, o si el cambio funciono.
-        False si el perfil indicado no se pudo abrir.
-    """
-    if not perfil:
-        return True
-    try:
-        # Profile, Password ('' = no aplica en un perfil normal), ShowDialog,
-        # NewSession (True: fuerza una sesion nueva con este perfil, en vez
-        # de reutilizar la que Outlook ya tuviera abierta).
-        espacio.Logon(perfil, "", False, True)
-        log.info("        Outlook: sesion abierta con el perfil '%s'", perfil)
-        return True
-    except Exception as e:
-        log.error("        No se pudo abrir el perfil de Outlook '%s': %s", perfil, e)
-        return False
-
-
-def _cuentas_outlook(espacio):
-    """
-    Lista las cuentas de correo del perfil de Outlook.
-
-    Args:
-        espacio: objeto Namespace MAPI de Outlook.
-
-    Returns:
-        Lista de tuplas (direccion_smtp, objeto_cuenta). Vacia si no se
-        pueden leer.
-    """
-    cuentas = []
-    try:
-        for i in range(1, espacio.Accounts.Count + 1):
-            cuenta = espacio.Accounts.Item(i)
-            cuentas.append((str(cuenta.SmtpAddress), cuenta))
-    except Exception:
-        pass
-    return cuentas
-
-
-def _ids_en_carpeta(espacio, carpeta, asunto):
-    """
-    Identificadores de los mensajes con un asunto dado en una carpeta
-    predeterminada de Outlook.
-
-    Args:
-        espacio: objeto Namespace MAPI de Outlook.
-        carpeta: codigo de carpeta de Outlook (4 = Bandeja de salida,
-            5 = Elementos enviados).
-        asunto: asunto exacto a buscar.
-
-    Returns:
-        Lista de EntryID de los mensajes que coinciden.
-    """
-    ids = []
-    elementos = espacio.GetDefaultFolder(carpeta).Items
-    for k in range(1, elementos.Count + 1):
-        try:
-            elemento = elementos.Item(k)
-            if elemento.Subject == asunto:
-                ids.append(elemento.EntryID)
-        except Exception:
-            continue
-    return ids
-
-
-def diagnosticar_outlook(config):
-    """
-    Muestra que Outlook ve realmente la automatizacion: si se conecta a uno
-    YA ABIERTO en pantalla o lanza uno nuevo en segundo plano, que buzones
-    tiene el perfil, cual es el buzon por defecto, y el contenido reciente
-    de Elementos enviados y de la Bandeja de salida.
-
-    Sirve para el caso de que el script diga "enviado" pero el correo no
-    aparezca en ningun sitio: normalmente significa que la automatizacion
-    esta usando un Outlook o un perfil distinto del que el usuario tiene
-    abierto en su pantalla. No envia nada.
-
-    Args:
-        config: diccionario de configuracion ('outlook_cuenta', 'remitente').
-
-    Returns:
-        No devuelve nada (escribe en el log).
-    """
-    try:
-        import win32com.client
-    except ImportError:
-        log.error("Falta pywin32 para usar Outlook (pip install pywin32)")
-        return
-
-    ya_abierto = True
-    try:
-        outlook = win32com.client.GetActiveObject("Outlook.Application")
-    except Exception:
-        ya_abierto = False
-        try:
-            outlook = win32com.client.Dispatch("Outlook.Application")
-        except Exception as e:
-            log.error("No se pudo abrir Outlook: %s", e)
-            return
-
-    try:
-        log.info("Version de Outlook: %s", outlook.Version)
-    except Exception:
-        pass
-
-    if ya_abierto:
-        log.info("Conectado a un Outlook YA ABIERTO en este equipo (el mismo que ves en pantalla)")
-    else:
-        log.warning("No habia ningun Outlook abierto: la automatizacion ha lanzado UNO NUEVO en "
-                    "segundo plano, sin ventana visible")
-        log.warning("Si tu Outlook habitual esta abierto aparte, es muy probable que sean sesiones "
-                    "distintas: revisa si usas 'Nuevo Outlook' (no compatible con este metodo, hace "
-                    "falta el Outlook clasico) o si tienes mas de un perfil de Outlook en el equipo")
-
-    espacio = outlook.GetNamespace("MAPI")
-    if not entrar_en_perfil_outlook(espacio, config.get('outlook_perfil')):
-        return
-
-    try:
-        log.info("Usuario actual del perfil: %s <%s>",
-                 espacio.CurrentUser.Name, espacio.CurrentUser.Address)
-    except Exception:
-        pass
-
-    try:
-        id_por_defecto = espacio.DefaultStore.StoreID
-        log.info("Buzones (almacenes) del perfil:")
-        for tienda in espacio.Stores:
-            marca = "  <- POR DEFECTO (aqui escribe la automatizacion)" if tienda.StoreID == id_por_defecto else ""
-            log.info("  - %s%s", tienda.DisplayName, marca)
-    except Exception as e:
-        log.warning("No se pudieron listar los buzones del perfil: %s", e)
-
-    cuentas = _cuentas_outlook(espacio)
-    log.info("Cuentas de correo configuradas: %s", ", ".join(c[0] for c in cuentas) or "(ninguna)")
-    if config.get('outlook_cuenta'):
-        if config['outlook_cuenta'].lower() in (c[0].lower() for c in cuentas):
-            log.info("'outlook_cuenta' (%s) SI esta en el perfil", config['outlook_cuenta'])
-        else:
-            log.error("'outlook_cuenta' (%s) NO esta en el perfil: los envios fallarian",
-                      config['outlook_cuenta'])
-    else:
-        log.info("'outlook_cuenta' no esta fijada: se usa el buzon por defecto de arriba")
-
-    for nombre, codigo in [("Elementos enviados", 5), ("Bandeja de salida", 4)]:
-        try:
-            carpeta = espacio.GetDefaultFolder(codigo)
-            elementos = carpeta.Items
-            total = elementos.Count
-            log.info("%s: %s (%d elemento(s))", nombre, carpeta.FolderPath, total)
-            try:
-                elementos.Sort("[CreationTime]", True)
-            except Exception:
-                pass
-            for k in range(1, min(total, 5) + 1):
-                try:
-                    e = elementos.Item(k)
-                    log.info("    - %s | %s", getattr(e, 'CreationTime', '?'), e.Subject)
-                except Exception:
-                    continue
-        except Exception as e:
-            log.warning("No se pudo leer '%s': %s", nombre, e)
-
-
 def probar_correo(config, direccion):
     """
     Envia un correo de prueba con un CSV pequeno adjunto, sin tocar Tableau,
-    para comprobar un metodo de envio (Outlook o SMTP) y su rapidez.
+    para comprobar el envio por Microsoft Graph y su rapidez.
 
     Args:
-        config: diccionario de configuracion (con el 'metodo_correo' que se
-            quiere probar).
+        config: diccionario de configuracion.
         direccion: direccion de destino de la prueba. Se pide siempre
             explicita para no mandar una prueba al cliente por error.
 
@@ -1631,87 +1285,38 @@ def probar_correo(config, direccion):
     inicio = time.time()
     correcto = enviar_correo(
         config, [direccion], "Prueba de envio - CSV Tableau",
-        "Correo de prueba del proceso de envio de CSV de Tableau.\n"
-        f"Metodo usado: {config['metodo_correo']}.", ruta)
+        "Correo de prueba del proceso de envio de CSV de Tableau.", [ruta])
     segundos = time.time() - inicio
 
     if correcto:
-        log.info("PRUEBA CORRECTA con '%s' en %.1f s: revisa la bandeja de %s "
-                 "(y si aparecio algun aviso de seguridad)", config['metodo_correo'], segundos, direccion)
+        log.info("PRUEBA CORRECTA en %.1f s: revisa la bandeja de %s", segundos, direccion)
     else:
-        log.error("PRUEBA FALLIDA con '%s' tras %.1f s", config['metodo_correo'], segundos)
+        log.error("PRUEBA FALLIDA tras %.1f s", segundos)
     return correcto
-
-
-def enviar_correo_smtp(config, destinatarios, asunto, cuerpo, adjunto=None):
-    """
-    Envia un correo por SMTP, con un CSV adjunto opcional.
-
-    No usa Outlook, asi que no aparece el aviso de seguridad. La conexion
-    puede ser sin cifrar (puerto 25), con STARTTLS ('smtp_starttls', puerto
-    587 habitual) o con SSL directo ('smtp_ssl', puerto 465). La contrasena
-    SMTP se toma de config['smtp_password'] o, si esta vacia, de la variable
-    de entorno SMTP_PASSWORD. Con un servidor que autentica (Microsoft 365,
-    Gmail...), 'remitente' debe ser el buzon con el que se inicia sesion.
-
-    Args:
-        config: diccionario de configuracion con las claves smtp_*.
-        destinatarios: lista de direcciones de destino.
-        asunto: asunto del mensaje.
-        cuerpo: texto plano del mensaje.
-        adjunto: ruta de un fichero a adjuntar, o None.
-
-    Returns:
-        True si el servidor SMTP acepto el mensaje. False si fallo.
-    """
-    import os
-
-    mensaje = EmailMessage()
-    mensaje['From'] = config['remitente']
-    mensaje['To'] = ", ".join(destinatarios)
-    mensaje['Subject'] = asunto
-    mensaje.set_content(cuerpo)
-
-    if adjunto:
-        adjunto = Path(adjunto)
-        tipo, _ = mimetypes.guess_type(adjunto.name)
-        principal, secundario = (tipo or 'text/csv').split('/', 1)
-        mensaje.add_attachment(adjunto.read_bytes(), maintype=principal,
-                               subtype=secundario, filename=adjunto.name)
-
-    try:
-        conexion = smtplib.SMTP_SSL if config['smtp_ssl'] else smtplib.SMTP
-        with conexion(config['smtp_servidor'], int(config['smtp_puerto']), timeout=60) as smtp:
-            if config['smtp_starttls'] and not config['smtp_ssl']:
-                smtp.starttls()
-            if config['smtp_usuario']:
-                smtp.login(config['smtp_usuario'],
-                           config['smtp_password'] or os.environ.get('SMTP_PASSWORD', ''))
-            smtp.send_message(mensaje)
-        return True
-    except Exception as e:
-        log.error("        No se pudo enviar el correo: %s", e)
-        return False
 
 
 # ============================================================================
 # PROCESO DE UN INFORME
 # ============================================================================
 
-def procesar_informe(servidor, config, informe, hoy, enviar):
+def preparar_informe(servidor, config, informe, hoy):
     """
-    Descarga un informe, comprueba su fecha y, si toca, lo envia.
+    Descarga un informe, comprueba su fecha y, si esta al dia, genera su
+    CSV. No envia nada: main() agrupa los informes que preparar_informe()
+    deja listos en la misma pasada y los manda en el menor numero de
+    correos posible (ver enviar_lote).
 
     Args:
         servidor: objeto Server ya autenticado.
         config: diccionario de configuracion.
         informe: diccionario del informe (una entrada de 'informes').
         hoy: objeto date del dia de envio.
-        enviar: si es False, hace todo salvo el envio real (--sin-enviar).
 
     Returns:
-        Uno de: 'enviado', 'descartado' (fecha no es hoy: caso normal),
-        'error' (fallo tecnico: Tableau, formato, SMTP).
+        Tupla (estado, ruta). estado es uno de: 'listo' (con la ruta del
+        CSV generado), 'descartado' (fecha no es hoy: caso normal, ruta
+        None), 'error' (fallo tecnico: Tableau, formato de fichero, ruta
+        None).
     """
     nombre = informe['nombre']
 
@@ -1728,18 +1333,18 @@ def procesar_informe(servidor, config, informe, hoy, enviar):
                 log.error("        No se puede comprobar la fecha de actualizacion de este workbook")
                 log.error("        Si la fecha esta dentro del dashboard, indica 'fecha_columna'. "
                           "Ejecuta con --diagnostico para ver de donde salen sus datos")
-                return 'error'
+                return 'error', None
             if fecha != hoy:
                 log.warning("        DESCARTADO: datos actualizados el %s, no el %s",
                             fecha.strftime('%d/%m/%Y'), hoy.strftime('%d/%m/%Y'))
-                return 'descartado'
+                return 'descartado', None
         if origen == 'crosstab':
             contenido_excel = descargar_excel_bytes(servidor, vista, config['cache_maxima_minutos'])
         else:
             contenido = descargar_tabla(servidor, vista, config['cache_maxima_minutos'])
     except Exception as e:
         log.error("        Error al consultar Tableau: %s", e)
-        return 'error'
+        return 'error', None
 
     ruta = Path(config['directorio_salida']) / f"{sanear_nombre_archivo(nombre)}_{hoy.isoformat()}.csv"
 
@@ -1751,10 +1356,10 @@ def procesar_informe(servidor, config, informe, hoy, enviar):
                                   informe.get('separador_miles', config['separador_miles']))
         except Exception as e:
             log.error("        No se pudo leer el Excel de Tableau: %s", e)
-            return 'error'
+            return 'error', None
         if len(tabla) < 2:
             log.warning("        La tabla llego sin filas: no se envia")
-            return 'error'
+            return 'error', None
 
         # Etiquetas de grupo (PROMO, NO PROMO...) repetidas en cada fila.
         # 'rellenar_columnas' fija cuales (por nombre de cabecera); con []
@@ -1776,13 +1381,13 @@ def procesar_informe(servidor, config, informe, hoy, enviar):
         except PermissionError:
             log.error("        No se pudo escribir %s: esta abierto en otro programa (ciérralo e "
                       "intenta de nuevo)", ruta)
-            return 'error'
-        return enviar_informe(config, informe, ruta, hoy, enviar)
+            return 'error', None
+        return 'listo', ruta
 
     columnas, filas = leer_csv(contenido)
     if not filas:
         log.warning("        La tabla llego sin filas: no se envia")
-        return 'error'
+        return 'error', None
 
     # Alternativa: la fecha esta en una columna del propio dashboard.
     if informe.get('fecha_columna'):
@@ -1791,11 +1396,11 @@ def procesar_informe(servidor, config, informe, hoy, enviar):
             log.error("        No se pudo leer la fecha de actualizacion en la columna '%s'",
                       informe['fecha_columna'])
             log.error("        Columnas recibidas: %s", ", ".join(columnas))
-            return 'error'
+            return 'error', None
         if fecha != hoy:
             log.warning("        DESCARTADO: datos actualizados el %s, no el %s",
                         fecha.strftime('%d/%m/%Y'), hoy.strftime('%d/%m/%Y'))
-            return 'descartado'
+            return 'descartado', None
 
     log.info("        Fecha de actualizacion correcta (%s), %d filas", fecha.strftime('%d/%m/%Y'), len(filas))
 
@@ -1844,40 +1449,125 @@ def procesar_informe(servidor, config, informe, hoy, enviar):
     except PermissionError:
         log.error("        No se pudo escribir %s: esta abierto en otro programa (ciérralo e "
                   "intenta de nuevo)", ruta)
-        return 'error'
-    return enviar_informe(config, informe, ruta, hoy, enviar)
+        return 'error', None
+    return 'listo', ruta
 
 
-def enviar_informe(config, informe, ruta, hoy, enviar):
+def procesar_informe(servidor, config, informe, hoy, enviar):
     """
-    Envia por correo el CSV ya generado de un informe (o, con --sin-enviar,
-    solo lo deja en disco).
+    Prepara un unico informe y, si 'enviar' es True, lo manda en su propio
+    correo. Envoltorio de conveniencia sobre preparar_informe() +
+    enviar_lote() para un solo informe (util en pruebas sueltas); main()
+    prepara varios informes y los agrupa en el menor numero de correos.
 
     Args:
+        servidor: objeto Server ya autenticado.
         config: diccionario de configuracion.
         informe: diccionario del informe (una entrada de 'informes').
-        ruta: ruta del CSV generado.
         hoy: objeto date del dia de envio.
-        enviar: si es False, no se envia nada.
+        enviar: si es False, prepara el CSV pero no envia nada (--sin-enviar).
 
     Returns:
-        'enviado' si se envio (o si es una prueba sin envio), 'error' si
-        el correo fallo.
+        Uno de: 'enviado', 'descartado' (fecha no es hoy: caso normal),
+        'error' (fallo tecnico).
     """
-    nombre = informe['nombre']
+    estado, ruta = preparar_informe(servidor, config, informe, hoy)
+    if estado != 'listo':
+        return estado
     if not enviar:
         log.info("        (modo --sin-enviar) CSV generado en %s", ruta)
         return 'enviado'
+    return enviar_lote(config, [(informe, ruta)], hoy)[informe['nombre']]
 
-    destinatarios = informe.get('destinatarios') or config['destinatarios']
-    asunto = f"{nombre} - datos a {hoy.strftime('%d/%m/%Y')}"
-    cuerpo = (f"Buenos dias,\n\nadjuntamos el informe \"{nombre}\" con los datos "
-              f"actualizados a {hoy.strftime('%d/%m/%Y')}.\n\nUn saludo.")
-    if not enviar_correo(config, destinatarios, asunto, cuerpo, ruta):
-        return 'error'
 
-    log.info("        Enviado a %s", ", ".join(destinatarios))
-    return 'enviado'
+def enviar_lote(config, listos, hoy, fallidos=None, estado=None, hoy_txt=None):
+    """
+    Envia los informes preparados en esta pasada, en el MENOR numero de
+    correos posible: los que comparten los mismos destinatarios (lo
+    habitual, salvo que un informe fije los suyos propios) van juntos en un
+    unico correo, con todos sus CSV adjuntos.
+
+    Si en esta misma pasada algun OTRO informe con esos mismos destinatarios
+    fallo por un problema tecnico (ver 'fallidos'), el correo incluye un
+    aviso con su nombre, indicando que se reintentara automaticamente en un
+    envio posterior. Un informe fallido cuyos destinatarios no coinciden con
+    ningun correo que SI se envia en esta pasada no genera ningun correo al
+    cliente por si solo (su fallo queda registrado igualmente para el aviso
+    interno de --aviso).
+
+    Si se pasan 'estado' y 'hoy_txt', tras cada grupo enviado con exito se
+    marca de inmediato en 'estado' y se guarda en disco -- igual que con un
+    envio individual, si el proceso se interrumpe a mitad no se pierde ni
+    se duplica ningun informe ya confirmado. Sin esos argumentos (uso suelto,
+    p. ej. desde procesar_informe en pruebas) no se toca el fichero de estado.
+
+    Args:
+        config: diccionario de configuracion.
+        listos: lista de tuplas (informe, ruta) ya preparadas (CSV escrito
+            en disco), pendientes de enviar.
+        hoy: objeto date del dia de envio.
+        fallidos: lista de informes (diccionarios) que fallaron por un
+            problema tecnico en esta misma pasada, o None.
+        estado: diccionario de cargar_estado(), se actualiza en sitio. None
+            para no tocar el fichero de estado.
+        hoy_txt: cadena 'YYYY-MM-DD' de hoy, la clave de 'estado'.
+
+    Returns:
+        Diccionario {nombre_del_informe: 'enviado' | 'error'}.
+    """
+    grupos = {}
+    for informe, ruta in listos:
+        destinatarios = tuple(informe.get('destinatarios') or config['destinatarios'])
+        grupos.setdefault(destinatarios, []).append((informe, ruta))
+
+    grupos_fallidos = {}
+    for informe in (fallidos or []):
+        destinatarios = tuple(informe.get('destinatarios') or config['destinatarios'])
+        grupos_fallidos.setdefault(destinatarios, []).append(informe['nombre'])
+
+    resultados = {}
+    for destinatarios, items in grupos.items():
+        nombres = [informe['nombre'] for informe, _ in items]
+        rutas = [ruta for _, ruta in items]
+
+        if len(items) == 1:
+            asunto = f"{nombres[0]} - datos a {hoy.strftime('%d/%m/%Y')}"
+            cuerpo = (f"Buenos dias,\n\nadjuntamos el informe \"{nombres[0]}\" con los datos "
+                      f"actualizados a {hoy.strftime('%d/%m/%Y')}.")
+        else:
+            lista = "\n".join(f"- {n}" for n in nombres)
+            asunto = f"Informes Tableau - datos a {hoy.strftime('%d/%m/%Y')}"
+            cuerpo = (f"Buenos dias,\n\nadjuntamos los siguientes informes con los datos "
+                      f"actualizados a {hoy.strftime('%d/%m/%Y')}:\n\n{lista}")
+
+        nombres_fallidos = grupos_fallidos.get(destinatarios, [])
+        if nombres_fallidos:
+            if len(nombres_fallidos) == 1:
+                cuerpo += (f"\n\nAviso: no ha sido posible generar el informe "
+                          f"\"{nombres_fallidos[0]}\" por un problema tecnico. Se reintentara "
+                          f"automaticamente en un envio posterior.")
+            else:
+                lista_fallidos = "\n".join(f"- {n}" for n in nombres_fallidos)
+                cuerpo += (f"\n\nAviso: los siguientes informes no se han podido generar por un "
+                          f"problema tecnico y se reintentaran automaticamente en un envio "
+                          f"posterior:\n\n{lista_fallidos}")
+
+        cuerpo += "\n\nUn saludo."
+
+        if enviar_correo(config, list(destinatarios), asunto, cuerpo, rutas):
+            log.info("        Enviado a %s: %s%s", ", ".join(destinatarios), ", ".join(nombres),
+                     f" (con aviso de fallo: {', '.join(nombres_fallidos)})" if nombres_fallidos else "")
+            for nombre in nombres:
+                resultados[nombre] = 'enviado'
+            if estado is not None:
+                estado.setdefault(hoy_txt, []).extend(nombres)
+                guardar_estado(config['archivo_estado'], estado, hoy_txt)
+        else:
+            log.error("        No se pudo enviar el correo con: %s", ", ".join(nombres))
+            for nombre in nombres:
+                resultados[nombre] = 'error'
+
+    return resultados
 
 
 # ============================================================================
@@ -1904,26 +1594,16 @@ def main():
     parser.add_argument('--crosstab-excel', metavar='INFORME',
                         help="prueba: descarga como Excel (crosstab) el informe con ese nombre, "
                              "para ver la disposicion del dashboard; no envia nada")
-    parser.add_argument('--metodo-correo', choices=list(METODOS_CORREO),
-                        help="usa este metodo de envio en esta ejecucion, sin cambiar "
-                             "config_envio.json")
     parser.add_argument('--probar-correo', metavar='DIRECCION',
                         help="envia un correo de prueba a esa direccion (sin usar Tableau) "
-                             "para comprobar el metodo de envio")
-    parser.add_argument('--diagnostico-outlook', action='store_true',
-                        help="muestra que perfil/buzon de Outlook usa la automatizacion y el "
-                             "contenido reciente de Elementos enviados; no envia nada")
+                             "para comprobar el envio por Graph")
     parser.add_argument('--aviso', action='store_true',
                         help="envia a 'destinatarios_aviso' la lista de informes que no salieron "
                              "(usar solo en la ultima ejecucion del dia)")
     args = parser.parse_args()
 
     inicio = time.time()
-    config = cargar_config(args.config, args.metodo_correo)
-
-    if args.diagnostico_outlook:
-        diagnosticar_outlook(config)
-        return
+    config = cargar_config(args.config)
 
     if args.probar_correo:
         sys.exit(0 if probar_correo(config, args.probar_correo) else 1)
@@ -1978,17 +1658,32 @@ def main():
     resultados = {'enviado': [], 'descartado': [], 'error': []}
     if pendientes:
         servidor = conectar_tableau(config)
+        listos = []     # [(informe, ruta), ...] listos para enviar en esta pasada
+        fallidos = []   # informes con error tecnico en esta pasada
         for numero, informe in enumerate(pendientes, start=1):
             log.info("[%d/%d] %s", numero, len(pendientes), informe['nombre'])
-            resultado = procesar_informe(servidor, config, informe, hoy, enviar)
-            resultados[resultado].append(informe['nombre'])
-            if resultado == 'enviado' and enviar:
-                estado.setdefault(hoy_txt, []).append(informe['nombre'])
-                guardar_estado(config['archivo_estado'], estado, hoy_txt)
+            estado_informe, ruta = preparar_informe(servidor, config, informe, hoy)
+            if estado_informe == 'listo':
+                if enviar:
+                    listos.append((informe, ruta))
+                else:
+                    log.info("        (modo --sin-enviar) CSV generado en %s", ruta)
+                    resultados['enviado'].append(informe['nombre'])
+            else:
+                resultados[estado_informe].append(informe['nombre'])
+                if estado_informe == 'error':
+                    fallidos.append(informe)
         try:
             servidor.auth.sign_out()
         except Exception:
             pass
+
+        # Se agrupan aqui, tras cerrar la sesion de Tableau: el envio de
+        # correo no necesita ya ninguna conexion con Tableau.
+        if listos:
+            resultados_envio = enviar_lote(config, listos, hoy, fallidos, estado, hoy_txt)
+            for nombre, resultado in resultados_envio.items():
+                resultados[resultado].append(nombre)
 
     # Aviso interno de lo que no salio, para que no pase desapercibido. Solo
     # con --aviso: si la tarea se repite varias veces al dia, se pide solo en

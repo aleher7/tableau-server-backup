@@ -15,14 +15,16 @@
   "archivo_estado": "./estado_envios.json",
   "csv_separador": ";",
 
+  "proyecto_ruta": "Production/Dashboards/Ad hoc Reports/BI Local/BI España/Informes Automaticos",
+
   "informes": [
-    { "nombre": "CdM Venta Interna Detalle Marca MTD", "view_luid": "<PEGAR_AQUI>" },
-    { "nombre": "CdM Venta Interna Detalle Marca YTD", "view_luid": "<PEGAR_AQUI>" },
-    { "nombre": "CdM Venta Interna Detalle Producto Agrupado MTD", "view_luid": "<PEGAR_AQUI>" },
-    { "nombre": "CdM Venta Interna Detalle Producto Agrupado YTD", "view_luid": "<PEGAR_AQUI>" },
-    { "nombre": "CdM SRI Marca MTD", "view_luid": "<PEGAR_AQUI>" },
-    { "nombre": "CdM SRI Marca YTD", "view_luid": "<PEGAR_AQUI>" },
-    { "nombre": "CdM SRI Producto Agrupado MTD", "view_luid": "<PEGAR_AQUI>" },
-    { "nombre": "CdM SRI Producto Agrupado YTD", "view_luid": "<PEGAR_AQUI>" }
+    { "nombre": "CdM Venta Interna Detalle Marca MTD" },
+    { "nombre": "CdM Venta Interna Detalle Marca YTD" },
+    { "nombre": "CdM Venta Interna Detalle Producto Agrupado MTD" },
+    { "nombre": "CdM Venta Interna Detalle Producto Agrupado YTD" },
+    { "nombre": "CdM SRI Marca MTD" },
+    { "nombre": "CdM SRI Marca YTD" },
+    { "nombre": "CdM SRI Producto Agrupado MTD" },
+    { "nombre": "CdM SRI Producto Agrupado YTD" }
   ]
 }

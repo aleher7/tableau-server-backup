@@ -2,8 +2,8 @@
 ENVIO DIARIO POR CORREO DE TABLAS DE TABLEAU EN CSV
 ====================================================
 
-Flujo, para cada informe de la lista 'informes' de config_envio.json (con
-su 'nombre' y su 'view_luid', el identificador fijo de su vista en Tableau):
+Flujo, para cada informe de la lista 'informes' de config_envio.json (por su
+'nombre', localizado en Tableau dentro de la carpeta 'proyecto_ruta'):
     1. Consulta a la Metadata API de Tableau la fecha de actualizacion de las
        fuentes de datos de las que depende el workbook (extractLastRefreshTime
        / extractLastUpdateTime).
@@ -48,10 +48,6 @@ Uso:
                                                         # prueba solo el envio de
                                                         # correo por Graph (sin Tableau)
     python enviar_csv_dashboards.py --forzar            # ignora lo ya enviado
-    python enviar_csv_dashboards.py --obtener-luids [--proyecto-ruta "..."]
-                                                        # herramienta de un solo uso: busca
-                                                        # cada informe por nombre y muestra
-                                                        # su view_luid; no envia nada
 
 Codigo de salida: 0 si todo fue bien (incluidos los informes descartados por
 fecha, que es un caso normal), 1 si hubo errores tecnicos (Tableau, Graph...).
@@ -131,7 +127,7 @@ def cargar_config(fichero):
     for clave, valor in CLAVES_OPCIONALES.items():
         config.setdefault(clave, valor)
 
-    obligatorias = CLAVES_TABLEAU + CLAVES_CORREO + CLAVES_GRAPH + ['informes']
+    obligatorias = CLAVES_TABLEAU + CLAVES_CORREO + CLAVES_GRAPH + ['informes', 'proyecto_ruta']
     faltan = [c for c in obligatorias if c not in config or config[c] in ('', [])]
     if faltan:
         log.error("Faltan claves obligatorias en %s: %s", fichero, ", ".join(faltan))
@@ -150,9 +146,6 @@ def cargar_config(fichero):
     for i, informe in enumerate(config['informes'], start=1):
         if not informe.get('nombre'):
             log.error("El informe %d no tiene 'nombre'", i)
-            sys.exit(1)
-        if not informe.get('view_luid'):
-            log.error("'%s' no tiene 'view_luid'", informe['nombre'])
             sys.exit(1)
 
     return config
@@ -324,33 +317,25 @@ def conectar_tableau(config):
 
 
 
-def localizar_vista(servidor, informe):
-    """
-    Localiza la vista de un informe por su 'view_luid', el identificador
-    fijo de su vista en Tableau (no cambia aunque se renombre el dashboard).
-
-    Args:
-        servidor: objeto Server ya autenticado.
-        informe: diccionario del informe (una entrada de 'informes'), con
-            'view_luid'.
-
-    Returns:
-        Tupla (vista, workbook_luid): el ViewItem de tableauserverclient y
-        el LUID de su workbook (lo necesita la Metadata API).
-    """
-    vista = servidor.views.get_by_id(informe['view_luid'])
-    return vista, vista.workbook_id
-
-
-def _normalizar_ruta_proyecto(texto):
+def normalizar_ruta(texto):
     """Deja una ruta de proyecto comparable: sin acentos, minusculas."""
     import unicodedata
     sin_acentos = unicodedata.normalize('NFKD', texto).encode('ascii', 'ignore').decode()
     return "/".join(p.strip() for p in sin_acentos.casefold().split('/'))
 
 
-def _ids_proyecto_por_ruta(servidor, ruta):
-    """Encuentra el/los proyecto(s) cuya ruta completa coincide con 'ruta'."""
+_CACHE_PROYECTOS = {}
+
+
+def ids_proyecto_por_ruta(servidor, ruta):
+    """
+    Encuentra el/los proyecto(s) cuya ruta completa coincide con 'ruta'.
+    Cachea el resultado por ruta: los 8 informes comparten la misma, asi que
+    solo se recorren los proyectos de Tableau una vez por ejecucion.
+    """
+    if ruta in _CACHE_PROYECTOS:
+        return _CACHE_PROYECTOS[ruta]
+
     import tableauserverclient as TSC
     proyectos = {p.id: p for p in TSC.Pager(servidor.projects)}
 
@@ -362,102 +347,55 @@ def _ids_proyecto_por_ruta(servidor, ruta):
         return "/".join(reversed(partes))
 
     rutas = {p.id: ruta_de(p) for p in proyectos.values()}
-    objetivo = _normalizar_ruta_proyecto(ruta)
-    ids = [i for i, r in rutas.items() if _normalizar_ruta_proyecto(r) == objetivo]
+    objetivo = normalizar_ruta(ruta)
+    ids = [i for i, r in rutas.items() if normalizar_ruta(r) == objetivo]
     if not ids:
-        colas = [i for i, r in rutas.items() if objetivo.endswith('/' + _normalizar_ruta_proyecto(r))]
+        colas = [i for i, r in rutas.items() if objetivo.endswith('/' + normalizar_ruta(r))]
         if len(colas) == 1:
-            log.info("(aviso: solo se ve la ruta '%s', se acepta por ser unica)", rutas[colas[0]])
+            log.info("        (aviso: solo se ve la ruta '%s', se acepta por ser unica)", rutas[colas[0]])
             ids = colas
     if not ids:
         hoja = objetivo.rsplit('/', 1)[-1]
-        parecidas = [r for r in rutas.values() if _normalizar_ruta_proyecto(r).rsplit('/', 1)[-1] == hoja]
+        parecidas = [r for r in rutas.values() if normalizar_ruta(r).rsplit('/', 1)[-1] == hoja]
         raise LookupError(f"no existe el proyecto '{ruta}'. Rutas con ese nombre final: {parecidas or 'ninguna'}")
+
+    _CACHE_PROYECTOS[ruta] = ids
     return ids
 
 
-def obtener_luids(fichero_config, proyecto_ruta):
+def localizar_vista(servidor, config, informe):
     """
-    HERRAMIENTA DE UN SOLO USO: busca cada informe de 'informes' por nombre
-    dentro de 'proyecto_ruta' y muestra su view_luid, listo para pegar en
-    config_envio.json. El proceso normal ya no busca por nombre (los 8
-    informes son fijos e identifican su vista por 'view_luid'), asi que esto
-    solo hace falta la primera vez, o si algun dia cambia algun informe.
-
-    No usa cargar_config(): el fichero puede no tener 'view_luid' todavia
-    (o puede que ya lo tenga; esta funcion lo ignora). Solo necesita las
-    claves tableau_* y la lista 'informes' con 'nombre'.
+    Localiza la vista de un informe por su nombre, dentro de la carpeta de
+    Tableau indicada en 'proyecto_ruta'.
 
     Args:
-        fichero_config: ruta del fichero de configuracion a leer.
-        proyecto_ruta: ruta del proyecto donde buscar. Si es None, se toma
-            de 'proyecto_ruta' dentro del propio fichero.
+        servidor: objeto Server ya autenticado.
+        config: diccionario de configuracion (usa 'proyecto_ruta').
+        informe: diccionario del informe (una entrada de 'informes'), con
+            'nombre'.
+
+    Returns:
+        Tupla (vista, workbook_luid): el ViewItem de tableauserverclient y
+        el LUID de su workbook (lo necesita la Metadata API).
     """
-    try:
-        with open(fichero_config, 'r', encoding='utf-8') as f:
-            config = json.load(f)
-    except FileNotFoundError:
-        log.error("No se encuentra %s", fichero_config)
-        sys.exit(1)
-    except json.JSONDecodeError as e:
-        log.error("El fichero %s tiene un error de sintaxis: %s", fichero_config, e)
-        sys.exit(1)
+    import tableauserverclient as TSC
+    nombre = informe['nombre']
+    ids_proyecto = ids_proyecto_por_ruta(servidor, config['proyecto_ruta'])
 
-    faltan = [c for c in CLAVES_TABLEAU + ['informes'] if c not in config or config[c] in ('', [])]
-    if faltan:
-        log.error("Faltan claves en %s: %s", fichero_config, ", ".join(faltan))
-        sys.exit(1)
+    opciones = TSC.RequestOptions(pagesize=100)
+    opciones.filter.add(TSC.Filter(TSC.RequestOptions.Field.Name,
+                                   TSC.RequestOptions.Operator.Equals, nombre))
+    workbooks = [w for w in TSC.Pager(servidor.workbooks, opciones) if w.project_id in ids_proyecto]
+    if len(workbooks) != 1:
+        raise LookupError(f"{len(workbooks)} workbooks encontrados con el nombre '{nombre}' "
+                          f"en la ruta de proyecto configurada")
 
-    ruta = proyecto_ruta or config.get('proyecto_ruta')
-    if not ruta:
-        log.error("Indica la ruta del proyecto con --proyecto-ruta (la config no la tiene)")
-        sys.exit(1)
+    servidor.workbooks.populate_views(workbooks[0])
+    vistas = workbooks[0].views
+    if len(vistas) != 1:
+        raise LookupError(f"el workbook '{nombre}' tiene {len(vistas)} vistas, se esperaba 1")
 
-    servidor = conectar_tableau(config)
-    log.info("Conectado a Tableau")
-    try:
-        import tableauserverclient as TSC
-        ids_proyecto = _ids_proyecto_por_ruta(servidor, ruta)
-
-        resultado = []
-        for informe in config['informes']:
-            nombre = informe['nombre']
-            log.info("%s:", nombre)
-            try:
-                opciones = TSC.RequestOptions(pagesize=100)
-                opciones.filter.add(TSC.Filter(TSC.RequestOptions.Field.Name,
-                                               TSC.RequestOptions.Operator.Equals, nombre))
-                workbooks = [w for w in TSC.Pager(servidor.workbooks, opciones)
-                            if w.project_id in ids_proyecto]
-                if len(workbooks) != 1:
-                    log.error("    %d workbooks encontrados con ese nombre en la ruta", len(workbooks))
-                    continue
-
-                servidor.workbooks.populate_views(workbooks[0])
-                vistas = workbooks[0].views
-                if len(vistas) != 1:
-                    log.warning("    %d vistas en este workbook: %s", len(vistas),
-                               ", ".join(v.name for v in vistas))
-                    log.warning("    Elige la correcta y usa su LUID abajo:")
-                    for v in vistas:
-                        log.warning("      %s: %s", v.name, v.id)
-                    continue
-
-                log.info("    view_luid: %s", vistas[0].id)
-                resultado.append({"nombre": nombre, "view_luid": vistas[0].id})
-            except Exception as e:
-                log.error("    Error: %s", e)
-    finally:
-        try:
-            servidor.auth.sign_out()
-        except Exception:
-            pass
-
-    print()
-    print("=" * 60)
-    print("Bloque 'informes' listo para pegar en config_envio.json:")
-    print("=" * 60)
-    print(json.dumps(resultado, ensure_ascii=False, indent=2))
+    return vistas[0], workbooks[0].id
 
 
 
@@ -743,7 +681,7 @@ def fecha_por_tablas_origen(servidor, workbook_luid):
     return min(fechas_tablas)
 
 
-def diagnosticar_informe(servidor, informe):
+def diagnosticar_informe(servidor, config, informe):
     """
     Muestra en el log que ve la Metadata API para el workbook de un informe:
     fuentes publicadas, fuentes embebidas (con o sin extracto) y bases de
@@ -752,13 +690,14 @@ def diagnosticar_informe(servidor, informe):
 
     Args:
         servidor: objeto Server ya autenticado.
+        config: diccionario de configuracion (usa 'proyecto_ruta').
         informe: diccionario del informe (una entrada de 'informes').
 
     Returns:
         No devuelve nada (escribe en el log).
     """
     try:
-        _, workbook_luid = localizar_vista(servidor, informe)
+        _, workbook_luid = localizar_vista(servidor, config, informe)
     except Exception as e:
         log.error("        No se pudo localizar el workbook: %s", e)
         return
@@ -1065,7 +1004,7 @@ def preparar_informe(servidor, config, informe, hoy):
     # La fecha se comprueba ANTES de descargar el Excel: si no es la de hoy,
     # no hace falta bajar nada.
     try:
-        vista, workbook_luid = localizar_vista(servidor, informe)
+        vista, workbook_luid = localizar_vista(servidor, config, informe)
         fecha = fecha_actualizacion_fuentes(servidor, workbook_luid)
         if fecha is None:
             log.error("        No se puede comprobar la fecha de actualizacion de este workbook")
@@ -1261,18 +1200,7 @@ def main():
     parser.add_argument('--probar-correo', metavar='DIRECCION',
                         help="envia un correo de prueba a esa direccion (sin usar Tableau) "
                              "para comprobar el envio por Graph")
-    parser.add_argument('--obtener-luids', action='store_true',
-                        help="herramienta de un solo uso: busca cada informe por nombre en "
-                             "Tableau y muestra su view_luid, listo para pegar en la "
-                             "configuracion; no envia nada ni necesita datos de Graph")
-    parser.add_argument('--proyecto-ruta', metavar='RUTA',
-                        help="con --obtener-luids: ruta del proyecto donde buscar, si la "
-                             "config ya no tiene guardada 'proyecto_ruta'")
     args = parser.parse_args()
-
-    if args.obtener_luids:
-        obtener_luids(args.config, args.proyecto_ruta)
-        return
 
     inicio = time.time()
     config = cargar_config(args.config)
@@ -1294,7 +1222,7 @@ def main():
             sys.exit(1)
         servidor = conectar_tableau(config)
         try:
-            vista, _ = localizar_vista(servidor, elegidos[0])
+            vista, _ = localizar_vista(servidor, config, elegidos[0])
             ruta = Path(config['directorio_salida']) / f"{sanear_nombre_archivo(args.crosstab_excel)}_crosstab.xlsx"
             descargar_crosstab_excel(servidor, vista, ruta, config['cache_maxima_minutos'])
             log.info("Excel (crosstab) guardado en %s", ruta)
@@ -1312,7 +1240,7 @@ def main():
         servidor = conectar_tableau(config)
         for numero, informe in enumerate(config['informes'], start=1):
             log.info("[%d/%d] %s", numero, len(config['informes']), informe['nombre'])
-            diagnosticar_informe(servidor, informe)
+            diagnosticar_informe(servidor, config, informe)
         try:
             servidor.auth.sign_out()
         except Exception:

@@ -2,11 +2,11 @@
 ENVIO DIARIO POR CORREO DE TABLAS DE TABLEAU EN CSV
 ====================================================
 
-Flujo, para cada informe de la lista 'informes' de config_envio.json:
+Flujo, para cada informe de la lista 'informes' de config_envio.json (con
+su 'nombre' y su 'view_luid', el identificador fijo de su vista en Tableau):
     1. Consulta a la Metadata API de Tableau la fecha de actualizacion de las
        fuentes de datos de las que depende el workbook (extractLastRefreshTime
-       / extractLastUpdateTime). Si un informe indica 'fecha_columna', la
-       fecha se lee en cambio de esa columna de la propia tabla.
+       / extractLastUpdateTime).
     2. Si esa fecha es HOY  -> descarga la tabla en CSV, lista para enviar.
        Si no es hoy         -> NO se envia (la carga del dia no ha llegado o
                                ha fallado) y se anota en el log.
@@ -15,11 +15,18 @@ Flujo, para cada informe de la lista 'informes' de config_envio.json:
        fecha de refresco), se busca a traves de sus tablas de origen: se toma
        el extracto publicado mas reciente que se alimenta de esas mismas
        tablas, dejando aviso en el log. Sin configuracion por informe.
-    3. Los informes listos en esta pasada se agrupan por destinatarios y se
-       envian en el MENOR numero de correos posible (uno por grupo, con
-       todos sus CSV adjuntos), siempre por Microsoft Graph. Si alguno de
-       los informes fallo por un problema tecnico, el correo de ese grupo
-       incluye un aviso con su nombre y que se reintentara mas tarde.
+    3. Los 8 informes comparten la misma fuente de datos: si en esta pasada
+       ALGUN informe se descarta por no estar actualizado a hoy, no se envia
+       NINGUN correo, bajo ninguna circunstancia -- ni siquiera con los
+       informes que si estaban listos. Se reintentan todos juntos en la
+       siguiente pasada, cuando la fuente ya este al dia para todos.
+    4. Si (y solo si) NINGUN informe se descarto por fecha, los que quedaron
+       listos se agrupan por destinatarios y se envian en el MENOR numero de
+       correos posible (uno por grupo, con todos sus CSV adjuntos), siempre
+       por Microsoft Graph. Si alguno de los informes fallo por un problema
+       TECNICO (no por fecha), el correo de ese grupo incluye un aviso con su
+       nombre y que se reintentara mas tarde; esto no bloquea el envio de los
+       demas.
 
 El script es idempotente por dia: guarda en estado_envios.json que informes
 ya se enviaron hoy y no los repite. Por eso la tarea programada puede
@@ -41,9 +48,10 @@ Uso:
                                                         # prueba solo el envio de
                                                         # correo por Graph (sin Tableau)
     python enviar_csv_dashboards.py --forzar            # ignora lo ya enviado
-    python enviar_csv_dashboards.py --aviso             # ultima pasada del dia:
-                                                        # avisa al equipo de lo
-                                                        # que no salio
+    python enviar_csv_dashboards.py --obtener-luids [--proyecto-ruta "..."]
+                                                        # herramienta de un solo uso: busca
+                                                        # cada informe por nombre y muestra
+                                                        # su view_luid; no envia nada
 
 Codigo de salida: 0 si todo fue bien (incluidos los informes descartados por
 fecha, que es un caso normal), 1 si hubo errores tecnicos (Tableau, Graph...).
@@ -56,10 +64,9 @@ import json
 import time
 import base64
 import logging
-import unicodedata
 import argparse
 import requests
-from io import BytesIO, StringIO
+from io import BytesIO
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from datetime import datetime, date
@@ -94,15 +101,8 @@ CLAVES_OPCIONALES = {
     'archivo_estado': './estado_envios.json',
     'csv_separador': ';',
     'cache_maxima_minutos': 1,
-    'decimales_porcentaje': 1,
-    'decimales_numeros': 0,
-    'origen_datos': 'csv',
     'rellenar_etiquetas': True,
     'separador_miles': False,
-    'destinatarios_aviso': [],
-    # Formatos con los que se intenta interpretar la fecha de actualizacion
-    # que devuelve Tableau (depende del idioma de la cuenta que exporta).
-    'formatos_fecha': ['%d/%m/%Y', '%Y-%m-%d', '%d-%m-%Y', '%m/%d/%Y', '%d.%m.%Y'],
 }
 
 
@@ -131,12 +131,6 @@ def cargar_config(fichero):
     for clave, valor in CLAVES_OPCIONALES.items():
         config.setdefault(clave, valor)
 
-    origenes = [config['origen_datos']] + [i['origen_datos'] for i in config.get('informes', [])
-                                           if 'origen_datos' in i]
-    if any(o not in ('csv', 'crosstab') for o in origenes):
-        log.error("'origen_datos' debe ser 'csv' o 'crosstab'")
-        sys.exit(1)
-
     obligatorias = CLAVES_TABLEAU + CLAVES_CORREO + CLAVES_GRAPH + ['informes']
     faltan = [c for c in obligatorias if c not in config or config[c] in ('', [])]
     if faltan:
@@ -156,6 +150,9 @@ def cargar_config(fichero):
     for i, informe in enumerate(config['informes'], start=1):
         if not informe.get('nombre'):
             log.error("El informe %d no tiene 'nombre'", i)
+            sys.exit(1)
+        if not informe.get('view_luid'):
+            log.error("'%s' no tiene 'view_luid'", informe['nombre'])
             sys.exit(1)
 
     return config
@@ -181,185 +178,6 @@ def sanear_nombre_archivo(nombre):
     return nombre.translate(CARACTERES_INVALIDOS_WINDOWS).strip()
 
 
-def parsear_fecha(texto, formatos):
-    """
-    Convierte el texto de una fecha (con o sin hora) en un date.
-
-    Args:
-        texto: valor tal como viene en el CSV, p. ej. '21/09/2026' o
-            '2026-09-21 07:45:12'.
-        formatos: lista de formatos strptime a probar, en orden.
-
-    Returns:
-        Objeto date, o None si el texto no coincide con ningun formato.
-    """
-    texto = (texto or '').strip()
-    if not texto:
-        return None
-
-    # Se prueba el texto entero y, si lleva hora, solo la parte de la fecha.
-    candidatos = [texto, re.split(r'[ T]', texto)[0]]
-    for candidato in candidatos:
-        for formato in formatos:
-            try:
-                return datetime.strptime(candidato, formato).date()
-            except ValueError:
-                continue
-    return None
-
-
-def fecha_actualizacion(filas, columna, formatos):
-    """
-    Devuelve la fecha de actualizacion mas reciente de una columna del CSV.
-
-    Es la mas reciente (y no la primera) porque en el dashboard puede
-    aparecer repetida en cada fila, o una sola vez en una vista aparte.
-
-    Args:
-        filas: lista de diccionarios (una por fila del CSV).
-        columna: nombre de la columna que contiene la fecha.
-        formatos: formatos de fecha admitidos (ver parsear_fecha).
-
-    Returns:
-        Objeto date con la fecha mas reciente. None si la columna no existe
-        o ninguno de sus valores se pudo interpretar como fecha.
-    """
-    if not filas or columna not in filas[0]:
-        return None
-    fechas = [parsear_fecha(f.get(columna), formatos) for f in filas]
-    fechas = [f for f in fechas if f]
-    return max(fechas) if fechas else None
-
-
-def leer_csv(contenido):
-    """
-    Convierte el texto de un CSV en cabecera + lista de filas.
-
-    Args:
-        contenido: texto completo del CSV (separado por comas, como lo
-            entrega Tableau).
-
-    Returns:
-        Tupla (columnas, filas): la lista de nombres de columna y una lista
-        de diccionarios, una por fila.
-    """
-    lector = csv.DictReader(StringIO(contenido))
-    filas = list(lector)
-    return list(lector.fieldnames or []), filas
-
-
-def pivotar_medidas(columnas, filas, col_nombre='Measure Names', col_valor='Measure Values'):
-    """
-    Convierte el formato "largo" de Tableau en la tabla tal como se ve.
-
-    Cuando un dashboard tiene varias medidas como columnas, Tableau exporta
-    una fila por cada combinacion de dimensiones y medida, con las columnas
-    'Measure Names' (nombre de la medida) y 'Measure Values' (su valor).
-    Aqui se agrupan las filas por sus dimensiones y cada medida pasa a ser
-    una columna, en el orden en que aparecen.
-
-    Si el CSV no tiene esas dos columnas, se devuelve tal cual. Si el
-    pivotado fuera ambiguo (una medida repetida para las mismas
-    dimensiones, o con el mismo nombre que una dimension), tambien se
-    devuelve tal cual para no perder ni mezclar datos.
-
-    Args:
-        columnas: lista de nombres de columna del CSV.
-        filas: lista de diccionarios, una por fila.
-        col_nombre: nombre de la columna con el nombre de la medida.
-        col_valor: nombre de la columna con el valor de la medida.
-
-    Returns:
-        Tupla (columnas, filas) ya pivotada, o las originales si no
-        procede pivotar.
-    """
-    if col_nombre not in columnas or col_valor not in columnas:
-        return columnas, filas
-
-    dimensiones = [c for c in columnas if c not in (col_nombre, col_valor)]
-    medidas = []
-    grupos = {}
-    for fila in filas:
-        clave = tuple(fila[c] for c in dimensiones)
-        grupo = grupos.setdefault(clave, {c: fila[c] for c in dimensiones})
-        medida = fila[col_nombre]
-        if medida in grupo:
-            log.warning("        No se pivota: la medida '%s' se repite para las mismas dimensiones "
-                        "(o coincide con una dimension)", medida)
-            return columnas, filas
-        if medida not in medidas:
-            medidas.append(medida)
-        grupo[medida] = fila[col_valor]
-
-    return dimensiones + medidas, list(grupos.values())
-
-
-def dar_formato_columnas(columnas, filas, renombrar=None, orden=None):
-    """
-    Adapta los encabezados y el orden de columnas al aspecto del dashboard.
-
-    Args:
-        columnas: lista de nombres de columna.
-        filas: lista de diccionarios, una por fila.
-        renombrar: diccionario {nombre_en_el_CSV: nombre_final}, p. ej.
-            {"Linea Negocio": "Linea Negocio Act."}. Los que no aparecen no
-            cambian.
-        orden: lista de nombres FINALES en el orden deseado. Las columnas
-            que no aparezcan en la lista van al final, en su orden actual.
-
-    Returns:
-        Tupla (columnas, filas) con los nombres y el orden aplicados.
-    """
-    if renombrar:
-        columnas = [renombrar.get(c, c) for c in columnas]
-        filas = [{renombrar.get(k, k): v for k, v in f.items()} for f in filas]
-    if orden:
-        primeras = [c for c in orden if c in columnas]
-        columnas = primeras + [c for c in columnas if c not in primeras]
-    return columnas, filas
-
-
-def formatear_porcentajes(filas, columnas_porcentaje, decimales=1):
-    """
-    Convierte en porcentaje (0.5 -> '50,0%') los valores de las columnas dadas.
-
-    Tableau entrega la fraccion sin formato (0.5) y no el porcentaje que se
-    ve en el dashboard. Los valores que ya llevan '%', los vacios y los que
-    no son un numero se dejan tal cual. El resultado usa coma decimal, y
-    Excel en espanol lo reconoce como numero con formato de porcentaje.
-
-    Al leer el numero de entrada: si trae coma y punto, el ultimo es el
-    decimal; si solo trae uno de los dos, se toma como decimal (en una
-    columna de porcentajes, '1.438' es 1,438 = 143,8%, no mil cuatrocientos).
-
-    Args:
-        filas: lista de diccionarios, una por fila. Se modifican en sitio.
-        columnas_porcentaje: nombres de las columnas a convertir.
-        decimales: decimales del porcentaje resultante.
-
-    Returns:
-        La misma lista de filas, con las columnas convertidas.
-    """
-    paso = Decimal(1).scaleb(-decimales)   # 0.1 para 1 decimal
-    for fila in filas:
-        for columna in columnas_porcentaje:
-            texto = (fila.get(columna) or '').strip()
-            if not texto or texto.endswith('%'):
-                continue
-            limpio = texto.replace(' ', '')
-            if ',' in limpio and '.' in limpio:
-                if limpio.rfind(',') > limpio.rfind('.'):
-                    limpio = limpio.replace('.', '').replace(',', '.')
-                else:
-                    limpio = limpio.replace(',', '')
-            else:
-                limpio = limpio.replace(',', '.')
-            try:
-                valor = (Decimal(limpio) * 100).quantize(paso, rounding=ROUND_HALF_UP)
-            except InvalidOperation:
-                continue
-            fila[columna] = f"{valor:.{decimales}f}".replace('.', ',') + '%'
-    return filas
 
 
 _NUMERO = re.compile(r'^[\s€$£]*[-+]?[\d.,]+[\s€$£]*$')
@@ -406,38 +224,6 @@ def interpretar_numero(texto):
         return None
 
 
-def redondear_numeros(filas, columnas_numericas, decimales=0):
-    """
-    Redondea a 'decimales' los valores numericos de las columnas dadas.
-
-    Los valores que no son un numero (vacios, 'Null'...) no se tocan. Los
-    que ya son enteros se dejan tal cual cuando decimales es 0, para no
-    alterar su formato. El resultado no lleva separador de miles ni simbolo
-    de moneda, y usa coma decimal si decimales > 0.
-
-    Args:
-        filas: lista de diccionarios, una por fila. Se modifican en sitio.
-        columnas_numericas: nombres de las columnas a redondear.
-        decimales: numero de decimales del resultado.
-
-    Returns:
-        La misma lista de filas, con las columnas redondeadas.
-    """
-    paso = Decimal(1).scaleb(-decimales)
-    for fila in filas:
-        for columna in columnas_numericas:
-            texto = fila.get(columna)
-            valor = interpretar_numero(texto)
-            if valor is None:
-                continue
-            if decimales == 0 and valor == valor.to_integral_value():
-                continue
-            redondeado = valor.quantize(paso, rounding=ROUND_HALF_UP)
-            if redondeado == 0:
-                redondeado = abs(redondeado)   # evita '-0'
-            fila[columna] = f"{redondeado:.{decimales}f}".replace('.', ',')
-    return filas
-
 
 def escribir_filas_csv(ruta, filas, separador):
     """
@@ -455,27 +241,6 @@ def escribir_filas_csv(ruta, filas, separador):
     Path(ruta).parent.mkdir(parents=True, exist_ok=True)
     with open(ruta, 'w', encoding='utf-8-sig', newline='') as f:
         csv.writer(f, delimiter=separador, quoting=csv.QUOTE_MINIMAL).writerows(filas)
-
-
-def escribir_csv(ruta, columnas, filas, separador):
-    """
-    Guarda la tabla en CSV con UTF-8 con BOM, para que Excel lo abra bien.
-
-    Args:
-        ruta: ruta del fichero a crear.
-        columnas: lista de nombres de columna, en orden.
-        filas: lista de diccionarios con los datos.
-        separador: caracter separador de columnas del CSV de salida.
-
-    Returns:
-        No devuelve nada.
-    """
-    Path(ruta).parent.mkdir(parents=True, exist_ok=True)
-    with open(ruta, 'w', encoding='utf-8-sig', newline='') as f:
-        escritor = csv.DictWriter(f, fieldnames=columnas, delimiter=separador,
-                                  quoting=csv.QUOTE_MINIMAL, extrasaction='ignore')
-        escritor.writeheader()
-        escritor.writerows(filas)
 
 
 # ============================================================================
@@ -558,47 +323,35 @@ def conectar_tableau(config):
         sys.exit(1)
 
 
-def normalizar_ruta(texto):
+
+def localizar_vista(servidor, informe):
     """
-    Deja una ruta de proyecto comparable: sin acentos, en minusculas y sin
-    espacios alrededor de las barras ('BI Espana' == 'bi españa').
+    Localiza la vista de un informe por su 'view_luid', el identificador
+    fijo de su vista en Tableau (no cambia aunque se renombre el dashboard).
 
     Args:
-        texto: ruta tal como se escribe, p. ej. 'Production/Dashboards/BI España'.
+        servidor: objeto Server ya autenticado.
+        informe: diccionario del informe (una entrada de 'informes'), con
+            'view_luid'.
 
     Returns:
-        La ruta normalizada.
+        Tupla (vista, workbook_luid): el ViewItem de tableauserverclient y
+        el LUID de su workbook (lo necesita la Metadata API).
     """
+    vista = servidor.views.get_by_id(informe['view_luid'])
+    return vista, vista.workbook_id
+
+
+def _normalizar_ruta_proyecto(texto):
+    """Deja una ruta de proyecto comparable: sin acentos, minusculas."""
+    import unicodedata
     sin_acentos = unicodedata.normalize('NFKD', texto).encode('ascii', 'ignore').decode()
     return "/".join(p.strip() for p in sin_acentos.casefold().split('/'))
 
 
-_CACHE_PROYECTOS = {}
-
-
-def ids_proyecto_por_ruta(servidor, ruta):
-    """
-    Devuelve los IDs de los proyectos de Tableau cuya ruta completa coincide
-    con la indicada. Distingue dos carpetas con el mismo nombre en sitios
-    distintos, que es lo que un simple filtro por nombre no puede hacer.
-
-    Args:
-        servidor: objeto Server ya autenticado.
-        ruta: ruta completa desde la raiz, con '/', p. ej.
-            'Production/Dashboards/Ad hoc Reports/BI Local/BI España/Informes Automaticos'.
-
-    Returns:
-        Lista de IDs de proyecto que coinciden (normalmente uno).
-
-    Raises:
-        LookupError: si ningun proyecto tiene esa ruta. El mensaje lista las
-            rutas de proyectos con el mismo nombre final, para corregirla.
-    """
-    if ruta in _CACHE_PROYECTOS:
-        return _CACHE_PROYECTOS[ruta]
-
+def _ids_proyecto_por_ruta(servidor, ruta):
+    """Encuentra el/los proyecto(s) cuya ruta completa coincide con 'ruta'."""
     import tableauserverclient as TSC
-
     proyectos = {p.id: p for p in TSC.Pager(servidor.projects)}
 
     def ruta_de(proyecto):
@@ -609,113 +362,103 @@ def ids_proyecto_por_ruta(servidor, ruta):
         return "/".join(reversed(partes))
 
     rutas = {p.id: ruta_de(p) for p in proyectos.values()}
-    objetivo = normalizar_ruta(ruta)
-    ids = [i for i, r in rutas.items() if normalizar_ruta(r) == objetivo]
-
+    objetivo = _normalizar_ruta_proyecto(ruta)
+    ids = [i for i, r in rutas.items() if _normalizar_ruta_proyecto(r) == objetivo]
     if not ids:
-        # Si el usuario del PAT no ve las carpetas padre, la ruta que se
-        # reconstruye llega truncada ('Informes Automaticos' en vez de la
-        # completa). Se acepta un proyecto cuya ruta visible sea la COLA de
-        # la configurada, pero solo si es unico: con dos candidatos no se
-        # adivina cual es.
-        colas = [i for i, r in rutas.items()
-                 if objetivo.endswith('/' + normalizar_ruta(r))]
+        colas = [i for i, r in rutas.items() if objetivo.endswith('/' + _normalizar_ruta_proyecto(r))]
         if len(colas) == 1:
-            log.warning("        Ruta visible de '%s': '%s' (Tableau no muestra sus carpetas "
-                        "padre a este usuario). Se acepta por ser la unica con ese nombre",
-                        ruta.rsplit('/', 1)[-1], rutas[colas[0]])
+            log.info("(aviso: solo se ve la ruta '%s', se acepta por ser unica)", rutas[colas[0]])
             ids = colas
-
     if not ids:
         hoja = objetivo.rsplit('/', 1)[-1]
-        parecidas = [r for r in rutas.values() if normalizar_ruta(r).rsplit('/', 1)[-1] == hoja]
-        raise LookupError(f"no existe el proyecto '{ruta}'. Rutas con ese nombre final: "
-                          f"{parecidas or 'ninguna'}")
-    _CACHE_PROYECTOS[ruta] = ids
+        parecidas = [r for r in rutas.values() if _normalizar_ruta_proyecto(r).rsplit('/', 1)[-1] == hoja]
+        raise LookupError(f"no existe el proyecto '{ruta}'. Rutas con ese nombre final: {parecidas or 'ninguna'}")
     return ids
 
 
-def localizar_vista(servidor, config, informe):
+def obtener_luids(fichero_config, proyecto_ruta):
     """
-    Localiza la vista de un informe y el workbook al que pertenece.
+    HERRAMIENTA DE UN SOLO USO: busca cada informe de 'informes' por nombre
+    dentro de 'proyecto_ruta' y muestra su view_luid, listo para pegar en
+    config_envio.json. El proceso normal ya no busca por nombre (los 8
+    informes son fijos e identifican su vista por 'view_luid'), asi que esto
+    solo hace falta la primera vez, o si algun dia cambia algun informe.
 
-    Dos formas de indicarlo:
-      - 'view_luid': la mas robusta, no cambia aunque se renombre el dashboard.
-      - Por nombre: workbook = informe['workbook'] (o, si no se indica,
-        informe['nombre']), dentro del proyecto 'proyecto_ruta' (del informe
-        o, si no, el global de la config). La vista es informe['vista'] o,
-        si el workbook tiene una sola, esa.
+    No usa cargar_config(): el fichero puede no tener 'view_luid' todavia
+    (o puede que ya lo tenga; esta funcion lo ignora). Solo necesita las
+    claves tableau_* y la lista 'informes' con 'nombre'.
 
     Args:
-        servidor: objeto Server ya autenticado.
-        config: diccionario de configuracion (para 'proyecto_ruta').
-        informe: diccionario del informe (una entrada de 'informes').
-
-    Returns:
-        Tupla (vista, workbook_luid): el ViewItem de tableauserverclient y
-        el LUID de su workbook (lo necesita la Metadata API).
-
-    Raises:
-        LookupError: si el proyecto, el workbook o la vista no existen, o
-            son ambiguos.
-    """
-    if informe.get('view_luid'):
-        vista = servidor.views.get_by_id(informe['view_luid'])
-        return vista, vista.workbook_id
-
-    import tableauserverclient as TSC
-
-    nombre_wb = informe.get('workbook') or informe['nombre']
-    ruta = informe.get('proyecto_ruta') or config.get('proyecto_ruta')
-
-    opciones = TSC.RequestOptions(pagesize=100)
-    opciones.filter.add(TSC.Filter(TSC.RequestOptions.Field.Name,
-                                   TSC.RequestOptions.Operator.Equals, nombre_wb))
-    workbooks = list(TSC.Pager(servidor.workbooks, opciones))
-    if ruta:
-        ids = ids_proyecto_por_ruta(servidor, ruta)
-        workbooks = [w for w in workbooks if w.project_id in ids]
-    if len(workbooks) != 1:
-        raise LookupError(
-            f"workbook '{nombre_wb}': {len(workbooks)} coincidencias"
-            + ("" if ruta else " (indica 'proyecto_ruta' para acotar)"))
-
-    servidor.workbooks.populate_views(workbooks[0])
-    vistas = workbooks[0].views
-    if informe.get('vista'):
-        vistas = [v for v in vistas if v.name == informe['vista']]
-    if len(vistas) != 1:
-        raise LookupError(
-            f"'{nombre_wb}': {len(vistas)} vistas candidatas ("
-            + ", ".join(v.name for v in workbooks[0].views)
-            + "). Indica cual con 'vista'")
-    return vistas[0], workbooks[0].id
-
-
-def descargar_tabla(servidor, vista, cache_maxima_minutos=1):
-    """
-    Descarga los datos de una vista de Tableau como CSV.
-
-    Con 'maxAge' se limita la antiguedad de la cache de Tableau: en una
-    conexion en vivo, sin esto podria servirse un resultado de hace horas
-    aunque la base de datos ya se haya cargado.
-
-    Args:
-        servidor: objeto Server ya autenticado.
-        vista: ViewItem devuelto por localizar_vista.
-        cache_maxima_minutos: antiguedad maxima admitida de la cache, en
-            minutos (minimo 1).
-
-    Returns:
-        Texto del CSV tal como lo entrega Tableau.
+        fichero_config: ruta del fichero de configuracion a leer.
+        proyecto_ruta: ruta del proyecto donde buscar. Si es None, se toma
+            de 'proyecto_ruta' dentro del propio fichero.
     """
     try:
+        with open(fichero_config, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+    except FileNotFoundError:
+        log.error("No se encuentra %s", fichero_config)
+        sys.exit(1)
+    except json.JSONDecodeError as e:
+        log.error("El fichero %s tiene un error de sintaxis: %s", fichero_config, e)
+        sys.exit(1)
+
+    faltan = [c for c in CLAVES_TABLEAU + ['informes'] if c not in config or config[c] in ('', [])]
+    if faltan:
+        log.error("Faltan claves en %s: %s", fichero_config, ", ".join(faltan))
+        sys.exit(1)
+
+    ruta = proyecto_ruta or config.get('proyecto_ruta')
+    if not ruta:
+        log.error("Indica la ruta del proyecto con --proyecto-ruta (la config no la tiene)")
+        sys.exit(1)
+
+    servidor = conectar_tableau(config)
+    log.info("Conectado a Tableau")
+    try:
         import tableauserverclient as TSC
-        opciones = TSC.CSVRequestOptions(maxage=cache_maxima_minutos)
-    except (ImportError, TypeError):   # libreria antigua sin maxage
-        opciones = None
-    servidor.views.populate_csv(vista, opciones)
-    return b"".join(vista.csv).decode('utf-8-sig')
+        ids_proyecto = _ids_proyecto_por_ruta(servidor, ruta)
+
+        resultado = []
+        for informe in config['informes']:
+            nombre = informe['nombre']
+            log.info("%s:", nombre)
+            try:
+                opciones = TSC.RequestOptions(pagesize=100)
+                opciones.filter.add(TSC.Filter(TSC.RequestOptions.Field.Name,
+                                               TSC.RequestOptions.Operator.Equals, nombre))
+                workbooks = [w for w in TSC.Pager(servidor.workbooks, opciones)
+                            if w.project_id in ids_proyecto]
+                if len(workbooks) != 1:
+                    log.error("    %d workbooks encontrados con ese nombre en la ruta", len(workbooks))
+                    continue
+
+                servidor.workbooks.populate_views(workbooks[0])
+                vistas = workbooks[0].views
+                if len(vistas) != 1:
+                    log.warning("    %d vistas en este workbook: %s", len(vistas),
+                               ", ".join(v.name for v in vistas))
+                    log.warning("    Elige la correcta y usa su LUID abajo:")
+                    for v in vistas:
+                        log.warning("      %s: %s", v.name, v.id)
+                    continue
+
+                log.info("    view_luid: %s", vistas[0].id)
+                resultado.append({"nombre": nombre, "view_luid": vistas[0].id})
+            except Exception as e:
+                log.error("    Error: %s", e)
+    finally:
+        try:
+            servidor.auth.sign_out()
+        except Exception:
+            pass
+
+    print()
+    print("=" * 60)
+    print("Bloque 'informes' listo para pegar en config_envio.json:")
+    print("=" * 60)
+    print(json.dumps(resultado, ensure_ascii=False, indent=2))
+
 
 
 def descargar_excel_bytes(servidor, vista, cache_maxima_minutos=1):
@@ -1000,7 +743,7 @@ def fecha_por_tablas_origen(servidor, workbook_luid):
     return min(fechas_tablas)
 
 
-def diagnosticar_informe(servidor, config, informe):
+def diagnosticar_informe(servidor, informe):
     """
     Muestra en el log que ve la Metadata API para el workbook de un informe:
     fuentes publicadas, fuentes embebidas (con o sin extracto) y bases de
@@ -1009,14 +752,13 @@ def diagnosticar_informe(servidor, config, informe):
 
     Args:
         servidor: objeto Server ya autenticado.
-        config: diccionario de configuracion.
         informe: diccionario del informe (una entrada de 'informes').
 
     Returns:
         No devuelve nada (escribe en el log).
     """
     try:
-        _, workbook_luid = localizar_vista(servidor, config, informe)
+        _, workbook_luid = localizar_vista(servidor, informe)
     except Exception as e:
         log.error("        No se pudo localizar el workbook: %s", e)
         return
@@ -1320,132 +1062,55 @@ def preparar_informe(servidor, config, informe, hoy):
     """
     nombre = informe['nombre']
 
-    # 'fecha_columna' necesita las filas del CSV de datos, asi que fuerza ese origen.
-    origen = 'csv' if informe.get('fecha_columna') else informe.get('origen_datos', config['origen_datos'])
-
-    # La fecha se comprueba ANTES de descargar la tabla: si no es la de hoy,
+    # La fecha se comprueba ANTES de descargar el Excel: si no es la de hoy,
     # no hace falta bajar nada.
     try:
-        vista, workbook_luid = localizar_vista(servidor, config, informe)
-        if not informe.get('fecha_columna'):
-            fecha = fecha_actualizacion_fuentes(servidor, workbook_luid)
-            if fecha is None:
-                log.error("        No se puede comprobar la fecha de actualizacion de este workbook")
-                log.error("        Si la fecha esta dentro del dashboard, indica 'fecha_columna'. "
-                          "Ejecuta con --diagnostico para ver de donde salen sus datos")
-                return 'error', None
-            if fecha != hoy:
-                log.warning("        DESCARTADO: datos actualizados el %s, no el %s",
-                            fecha.strftime('%d/%m/%Y'), hoy.strftime('%d/%m/%Y'))
-                return 'descartado', None
-        if origen == 'crosstab':
-            contenido_excel = descargar_excel_bytes(servidor, vista, config['cache_maxima_minutos'])
-        else:
-            contenido = descargar_tabla(servidor, vista, config['cache_maxima_minutos'])
+        vista, workbook_luid = localizar_vista(servidor, informe)
+        fecha = fecha_actualizacion_fuentes(servidor, workbook_luid)
+        if fecha is None:
+            log.error("        No se puede comprobar la fecha de actualizacion de este workbook")
+            log.error("        Ejecuta con --diagnostico para ver de donde salen sus datos")
+            return 'error', None
+        if fecha != hoy:
+            log.warning("        DESCARTADO: datos actualizados el %s, no el %s",
+                        fecha.strftime('%d/%m/%Y'), hoy.strftime('%d/%m/%Y'))
+            return 'descartado', None
+        contenido_excel = descargar_excel_bytes(servidor, vista, config['cache_maxima_minutos'])
     except Exception as e:
         log.error("        Error al consultar Tableau: %s", e)
         return 'error', None
 
     ruta = Path(config['directorio_salida']) / f"{sanear_nombre_archivo(nombre)}_{hoy.isoformat()}.csv"
 
-    # Origen 'crosstab': el Excel que exporta Tableau ya tiene la disposicion
-    # del dashboard; solo se convierte a CSV, que es lo que se envia.
-    if origen == 'crosstab':
-        try:
-            tabla = excel_a_filas(contenido_excel, informe.get('hoja_excel'),
-                                  informe.get('separador_miles', config['separador_miles']))
-        except Exception as e:
-            log.error("        No se pudo leer el Excel de Tableau: %s", e)
-            return 'error', None
-        if len(tabla) < 2:
-            log.warning("        La tabla llego sin filas: no se envia")
-            return 'error', None
-
-        # Etiquetas de grupo (PROMO, NO PROMO...) repetidas en cada fila.
-        # 'rellenar_columnas' fija cuales (por nombre de cabecera); con []
-        # se desactiva; por defecto, las columnas de texto de la izquierda.
-        rellenar = informe.get('rellenar_columnas')
-        if rellenar is None and config['rellenar_etiquetas']:
-            indices = columnas_de_etiquetas(tabla)
-        else:
-            indices = [tabla[0].index(n) for n in (rellenar or []) if n in tabla[0]]
-        if indices:
-            repetidas = rellenar_etiquetas(tabla, indices)
-            if repetidas:
-                log.info("        Etiquetas repetidas en cada fila (%s): %d celdas rellenadas",
-                         ", ".join(tabla[0][i] for i in indices), repetidas)
-        log.info("        Fecha de actualizacion correcta (%s), %d filas (disposicion del dashboard)",
-                 fecha.strftime('%d/%m/%Y'), len(tabla) - 1)
-        try:
-            escribir_filas_csv(ruta, tabla, config['csv_separador'])
-        except PermissionError:
-            log.error("        No se pudo escribir %s: esta abierto en otro programa (ciérralo e "
-                      "intenta de nuevo)", ruta)
-            return 'error', None
-        return 'listo', ruta
-
-    columnas, filas = leer_csv(contenido)
-    if not filas:
+    # El Excel que exporta Tableau ya tiene la disposicion del dashboard;
+    # solo se convierte a CSV, que es lo que se envia.
+    try:
+        tabla = excel_a_filas(contenido_excel, informe.get('hoja_excel'),
+                              informe.get('separador_miles', config['separador_miles']))
+    except Exception as e:
+        log.error("        No se pudo leer el Excel de Tableau: %s", e)
+        return 'error', None
+    if len(tabla) < 2:
         log.warning("        La tabla llego sin filas: no se envia")
         return 'error', None
 
-    # Alternativa: la fecha esta en una columna del propio dashboard.
-    if informe.get('fecha_columna'):
-        fecha = fecha_actualizacion(filas, informe['fecha_columna'], config['formatos_fecha'])
-        if fecha is None:
-            log.error("        No se pudo leer la fecha de actualizacion en la columna '%s'",
-                      informe['fecha_columna'])
-            log.error("        Columnas recibidas: %s", ", ".join(columnas))
-            return 'error', None
-        if fecha != hoy:
-            log.warning("        DESCARTADO: datos actualizados el %s, no el %s",
-                        fecha.strftime('%d/%m/%Y'), hoy.strftime('%d/%m/%Y'))
-            return 'descartado', None
-
-    log.info("        Fecha de actualizacion correcta (%s), %d filas", fecha.strftime('%d/%m/%Y'), len(filas))
-
-    medidas_pivot = []   # columnas que han salido de pivotar 'Measure Names'
-    if informe.get('pivotar_medidas', True):
-        filas_largas = len(filas)
-        columnas_largas = columnas
-        columnas, filas = pivotar_medidas(columnas, filas)
-        medidas_pivot = [c for c in columnas if c not in columnas_largas]
-        if len(filas) != filas_largas:
-            log.info("        Medidas pivotadas: %d filas largas -> %d filas, %d columnas",
-                     filas_largas, len(filas), len(columnas))
-
-    if informe.get('excluir_columnas'):
-        columnas = [c for c in columnas if c not in informe['excluir_columnas']]
-
-    columnas, filas = dar_formato_columnas(
-        columnas, filas, informe.get('renombrar_columnas'), informe.get('orden_columnas'))
-
-    # Por defecto son porcentajes las columnas cuyo nombre empieza por '%'
-    # (p. ej. '% S/ Ppto'); 'columnas_porcentaje' lo fija a mano (con []
-    # se desactiva). Los nombres son los finales, tras renombrar.
-    columnas_pct = informe.get('columnas_porcentaje')
-    if columnas_pct is None:
-        columnas_pct = [c for c in columnas if c.lstrip().startswith('%')]
-    if columnas_pct:
-        formatear_porcentajes(filas, columnas_pct,
-                              informe.get('decimales_porcentaje', config['decimales_porcentaje']))
-        log.info("        Columnas de porcentaje: %s", ", ".join(columnas_pct))
-
-    # Importes: por defecto, las medidas que salen del pivotado (sin las de
-    # porcentaje). 'columnas_numericas' lo fija a mano; 'decimales_numeros'
-    # a null (None) desactiva el redondeo.
-    decimales = informe.get('decimales_numeros', config['decimales_numeros'])
-    columnas_num = informe.get('columnas_numericas')
-    if columnas_num is None:
-        renombrar = informe.get('renombrar_columnas') or {}
-        columnas_num = [renombrar.get(c, c) for c in medidas_pivot]
-    columnas_num = [c for c in columnas_num if c in columnas and c not in columnas_pct]
-    if decimales is not None and columnas_num:
-        redondear_numeros(filas, columnas_num, decimales)
-        log.info("        Columnas redondeadas a %d decimales: %s", decimales, ", ".join(columnas_num))
-
+    # Etiquetas de grupo (PROMO, NO PROMO...) repetidas en cada fila.
+    # 'rellenar_columnas' fija cuales (por nombre de cabecera); con []
+    # se desactiva; por defecto, las columnas de texto de la izquierda.
+    rellenar = informe.get('rellenar_columnas')
+    if rellenar is None and config['rellenar_etiquetas']:
+        indices = columnas_de_etiquetas(tabla)
+    else:
+        indices = [tabla[0].index(n) for n in (rellenar or []) if n in tabla[0]]
+    if indices:
+        repetidas = rellenar_etiquetas(tabla, indices)
+        if repetidas:
+            log.info("        Etiquetas repetidas en cada fila (%s): %d celdas rellenadas",
+                     ", ".join(tabla[0][i] for i in indices), repetidas)
+    log.info("        Fecha de actualizacion correcta (%s), %d filas (disposicion del dashboard)",
+             fecha.strftime('%d/%m/%Y'), len(tabla) - 1)
     try:
-        escribir_csv(ruta, columnas, filas, config['csv_separador'])
+        escribir_filas_csv(ruta, tabla, config['csv_separador'])
     except PermissionError:
         log.error("        No se pudo escribir %s: esta abierto en otro programa (ciérralo e "
                   "intenta de nuevo)", ruta)
@@ -1492,8 +1157,7 @@ def enviar_lote(config, listos, hoy, fallidos=None, estado=None, hoy_txt=None):
     aviso con su nombre, indicando que se reintentara automaticamente en un
     envio posterior. Un informe fallido cuyos destinatarios no coinciden con
     ningun correo que SI se envia en esta pasada no genera ningun correo al
-    cliente por si solo (su fallo queda registrado igualmente para el aviso
-    interno de --aviso).
+    cliente por si solo (queda igualmente en el RESUMEN final del log).
 
     Si se pasan 'estado' y 'hoy_txt', tras cada grupo enviado con exito se
     marca de inmediato en 'estado' y se guarda en disco -- igual que con un
@@ -1597,10 +1261,18 @@ def main():
     parser.add_argument('--probar-correo', metavar='DIRECCION',
                         help="envia un correo de prueba a esa direccion (sin usar Tableau) "
                              "para comprobar el envio por Graph")
-    parser.add_argument('--aviso', action='store_true',
-                        help="envia a 'destinatarios_aviso' la lista de informes que no salieron "
-                             "(usar solo en la ultima ejecucion del dia)")
+    parser.add_argument('--obtener-luids', action='store_true',
+                        help="herramienta de un solo uso: busca cada informe por nombre en "
+                             "Tableau y muestra su view_luid, listo para pegar en la "
+                             "configuracion; no envia nada ni necesita datos de Graph")
+    parser.add_argument('--proyecto-ruta', metavar='RUTA',
+                        help="con --obtener-luids: ruta del proyecto donde buscar, si la "
+                             "config ya no tiene guardada 'proyecto_ruta'")
     args = parser.parse_args()
+
+    if args.obtener_luids:
+        obtener_luids(args.config, args.proyecto_ruta)
+        return
 
     inicio = time.time()
     config = cargar_config(args.config)
@@ -1622,7 +1294,7 @@ def main():
             sys.exit(1)
         servidor = conectar_tableau(config)
         try:
-            vista, _ = localizar_vista(servidor, config, elegidos[0])
+            vista, _ = localizar_vista(servidor, elegidos[0])
             ruta = Path(config['directorio_salida']) / f"{sanear_nombre_archivo(args.crosstab_excel)}_crosstab.xlsx"
             descargar_crosstab_excel(servidor, vista, ruta, config['cache_maxima_minutos'])
             log.info("Excel (crosstab) guardado en %s", ruta)
@@ -1640,7 +1312,7 @@ def main():
         servidor = conectar_tableau(config)
         for numero, informe in enumerate(config['informes'], start=1):
             log.info("[%d/%d] %s", numero, len(config['informes']), informe['nombre'])
-            diagnosticar_informe(servidor, config, informe)
+            diagnosticar_informe(servidor, informe)
         try:
             servidor.auth.sign_out()
         except Exception:
@@ -1655,7 +1327,7 @@ def main():
         if i['nombre'] in ya_enviados:
             log.info("[ya enviado hoy] %s", i['nombre'])
 
-    resultados = {'enviado': [], 'descartado': [], 'error': []}
+    resultados = {'enviado': [], 'descartado': [], 'error': [], 'bloqueado': []}
     if pendientes:
         servidor = conectar_tableau(config)
         listos = []     # [(informe, ruta), ...] listos para enviar en esta pasada
@@ -1678,6 +1350,23 @@ def main():
         except Exception:
             pass
 
+        # Los 8 informes comparten la misma fuente de datos: si alguno se ha
+        # descartado por no estar actualizado a hoy, la fuente en su conjunto
+        # no esta lista, y no se envia NINGUN correo esta pasada -- ni
+        # siquiera con los informes que si salieron bien. Se reintentaran
+        # todos juntos en la siguiente pasada, cuando la fuente ya este al
+        # dia para todos.
+        if listos and resultados['descartado']:
+            log.warning("        BLOQUEADO: la fuente compartida aun no esta actualizada a hoy "
+                        "(%s) -- no se envia ningun correo esta pasada, aunque %d informe(s) "
+                        "estuvieran listos", ", ".join(resultados['descartado']), len(listos))
+            resultados['bloqueado'] = [informe['nombre'] for informe, _ in listos]
+            listos = []
+        elif not enviar and resultados['enviado'] and resultados['descartado']:
+            log.warning("        (modo --sin-enviar) en un envio real, estos %d informe(s) NO se "
+                        "enviarian: la fuente compartida aun no esta actualizada a hoy (%s)",
+                        len(resultados['enviado']), ", ".join(resultados['descartado']))
+
         # Se agrupan aqui, tras cerrar la sesion de Tableau: el envio de
         # correo no necesita ya ninguna conexion con Tableau.
         if listos:
@@ -1685,22 +1374,10 @@ def main():
             for nombre, resultado in resultados_envio.items():
                 resultados[resultado].append(nombre)
 
-    # Aviso interno de lo que no salio, para que no pase desapercibido. Solo
-    # con --aviso: si la tarea se repite varias veces al dia, se pide solo en
-    # la ultima para no mandar un aviso en cada pasada.
-    incidencias = resultados['descartado'] + resultados['error']
-    if args.aviso and incidencias and enviar and config['destinatarios_aviso']:
-        cuerpo = (f"Informes que NO se han enviado hoy ({hoy.strftime('%d/%m/%Y')}):\n\n"
-                  + "\n".join(f"- {n} (fecha de datos no actualizada)" for n in resultados['descartado'])
-                  + ("\n" if resultados['descartado'] else "")
-                  + "\n".join(f"- {n} (error tecnico, ver log)" for n in resultados['error']))
-        enviar_correo(config, config['destinatarios_aviso'],
-                      f"Aviso envio CSV Tableau {hoy.strftime('%d/%m/%Y')}: {len(incidencias)} sin enviar",
-                      cuerpo)
-
     log.info("=" * 60)
-    log.info("RESUMEN: enviados %d | descartados por fecha %d | errores %d | ya enviados hoy %d | %ds",
-             len(resultados['enviado']), len(resultados['descartado']),
+    log.info("RESUMEN: enviados %d | descartados por fecha %d | bloqueados (fuente no lista) %d | "
+             "errores %d | ya enviados hoy %d | %ds",
+             len(resultados['enviado']), len(resultados['descartado']), len(resultados['bloqueado']),
              len(resultados['error']), len(ya_enviados), int(time.time() - inicio))
     log.info("=" * 60)
 

@@ -34,7 +34,8 @@ Uso:
                                                         # como Excel (crosstab)
     python enviar_csv_dashboards.py --probar-correo tu@correo.com --metodo-correo smtp
                                                         # prueba solo el envio de
-                                                        # correo (sin Tableau)
+                                                        # correo (sin Tableau); tambien
+                                                        # vale 'outlook' o 'graph'
     python enviar_csv_dashboards.py --diagnostico-outlook
                                                         # con Outlook: que perfil/buzon
                                                         # usa la automatizacion
@@ -52,11 +53,13 @@ import sys
 import csv
 import json
 import time
+import base64
 import logging
 import unicodedata
 import smtplib
 import argparse
 import mimetypes
+import requests
 from io import BytesIO, StringIO
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
@@ -87,12 +90,18 @@ log = logging.getLogger(__name__)
 CLAVES_TABLEAU = ['tableau_server', 'tableau_token_name', 'tableau_token', 'tableau_site']
 CLAVES_CORREO = ['destinatarios']
 CLAVES_SMTP = ['smtp_servidor', 'remitente']
+CLAVES_GRAPH = ['graph_tenant_id', 'graph_client_id', 'graph_remitente']
+METODOS_CORREO = ('outlook', 'smtp', 'graph')
 CLAVES_OPCIONALES = {
     'metodo_correo': 'outlook',
     'remitente': '',
     'outlook_cuenta': '',
     'outlook_perfil': '',
     'outlook_espera_segundos': 30,
+    'graph_tenant_id': '',
+    'graph_client_id': '',
+    'graph_client_secret': '',
+    'graph_remitente': '',
     'directorio_salida': './csv_generados',
     'archivo_estado': './estado_envios.json',
     'csv_separador': ';',
@@ -120,8 +129,8 @@ def cargar_config(fichero, metodo_correo=None):
 
     Args:
         fichero: ruta del fichero de configuracion.
-        metodo_correo: si se indica ('outlook' o 'smtp'), sustituye al
-            'metodo_correo' del fichero solo en esta ejecucion.
+        metodo_correo: si se indica ('outlook', 'smtp' o 'graph'), sustituye
+            al 'metodo_correo' del fichero solo en esta ejecucion.
 
     Returns:
         Diccionario de configuracion validado. Si algo falta o esta mal, el
@@ -144,8 +153,8 @@ def cargar_config(fichero, metodo_correo=None):
     if metodo_correo:
         config['metodo_correo'] = metodo_correo
 
-    if config['metodo_correo'] not in ('outlook', 'smtp'):
-        log.error("'metodo_correo' debe ser 'outlook' o 'smtp'")
+    if config['metodo_correo'] not in METODOS_CORREO:
+        log.error("'metodo_correo' debe ser 'outlook', 'smtp' o 'graph'")
         sys.exit(1)
 
     origenes = [config['origen_datos']] + [i['origen_datos'] for i in config.get('informes', [])
@@ -157,10 +166,19 @@ def cargar_config(fichero, metodo_correo=None):
     obligatorias = CLAVES_TABLEAU + CLAVES_CORREO + ['informes']
     if config['metodo_correo'] == 'smtp':
         obligatorias += CLAVES_SMTP
+    elif config['metodo_correo'] == 'graph':
+        obligatorias += CLAVES_GRAPH
     faltan = [c for c in obligatorias if c not in config or config[c] in ('', [])]
     if faltan:
         log.error("Faltan claves obligatorias en %s: %s", fichero, ", ".join(faltan))
         sys.exit(1)
+
+    if config['metodo_correo'] == 'graph':
+        import os
+        if not config['graph_client_secret'] and not os.environ.get('GRAPH_CLIENT_SECRET'):
+            log.error("Falta 'graph_client_secret' en %s (o la variable de entorno "
+                      "GRAPH_CLIENT_SECRET)", fichero)
+            sys.exit(1)
 
     if not config['informes']:
         log.error("La lista 'informes' esta vacia")
@@ -1160,7 +1178,7 @@ def fecha_actualizacion_fuentes(servidor, workbook_luid):
 def enviar_correo(config, destinatarios, asunto, cuerpo, adjunto=None):
     """
     Envia un correo con el metodo de config['metodo_correo'] ('outlook' por
-    defecto, o 'smtp').
+    defecto, o 'smtp' o 'graph').
 
     Args:
         config: diccionario de configuracion.
@@ -1175,7 +1193,107 @@ def enviar_correo(config, destinatarios, asunto, cuerpo, adjunto=None):
     """
     if config['metodo_correo'] == 'smtp':
         return enviar_correo_smtp(config, destinatarios, asunto, cuerpo, adjunto)
+    if config['metodo_correo'] == 'graph':
+        return enviar_correo_graph(config, destinatarios, asunto, cuerpo, adjunto)
     return enviar_correo_outlook(config, destinatarios, asunto, cuerpo, adjunto)
+
+
+def obtener_token_graph(config):
+    """
+    Consigue un token de aplicacion (client credentials) para Microsoft
+    Graph, valido para enviar correo con el permiso de APLICACION
+    'Mail.Send' que debe conceder un administrador de Microsoft Entra ID.
+
+    El secreto se toma de config['graph_client_secret'] o, si esta vacio, de
+    la variable de entorno GRAPH_CLIENT_SECRET.
+
+    Args:
+        config: diccionario de configuracion, con 'graph_tenant_id',
+            'graph_client_id' y 'graph_client_secret'.
+
+    Returns:
+        Texto con el token de acceso, o None si Microsoft lo rechaza.
+    """
+    import os
+    url = f"https://login.microsoftonline.com/{config['graph_tenant_id']}/oauth2/v2.0/token"
+    datos = {
+        'client_id': config['graph_client_id'],
+        'client_secret': config['graph_client_secret'] or os.environ.get('GRAPH_CLIENT_SECRET', ''),
+        'scope': 'https://graph.microsoft.com/.default',
+        'grant_type': 'client_credentials',
+    }
+    try:
+        respuesta = requests.post(url, data=datos, timeout=15)
+    except Exception as e:
+        log.error("        No se pudo contactar con Microsoft para el token de Graph: %s", e)
+        return None
+
+    if respuesta.status_code != 200:
+        log.error("        Microsoft rechazo la autenticacion de Graph (codigo %d)", respuesta.status_code)
+        log.error("        Respuesta: %s", respuesta.text[:300])
+        return None
+
+    return respuesta.json()['access_token']
+
+
+def enviar_correo_graph(config, destinatarios, asunto, cuerpo, adjunto=None):
+    """
+    Envia un correo con Microsoft Graph (API REST): no usa Outlook ni SMTP,
+    asi que no depende de ningun perfil ni aviso de seguridad de escritorio.
+
+    Necesita una aplicacion registrada en Microsoft Entra ID (Azure AD), con
+    permiso de APLICACION 'Mail.Send' concedido por un administrador (mejor
+    restringido a un buzon concreto con una 'application access policy', no
+    a todo el tenant). 'graph_remitente' es el buzon (UPN) desde el que se
+    envia, que debe ser justo ese buzon autorizado.
+
+    Args:
+        config: diccionario de configuracion, con 'graph_tenant_id',
+            'graph_client_id', 'graph_client_secret' y 'graph_remitente'.
+        destinatarios: lista de direcciones de destino.
+        asunto: asunto del mensaje.
+        cuerpo: texto plano del mensaje.
+        adjunto: ruta de un fichero a adjuntar, o None.
+
+    Returns:
+        True si Microsoft Graph acepto el envio. False si fallo.
+    """
+    token = obtener_token_graph(config)
+    if not token:
+        return False
+
+    mensaje = {
+        'subject': asunto,
+        'body': {'contentType': 'Text', 'content': cuerpo},
+        'toRecipients': [{'emailAddress': {'address': d}} for d in destinatarios],
+    }
+    if adjunto:
+        adjunto = Path(adjunto)
+        mensaje['attachments'] = [{
+            '@odata.type': '#microsoft.graph.fileAttachment',
+            'name': adjunto.name,
+            'contentBytes': base64.b64encode(adjunto.read_bytes()).decode('ascii'),
+        }]
+
+    url = f"https://graph.microsoft.com/v1.0/users/{config['graph_remitente']}/sendMail"
+    cabeceras = {'Authorization': f"Bearer {token}", 'Content-Type': 'application/json'}
+
+    try:
+        respuesta = requests.post(url, headers=cabeceras,
+                                  json={'message': mensaje, 'saveToSentItems': True}, timeout=30)
+    except Exception as e:
+        log.error("        No se pudo enviar con Microsoft Graph: %s", e)
+        return False
+
+    if respuesta.status_code != 202:
+        log.error("        Microsoft Graph rechazo el envio (codigo %d)", respuesta.status_code)
+        log.error("        Respuesta: %s", respuesta.text[:300])
+        if respuesta.status_code == 403:
+            log.error("        Probable falta de permiso: la aplicacion necesita 'Mail.Send' "
+                      "(de APLICACION, con consentimiento de administrador) sobre este buzon")
+        return False
+
+    return True
 
 
 def enviar_correo_outlook(config, destinatarios, asunto, cuerpo, adjunto=None):
@@ -1786,7 +1904,7 @@ def main():
     parser.add_argument('--crosstab-excel', metavar='INFORME',
                         help="prueba: descarga como Excel (crosstab) el informe con ese nombre, "
                              "para ver la disposicion del dashboard; no envia nada")
-    parser.add_argument('--metodo-correo', choices=['outlook', 'smtp'],
+    parser.add_argument('--metodo-correo', choices=list(METODOS_CORREO),
                         help="usa este metodo de envio en esta ejecucion, sin cambiar "
                              "config_envio.json")
     parser.add_argument('--probar-correo', metavar='DIRECCION',

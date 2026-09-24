@@ -68,6 +68,12 @@ from datetime import datetime, date
 # LOG
 # ============================================================================
 # Sin emojis: la consola del servidor no siempre esta en UTF-8.
+# Python pone los niveles en ingles (INFO/WARNING/ERROR/...) por defecto; se
+# traducen aqui para que el log quede entero en espanol.
+logging.addLevelName(logging.WARNING, 'AVISO')
+logging.addLevelName(logging.CRITICAL, 'CRITICO')
+logging.addLevelName(logging.DEBUG, 'DEPURACION')
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s  %(levelname)-5s %(message)s',
@@ -1222,9 +1228,9 @@ def main():
                 pass
 
     log.info("=" * 60)
-    log.info("RESUMEN: enviados %d | descartados por fecha %d | errores %d | ya enviados hoy %d | %ds",
+    log.info("RESUMEN: enviados %d | descartados por fecha %d | errores %d | %ds",
              len(resultados['enviado']), len(resultados['descartado']),
-             len(resultados['error']), len(ya_enviados), int(time.time() - inicio))
+             len(resultados['error']), int(time.time() - inicio))
     log.info("=" * 60)
 
     if resultados['error']:

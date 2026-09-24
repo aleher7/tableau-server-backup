@@ -15,13 +15,14 @@ Flujo, para la lista 'informes' de config_envio.json (cada uno por su
        no se descarga ni se envia nada, bajo ninguna circunstancia: se anota
        en el log y se reintenta todo junto en la siguiente pasada.
     3. Si es HOY, se descarga la tabla en CSV de cada uno de los 8 informes
-       (misma disposicion visual que el dashboard) y los que quedan listos
-       se agrupan por destinatarios y se envian en el MENOR numero de
-       correos posible (uno por grupo, con todos sus CSV adjuntos), siempre
-       por Microsoft Graph. Si alguno de los informes falla por un problema
-       TECNICO al descargarlo (no por fecha, que ya se sabe que esta bien),
-       el correo de ese grupo incluye un aviso con su nombre y que se
-       reintentara mas tarde; esto no bloquea el envio de los demas.
+       (misma disposicion visual que el dashboard). Todo o nada: se envia
+       si y solo si los 8 se han podido generar. Si alguno falla por un
+       problema TECNICO al descargarlo (no por fecha, que ya se sabe que
+       esta bien), no se envia NADA esta pasada -- no hay aviso a medias,
+       se reintenta todo junto en la siguiente. Si todos salen bien, se
+       agrupan por destinatarios y se envian en el MENOR numero de correos
+       posible (uno por grupo, con todos sus CSV adjuntos), siempre por
+       Microsoft Graph.
 
 El script es idempotente por dia: guarda en estado_envios.json que informes
 ya se enviaron hoy y no los repite. Por eso la tarea programada puede
@@ -820,27 +821,6 @@ def fecha_actualizacion_fuentes(servidor, workbook_luid):
 # CORREO
 # ============================================================================
 
-def enviar_correo(config, destinatarios, asunto, cuerpo, adjuntos=None):
-    """
-    Envia un correo con Microsoft Graph. Punto unico de envio del script:
-    el resto del codigo llama siempre a esta funcion, nunca directamente a
-    enviar_correo_graph.
-
-    Args:
-        config: diccionario de configuracion.
-        destinatarios: lista de direcciones de destino.
-        asunto: asunto del mensaje.
-        cuerpo: texto plano del mensaje.
-        adjuntos: lista de rutas de ficheros a adjuntar (un correo puede
-            llevar varios, p. ej. un informe por cada uno). None o lista
-            vacia si no lleva ninguno.
-
-    Returns:
-        True si Microsoft Graph acepto el envio. False si fallo.
-    """
-    return enviar_correo_graph(config, destinatarios, asunto, cuerpo, adjuntos)
-
-
 def obtener_token_graph(config):
     """
     Consigue un token de aplicacion (client credentials) para Microsoft
@@ -879,7 +859,7 @@ def obtener_token_graph(config):
     return respuesta.json()['access_token']
 
 
-def enviar_correo_graph(config, destinatarios, asunto, cuerpo, adjuntos=None):
+def enviar_correo(config, destinatarios, asunto, cuerpo, adjuntos=None):
     """
     Envia un correo con Microsoft Graph (API REST): no usa Outlook ni SMTP,
     asi que no depende de ningun perfil ni aviso de seguridad de escritorio.
@@ -975,11 +955,13 @@ def probar_correo(config, direccion):
 # PROCESO DE UN INFORME
 # ============================================================================
 
-def preparar_informe(servidor, config, informe, hoy, fecha=None):
+def preparar_informe(servidor, config, informe, hoy, fecha):
     """
-    Descarga un informe y, si esta al dia, genera su CSV. No envia nada:
-    main() agrupa los informes que preparar_informe() deja listos en la
-    misma pasada y los manda en el menor numero de correos posible (ver
+    Descarga un informe y genera su CSV. Su fecha de actualizacion ya se
+    comprobo en main() (los 8 informes comparten la misma fuente, asi que
+    se comprueba una sola vez para todos, no aqui por cada uno). No envia
+    nada: main() agrupa los informes que preparar_informe() deja listos en
+    la misma pasada y los manda en el menor numero de correos posible (ver
     enviar_lote).
 
     Args:
@@ -987,34 +969,18 @@ def preparar_informe(servidor, config, informe, hoy, fecha=None):
         config: diccionario de configuracion.
         informe: diccionario del informe (una entrada de 'informes').
         hoy: objeto date del dia de envio.
-        fecha: fecha de actualizacion ya comprobada (los 8 informes
-            comparten la misma fuente, asi que main() la comprueba UNA sola
-            vez y la pasa aqui para los demas, sin repetir la consulta a la
-            Metadata API por cada informe). Si es None, se comprueba aqui
-            mismo (uso suelto, p.ej. desde procesar_informe).
+        fecha: fecha de actualizacion de la fuente compartida, ya
+            comprobada por main() (solo para el mensaje de log).
 
     Returns:
-        Tupla (estado, ruta). estado es uno de: 'listo' (con la ruta del
-        CSV generado), 'descartado' (fecha no es hoy: caso normal, ruta
-        None), 'error' (fallo tecnico: Tableau, formato de fichero, ruta
-        None).
+        Tupla (estado, ruta). estado es 'listo' (con la ruta del CSV
+        generado) o 'error' (fallo tecnico: Tableau, formato de fichero;
+        ruta None).
     """
     nombre = informe['nombre']
 
-    # La fecha se comprueba ANTES de descargar el Excel: si no es la de hoy,
-    # no hace falta bajar nada.
     try:
-        vista, workbook_luid = localizar_vista(servidor, config, informe)
-        if fecha is None:
-            fecha = fecha_actualizacion_fuentes(servidor, workbook_luid)
-            if fecha is None:
-                log.error("        No se puede comprobar la fecha de actualizacion de este workbook")
-                log.error("        Ejecuta con --diagnostico para ver de donde salen sus datos")
-                return 'error', None
-            if fecha != hoy:
-                log.warning("        DESCARTADO: datos actualizados el %s, no el %s",
-                            fecha.strftime('%d/%m/%Y'), hoy.strftime('%d/%m/%Y'))
-                return 'descartado', None
+        vista, _ = localizar_vista(servidor, config, informe)
         contenido_excel = descargar_excel_bytes(servidor, vista, config['cache_maxima_minutos'])
     except Exception as e:
         log.error("        Error al consultar Tableau: %s", e)
@@ -1058,62 +1024,24 @@ def preparar_informe(servidor, config, informe, hoy, fecha=None):
     return 'listo', ruta
 
 
-def procesar_informe(servidor, config, informe, hoy, enviar):
+def enviar_lote(config, listos, hoy, estado, hoy_txt):
     """
-    Prepara un unico informe y, si 'enviar' es True, lo manda en su propio
-    correo. Envoltorio de conveniencia sobre preparar_informe() +
-    enviar_lote() para un solo informe (util en pruebas sueltas); main()
-    prepara varios informes y los agrupa en el menor numero de correos.
+    Envia TODOS los informes preparados en esta pasada (se llama solo cuando
+    los 8 han quedado listos: si alguno hubiera fallado, main() no la
+    llama). En el MENOR numero de correos posible: los que comparten los
+    mismos destinatarios (lo habitual, salvo que un informe fije los suyos
+    propios) van juntos en un unico correo, con todos sus CSV adjuntos.
 
-    Args:
-        servidor: objeto Server ya autenticado.
-        config: diccionario de configuracion.
-        informe: diccionario del informe (una entrada de 'informes').
-        hoy: objeto date del dia de envio.
-        enviar: si es False, prepara el CSV pero no envia nada (--sin-enviar).
-
-    Returns:
-        Uno de: 'enviado', 'descartado' (fecha no es hoy: caso normal),
-        'error' (fallo tecnico).
-    """
-    estado, ruta = preparar_informe(servidor, config, informe, hoy)
-    if estado != 'listo':
-        return estado
-    if not enviar:
-        log.info("        (modo --sin-enviar) CSV generado en %s", ruta)
-        return 'enviado'
-    return enviar_lote(config, [(informe, ruta)], hoy)[informe['nombre']]
-
-
-def enviar_lote(config, listos, hoy, fallidos=None, estado=None, hoy_txt=None):
-    """
-    Envia los informes preparados en esta pasada, en el MENOR numero de
-    correos posible: los que comparten los mismos destinatarios (lo
-    habitual, salvo que un informe fije los suyos propios) van juntos en un
-    unico correo, con todos sus CSV adjuntos.
-
-    Si en esta misma pasada algun OTRO informe con esos mismos destinatarios
-    fallo por un problema tecnico (ver 'fallidos'), el correo incluye un
-    aviso con su nombre, indicando que se reintentara automaticamente en un
-    envio posterior. Un informe fallido cuyos destinatarios no coinciden con
-    ningun correo que SI se envia en esta pasada no genera ningun correo al
-    cliente por si solo (queda igualmente en el RESUMEN final del log).
-
-    Si se pasan 'estado' y 'hoy_txt', tras cada grupo enviado con exito se
-    marca de inmediato en 'estado' y se guarda en disco -- igual que con un
-    envio individual, si el proceso se interrumpe a mitad no se pierde ni
-    se duplica ningun informe ya confirmado. Sin esos argumentos (uso suelto,
-    p. ej. desde procesar_informe en pruebas) no se toca el fichero de estado.
+    Tras cada grupo enviado con exito se marca de inmediato en 'estado' y se
+    guarda en disco: si el proceso se interrumpe a mitad, no se pierde ni se
+    duplica ningun informe ya confirmado.
 
     Args:
         config: diccionario de configuracion.
         listos: lista de tuplas (informe, ruta) ya preparadas (CSV escrito
             en disco), pendientes de enviar.
         hoy: objeto date del dia de envio.
-        fallidos: lista de informes (diccionarios) que fallaron por un
-            problema tecnico en esta misma pasada, o None.
-        estado: diccionario de cargar_estado(), se actualiza en sitio. None
-            para no tocar el fichero de estado.
+        estado: diccionario de cargar_estado(), se actualiza en sitio.
         hoy_txt: cadena 'YYYY-MM-DD' de hoy, la clave de 'estado'.
 
     Returns:
@@ -1124,11 +1052,6 @@ def enviar_lote(config, listos, hoy, fallidos=None, estado=None, hoy_txt=None):
         destinatarios = tuple(informe.get('destinatarios') or config['destinatarios'])
         grupos.setdefault(destinatarios, []).append((informe, ruta))
 
-    grupos_fallidos = {}
-    for informe in (fallidos or []):
-        destinatarios = tuple(informe.get('destinatarios') or config['destinatarios'])
-        grupos_fallidos.setdefault(destinatarios, []).append(informe['nombre'])
-
     resultados = {}
     for destinatarios, items in grupos.items():
         nombres = [informe['nombre'] for informe, _ in items]
@@ -1137,35 +1060,19 @@ def enviar_lote(config, listos, hoy, fallidos=None, estado=None, hoy_txt=None):
         if len(items) == 1:
             asunto = f"{nombres[0]} - datos a {hoy.strftime('%d/%m/%Y')}"
             cuerpo = (f"Buenos dias,\n\nadjuntamos el informe \"{nombres[0]}\" con los datos "
-                      f"actualizados a {hoy.strftime('%d/%m/%Y')}.")
+                      f"actualizados a {hoy.strftime('%d/%m/%Y')}.\n\nUn saludo.")
         else:
             lista = "\n".join(f"- {n}" for n in nombres)
             asunto = f"Informes Tableau - datos a {hoy.strftime('%d/%m/%Y')}"
             cuerpo = (f"Buenos dias,\n\nadjuntamos los siguientes informes con los datos "
-                      f"actualizados a {hoy.strftime('%d/%m/%Y')}:\n\n{lista}")
-
-        nombres_fallidos = grupos_fallidos.get(destinatarios, [])
-        if nombres_fallidos:
-            if len(nombres_fallidos) == 1:
-                cuerpo += (f"\n\nAviso: no ha sido posible generar el informe "
-                          f"\"{nombres_fallidos[0]}\" por un problema tecnico. Se reintentara "
-                          f"automaticamente en un envio posterior.")
-            else:
-                lista_fallidos = "\n".join(f"- {n}" for n in nombres_fallidos)
-                cuerpo += (f"\n\nAviso: los siguientes informes no se han podido generar por un "
-                          f"problema tecnico y se reintentaran automaticamente en un envio "
-                          f"posterior:\n\n{lista_fallidos}")
-
-        cuerpo += "\n\nUn saludo."
+                      f"actualizados a {hoy.strftime('%d/%m/%Y')}:\n\n{lista}\n\nUn saludo.")
 
         if enviar_correo(config, list(destinatarios), asunto, cuerpo, rutas):
-            log.info("        Enviado a %s: %s%s", ", ".join(destinatarios), ", ".join(nombres),
-                     f" (con aviso de fallo: {', '.join(nombres_fallidos)})" if nombres_fallidos else "")
+            log.info("        Enviado a %s: %s", ", ".join(destinatarios), ", ".join(nombres))
             for nombre in nombres:
                 resultados[nombre] = 'enviado'
-            if estado is not None:
-                estado.setdefault(hoy_txt, []).extend(nombres)
-                guardar_estado(config['archivo_estado'], estado, hoy_txt)
+            estado.setdefault(hoy_txt, []).extend(nombres)
+            guardar_estado(config['archivo_estado'], estado, hoy_txt)
         else:
             log.error("        No se pudo enviar el correo con: %s", ", ".join(nombres))
             for nombre in nombres:
@@ -1284,27 +1191,28 @@ def main():
             else:
                 log.info("Fuente compartida actualizada correctamente (%s)",
                         fecha_fuente.strftime('%d/%m/%Y'))
-                listos = []     # [(informe, ruta), ...] listos para enviar en esta pasada
-                fallidos = []   # informes con error tecnico en esta pasada
+                listos = []     # [(informe, ruta), ...] listos en esta pasada
                 for numero, informe in enumerate(pendientes, start=1):
                     log.info("[%d/%d] %s", numero, len(pendientes), informe['nombre'])
                     estado_informe, ruta = preparar_informe(servidor, config, informe, hoy, fecha_fuente)
                     if estado_informe == 'listo':
-                        if enviar:
-                            listos.append((informe, ruta))
-                        else:
-                            log.info("        (modo --sin-enviar) CSV generado en %s", ruta)
-                            resultados['enviado'].append(informe['nombre'])
+                        listos.append((informe, ruta))
                     else:
-                        resultados[estado_informe].append(informe['nombre'])
-                        if estado_informe == 'error':
-                            fallidos.append(informe)
+                        resultados['error'].append(informe['nombre'])
 
-                # Se agrupan aqui: el envio de correo no necesita conexion
-                # con Tableau, pero se hace dentro del 'try' para cerrar la
-                # sesion despues, ya se haya podido enviar o no.
-                if listos:
-                    resultados_envio = enviar_lote(config, listos, hoy, fallidos, estado, hoy_txt)
+                # Todo o nada: se envia si y solo si los 8 informes han
+                # quedado listos. Si alguno fallo por un problema tecnico,
+                # no se envia NADA esta pasada -- no hay aviso a medias, se
+                # reintenta todo junto en la siguiente pasada.
+                if resultados['error']:
+                    log.warning("No se envia ningun correo esta pasada: no se pudo generar %s",
+                                ", ".join(resultados['error']))
+                elif not enviar:
+                    for informe, ruta in listos:
+                        log.info("        (modo --sin-enviar) CSV generado en %s", ruta)
+                    resultados['enviado'].extend(informe['nombre'] for informe, _ in listos)
+                else:
+                    resultados_envio = enviar_lote(config, listos, hoy, estado, hoy_txt)
                     for nombre, resultado in resultados_envio.items():
                         resultados[resultado].append(nombre)
         finally:

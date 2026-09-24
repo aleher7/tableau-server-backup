@@ -173,6 +173,42 @@ def sanear_nombre_archivo(nombre):
     return nombre.translate(CARACTERES_INVALIDOS_WINDOWS).strip()
 
 
+_SUFIJO_FECHA_CSV = re.compile(r'_\d{4}-\d{2}-\d{2}\.csv$')
+
+
+def limpiar_csv_antiguos(directorio, hoy):
+    """
+    Borra del directorio de salida los CSV de informes de dias anteriores:
+    solo se conserva el de hoy de cada informe, no se acumulan indefinida-
+    mente. Un fichero que no siga el patron '..._AAAA-MM-DD.csv' (por
+    ejemplo prueba_correo.csv) se deja intacto.
+
+    Args:
+        directorio: carpeta de CSV generados.
+        hoy: objeto date del dia de envio.
+
+    Returns:
+        No devuelve nada.
+    """
+    carpeta = Path(directorio)
+    if not carpeta.is_dir():
+        return
+
+    sufijo_hoy = f"_{hoy.isoformat()}.csv"
+    borrados = 0
+    for fichero in carpeta.glob('*.csv'):
+        if fichero.name.endswith(sufijo_hoy) or not _SUFIJO_FECHA_CSV.search(fichero.name):
+            continue
+        try:
+            fichero.unlink()
+            borrados += 1
+        except OSError as e:
+            log.warning("No se pudo borrar %s: %s", fichero.name, e)
+
+    if borrados:
+        log.info("Limpieza: %d CSV de dias anteriores borrados de %s", borrados, carpeta)
+
+
 
 
 _NUMERO = re.compile(r'^[\s€$£]*[-+]?[\d.,]+[\s€$£]*$')
@@ -1160,6 +1196,8 @@ def main():
         except Exception:
             pass
         return
+
+    limpiar_csv_antiguos(config['directorio_salida'], hoy)
 
     estado = cargar_estado(config['archivo_estado'])
     ya_enviados = set() if args.forzar or not enviar else set(estado.get(hoy_txt, []))

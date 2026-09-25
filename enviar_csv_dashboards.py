@@ -781,14 +781,15 @@ def a_fecha_local(texto):
 
 def fecha_actualizacion_fuentes(servidor, workbook_luid):
     """
-    Consulta a la Metadata API la fecha de actualizacion de las fuentes de
-    datos publicadas de las que depende un workbook.
+    Consulta a la Metadata API la fecha de actualizacion de la fuente de
+    datos publicada de la que depende un workbook (los 8 informes comparten
+    la misma). De ella se toma la mas reciente entre extractLastRefreshTime
+    y extractLastUpdateTime; si no tiene fecha (conexion en vivo), se ignora.
 
-    De cada fuente se toma la mas reciente entre extractLastRefreshTime y
-    extractLastUpdateTime. Las fuentes sin fecha (conexion en vivo) no se
-    pueden comprobar y se ignoran. Si el workbook depende de varias fuentes
-    con extracto, se devuelve la MAS ANTIGUA: el informe solo esta al dia si
-    todas lo estan.
+    Por robustez, si la Metadata API llegara a devolver mas de una fuente
+    para el workbook, se queda con la MAS ANTIGUA de todas (el informe solo
+    esta al dia si todas lo estan) -- aunque en la practica, con una unica
+    fuente compartida, esto no cambia nada.
 
     Args:
         servidor: objeto Server ya autenticado.

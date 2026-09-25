@@ -4,13 +4,10 @@ ENVIO DIARIO POR CORREO DE TABLAS DE TABLEAU EN CSV
 
 Flujo, para la lista 'informes' de config_envio.json (cada uno por su
 'nombre', localizado en Tableau dentro de la carpeta 'proyecto_ruta'):
-    1. Los 8 informes comparten la misma fuente de datos, asi que su fecha
-       de actualizacion se comprueba UNA sola vez (consultando la Metadata
-       API con el primer informe pendiente), no una vez por informe.
-       Si el workbook lee EN VIVO de una base de datos (Tableau no guarda
-       fecha de refresco), se busca a traves de sus tablas de origen: se toma
-       el extracto publicado mas reciente que se alimenta de esas mismas
-       tablas, dejando aviso en el log.
+    1. Los 8 informes comparten la misma fuente de datos (un extracto
+       publicado), asi que su fecha de actualizacion se comprueba UNA sola
+       vez (consultando la Metadata API con el primer informe pendiente),
+       no una vez por informe.
     2. Si esa fecha NO es HOY (la carga del dia no ha llegado o ha fallado),
        no se descarga ni se envia nada, bajo ninguna circunstancia: se anota
        en el log y se reintenta todo junto en la siguiente pasada.
@@ -645,80 +642,6 @@ def excel_a_filas(contenido, hoja=None, miles=False):
     return [[f[i] for i in con_datos] for f in filas]
 
 
-def fecha_por_tablas_origen(servidor, workbook_luid):
-    """
-    Estima la fecha de actualizacion de un workbook que lee EN VIVO de una
-    base de datos (Tableau no guarda fecha de refresco en ese caso).
-
-    Se apoya en dos datos de la Metadata API: las tablas de origen del
-    workbook (upstreamTables) y, para cada tabla, las fuentes de datos que
-    dependen de ella (downstreamDatasources). De cada tabla se toma el
-    extracto PUBLICADO mas recientemente refrescado: si algun extracto
-    construido sobre esa tabla se ha refrescado hoy, la tabla ya tiene la
-    carga de hoy. Si el workbook lee de varias tablas, se devuelve la mas
-    antigua de ellas (todas deben estar al dia).
-
-    Es una comprobacion indirecta: no mira la base de datos, sino los
-    extractos que se alimentan de ella. Se deja constancia en el log.
-
-    Args:
-        servidor: objeto Server ya autenticado.
-        workbook_luid: LUID del workbook.
-
-    Returns:
-        Objeto date, o None si el workbook no tiene tablas de origen o
-        alguna de ellas no tiene ningun extracto publicado del que fiarse
-        (en ese caso no se puede comprobar y se anota el motivo).
-    """
-    consulta = (
-        "query { workbooks(filter: {luid: %s}) { upstreamTables { name schema "
-        "downstreamDatasources { __typename name ... on PublishedDatasource "
-        "{ projectName hasExtracts extractLastRefreshTime extractLastUpdateTime } } } } }"
-    ) % json.dumps(workbook_luid)
-
-    try:
-        respuesta = servidor.metadata.query(consulta)
-    except Exception as e:
-        log.warning("        No se pudo consultar las tablas de origen: %s", e)
-        return None
-    if respuesta.get('errors'):
-        log.warning("        La Metadata API rechazo la consulta de tablas de origen: %s",
-                    respuesta['errors'])
-        return None
-
-    tablas = ((respuesta['data']['workbooks'] or [{}])[0]).get('upstreamTables') or []
-    if not tablas:
-        log.info("        El workbook no tiene tablas de origen registradas")
-        return None
-
-    # Tableau puede registrar la misma tabla varias veces en un workbook (una
-    # por conexion): se agrupan por esquema.nombre para que cuenten como una.
-    por_tabla = {}
-    for tabla in tablas:
-        etiqueta = f"{tabla.get('schema') or '?'}.{tabla['name']}"
-        candidatas = por_tabla.setdefault(etiqueta, [])
-        for fuente in tabla.get('downstreamDatasources') or []:
-            if fuente.get('__typename') != 'PublishedDatasource':
-                continue
-            marcas = [fuente.get('extractLastRefreshTime'), fuente.get('extractLastUpdateTime')]
-            marcas = [a_fecha_local(m) for m in marcas if m]
-            if marcas:
-                candidatas.append((max(marcas), fuente['name'], fuente.get('projectName')))
-
-    fechas_tablas = []
-    for etiqueta, candidatas in por_tabla.items():
-        if not candidatas:
-            log.warning("        Tabla %s: ningun extracto publicado se alimenta de ella, "
-                        "no se puede comprobar su fecha", etiqueta)
-            return None
-        fecha, nombre, proyecto = max(candidatas)
-        log.warning("        Tabla %s (lectura en vivo): se toma la fecha del extracto publicado "
-                    "'%s' (%s), actualizado el %s", etiqueta, nombre, proyecto, fecha.strftime('%d/%m/%Y'))
-        fechas_tablas.append(fecha)
-
-    return min(fechas_tablas)
-
-
 def diagnosticar_informe(servidor, config, informe):
     """
     Muestra en el log que ve la Metadata API para el workbook de un informe:
@@ -837,26 +760,16 @@ def fecha_actualizacion_fuentes(servidor, workbook_luid):
         log.warning("        La Metadata API no devuelve ninguna fuente de datos para este workbook")
 
     fechas = []
-    hay_en_vivo = not (publicadas or embebidas)
     for fuente in publicadas + embebidas:
         marcas = [fuente.get('extractLastRefreshTime'), fuente.get('extractLastUpdateTime')]
         marcas = [a_fecha_local(m) for m in marcas if m]
         if not marcas:
-            log.info("        Fuente '%s': sin fecha de extracto (conexion en vivo)", fuente['name'])
-            hay_en_vivo = True
+            log.info("        Fuente '%s': sin fecha de extracto (conexion en vivo), se ignora",
+                     fuente['name'])
             continue
         log.info("        Fuente '%s': actualizada el %s", fuente['name'], max(marcas).strftime('%d/%m/%Y'))
         fechas.append(max(marcas))
 
-    # Fuentes en vivo: Tableau no tiene fecha de refresco, se busca a traves
-    # de las tablas de origen (ver fecha_por_tablas_origen). Si no hay forma
-    # y el workbook tiene otras fuentes con fecha, la en vivo se ignora.
-    if hay_en_vivo:
-        fecha_tablas = fecha_por_tablas_origen(servidor, workbook_luid)
-        if fecha_tablas:
-            fechas.append(fecha_tablas)
-        elif fechas:
-            log.info("        Las fuentes en vivo no se pueden comprobar y se ignoran")
     return min(fechas) if fechas else None
 
 

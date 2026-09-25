@@ -890,8 +890,8 @@ def probar_correo(config, direccion):
     ruta = Path(config['directorio_salida']) / "prueba_correo.csv"
     try:
         escribir_filas_csv(ruta, [["columna_a", "columna_b"], ["1", "2"]], config['csv_separador'])
-    except PermissionError:
-        log.error("No se pudo escribir %s: esta abierto en otro programa (ciérralo e intenta de nuevo)", ruta)
+    except PermissionError as e:
+        log.error("No se pudo escribir %s: %s", ruta, e)
         return False
 
     inicio = time.time()
@@ -973,9 +973,8 @@ def preparar_informe(servidor, config, informe, hoy, fecha):
              fecha.strftime('%d/%m/%Y'), len(tabla) - 1)
     try:
         escribir_filas_csv(ruta, tabla, config['csv_separador'])
-    except PermissionError:
-        log.error("        No se pudo escribir %s: esta abierto en otro programa (ciérralo e "
-                  "intenta de nuevo)", ruta)
+    except PermissionError as e:
+        log.error("        No se pudo escribir %s: %s", ruta, e)
         return 'error', None
     return 'listo', ruta
 

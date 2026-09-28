@@ -665,9 +665,11 @@ def diagnosticar_informe(servidor, config, informe):
 
     bloques = {
         "fuentes publicadas": "upstreamDatasources { name ... on PublishedDatasource "
-                              "{ projectName extractLastRefreshTime extractLastUpdateTime } }",
+                              "{ projectName extractLastRefreshTime "
+                              "extractLastIncrementalUpdateTime extractLastUpdateTime } }",
         "fuentes embebidas": "embeddedDatasources { name hasExtracts "
-                             "extractLastRefreshTime extractLastUpdateTime }",
+                             "extractLastRefreshTime extractLastIncrementalUpdateTime "
+                             "extractLastUpdateTime }",
         "bases de datos y tablas": "upstreamDatabases { name connectionType } "
                                    "upstreamTables { name schema }",
     }
@@ -706,11 +708,13 @@ def fecha_actualizacion_fuentes(servidor, workbook_luid):
     """
     Consulta a la Metadata API la fecha de actualizacion de la fuente de
     datos publicada de la que depende un workbook (los 8 informes comparten
-    la misma). Se usa extractLastRefreshTime (la unica marca que refleja un
-    refresco real de los DATOS); extractLastUpdateTime solo se usa si esa
-    faltara, porque puede cambiar solo por editar/republicar la fuente sin
-    haber refrescado los datos, y daria una fecha de "actualizado" falsa.
-    Si no hay ninguna fecha (conexion en vivo), se ignora.
+    la misma). Se usa la MAS RECIENTE entre extractLastRefreshTime (refresco
+    completo) y extractLastIncrementalUpdateTime (refresco incremental): las
+    dos reflejan una carga real de datos, ya sea completa o incremental.
+    extractLastUpdateTime NO se usa salvo que las dos anteriores falten,
+    porque su definicion oficial de Tableau incluye tambien "creacion" del
+    extracto, no solo refrescos de datos, y daria una fecha de "actualizado"
+    falsa. Si no hay ninguna fecha (conexion en vivo), se ignora.
 
     Por robustez, si la Metadata API llegara a devolver mas de una fuente
     para el workbook, se queda con la MAS ANTIGUA de todas (el informe solo
@@ -734,14 +738,14 @@ def fecha_actualizacion_fuentes(servidor, workbook_luid):
     consulta = (
         "query { workbooks(filter: {luid: %s}) { name "
         "upstreamDatasources { name ... on PublishedDatasource "
-        "{ extractLastRefreshTime extractLastUpdateTime } } "
+        "{ extractLastRefreshTime extractLastIncrementalUpdateTime extractLastUpdateTime } } "
         "embeddedDatasources { name hasExtracts "
-        "extractLastRefreshTime extractLastUpdateTime } } }"
+        "extractLastRefreshTime extractLastIncrementalUpdateTime extractLastUpdateTime } } }"
     ) % json.dumps(workbook_luid)
     consulta_solo_publicadas = (
         "query { workbooks(filter: {luid: %s}) { name "
         "upstreamDatasources { name ... on PublishedDatasource "
-        "{ extractLastRefreshTime extractLastUpdateTime } } } }"
+        "{ extractLastRefreshTime extractLastIncrementalUpdateTime extractLastUpdateTime } } } }"
     ) % json.dumps(workbook_luid)
 
     respuesta = servidor.metadata.query(consulta)
@@ -762,38 +766,39 @@ def fecha_actualizacion_fuentes(servidor, workbook_luid):
     if not publicadas and not embebidas:
         log.warning("        La Metadata API no devuelve ninguna fuente de datos para este workbook")
 
+    def _fmt(marca):
+        return a_fecha_local(marca).strftime('%d/%m/%Y') if marca else '—'
+
     fechas = []
     for fuente in publicadas + embebidas:
-        # extractLastRefreshTime es la unica marca que refleja un refresco
-        # REAL de los datos del extracto. extractLastUpdateTime puede
-        # cambiar solo por editar o republicar la fuente (definicion,
-        # conexion, permisos...) sin que los datos se hayan vuelto a
-        # cargar -- combinarla con max() daria falsos positivos de
-        # "actualizado hoy" cuando en realidad solo se toco la definicion.
-        refresco = fuente.get('extractLastRefreshTime')
+        # extractLastRefreshTime (refresco completo) y
+        # extractLastIncrementalUpdateTime (refresco incremental) son las
+        # dos marcas que reflejan una carga REAL de datos -- se toma la mas
+        # reciente de las dos que existan. extractLastUpdateTime NO se usa
+        # salvo que falten ambas: su definicion oficial de Tableau incluye
+        # tambien la "creacion" del extracto, no solo refrescos de datos, y
+        # daria una fecha de "actualizado" falsa (el caso real que motivo
+        # este cambio: una fuente republicada sin refrescar datos).
+        refresco_completo = fuente.get('extractLastRefreshTime')
+        refresco_incremental = fuente.get('extractLastIncrementalUpdateTime')
         actualizacion = fuente.get('extractLastUpdateTime')
-        marca = refresco or actualizacion
-        if not marca:
+
+        marcas_reales = [m for m in (refresco_completo, refresco_incremental) if m]
+        if marcas_reales:
+            fecha = max(a_fecha_local(m) for m in marcas_reales)
+            log.info("        Fuente '%s': datos actualizados el %s "
+                     "(refresco completo: %s, incremental: %s, definicion tocada: %s)",
+                     fuente['name'], fecha.strftime('%d/%m/%Y'), _fmt(refresco_completo),
+                     _fmt(refresco_incremental), _fmt(actualizacion))
+        elif actualizacion:
+            fecha = a_fecha_local(actualizacion)
+            log.warning("        Fuente '%s': sin refresco completo ni incremental registrados, "
+                        "se usa extractLastUpdateTime (%s) -- puede no reflejar un refresco "
+                        "real de los datos", fuente['name'], fecha.strftime('%d/%m/%Y'))
+        else:
             log.info("        Fuente '%s': sin fecha de extracto (conexion en vivo), se ignora",
                      fuente['name'])
             continue
-        fecha = a_fecha_local(marca)
-        if not refresco:
-            log.warning("        Fuente '%s': sin extractLastRefreshTime, se usa "
-                        "extractLastUpdateTime (%s) -- puede no reflejar un refresco real "
-                        "de los datos", fuente['name'], fecha.strftime('%d/%m/%Y'))
-        else:
-            # Se muestran las dos fechas siempre (no solo cuando difieren),
-            # para poder auditar cada dia en el log que ambas coinciden y
-            # detectar a simple vista si algun dia se separan (alguien toco
-            # la definicion de la fuente sin refrescar los datos).
-            if actualizacion:
-                fecha_definicion = a_fecha_local(actualizacion).strftime('%d/%m/%Y')
-                log.info("        Fuente '%s': datos actualizados el %s (definicion tocada el %s)",
-                         fuente['name'], fecha.strftime('%d/%m/%Y'), fecha_definicion)
-            else:
-                log.info("        Fuente '%s': datos actualizados el %s (sin dato de definicion)",
-                         fuente['name'], fecha.strftime('%d/%m/%Y'))
         fechas.append(fecha)
 
     return min(fechas) if fechas else None

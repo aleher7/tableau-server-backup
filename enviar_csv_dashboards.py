@@ -67,6 +67,7 @@ from io import BytesIO
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from datetime import datetime, date
+from logging.handlers import TimedRotatingFileHandler
 
 
 # ============================================================================
@@ -78,11 +79,6 @@ from datetime import datetime, date
 logging.addLevelName(logging.WARNING, 'AVISO')
 logging.addLevelName(logging.CRITICAL, 'CRITICO')
 logging.addLevelName(logging.DEBUG, 'DEPURACION')
-
-# Un fichero de log por dia (envio_csv_dashboards.log.AAAA-MM-DD para los
-# anteriores, hasta 90 dias) para que sea facil localizar el de una fecha
-# concreta en vez de buscar en un unico fichero que crece indefinidamente.
-from logging.handlers import TimedRotatingFileHandler
 
 _manejador_fichero = TimedRotatingFileHandler(
     'envio_csv_dashboards.log', when='midnight', backupCount=90, encoding='utf-8')
@@ -107,7 +103,7 @@ log = logging.getLogger(__name__)
 CLAVES_TABLEAU = ['tableau_server', 'tableau_token_name', 'tableau_token', 'tableau_site']
 CLAVES_CORREO = ['destinatarios']
 CLAVES_GRAPH = ['graph_tenant_id', 'graph_client_id', 'graph_remitente']
-CLAVES_ORACLE = ['oracle_dsn', 'oracle_usuario']
+CLAVES_ORACLE = ['oracle_dsn', 'oracle_user']
 CLAVES_OPCIONALES = {
     'graph_client_secret': '',
     'oracle_password': '',
@@ -363,7 +359,7 @@ def fecha_actualizacion_oracle(config):
 
     Args:
         config: diccionario de configuracion, con 'oracle_dsn',
-            'oracle_usuario', 'oracle_password', 'oracle_tabla' y
+            'oracle_user', 'oracle_password', 'oracle_tabla' y
             'oracle_columna_fecha'.
 
     Returns:
@@ -389,7 +385,7 @@ def fecha_actualizacion_oracle(config):
     # hay riesgo de inyeccion real.
     consulta = f"SELECT MAX({config['oracle_columna_fecha']}) FROM {config['oracle_tabla']}"
 
-    with oracledb.connect(user=config['oracle_usuario'], password=password,
+    with oracledb.connect(user=config['oracle_user'], password=password,
                           dsn=config['oracle_dsn']) as conexion:
         with conexion.cursor() as cursor:
             cursor.execute(consulta)
@@ -915,18 +911,12 @@ def fecha_actualizacion_fuentes(servidor, workbook_luid):
 
     fechas = []
     for fuente in publicadas + embebidas:
-        # extractLastRefreshTime (refresco completo) y
-        # extractLastIncrementalUpdateTime (refresco incremental) son las
-        # dos marcas que reflejan una carga REAL de datos -- se toma la mas
-        # reciente de las dos que existan. extractLastUpdateTime NO se usa
-        # salvo que falten ambas: su definicion oficial de Tableau incluye
-        # tambien la "creacion" del extracto, no solo refrescos de datos, y
-        # daria una fecha de "actualizado" falsa (el caso real que motivo
-        # este cambio: una fuente republicada sin refrescar datos).
         refresco_completo = fuente.get('extractLastRefreshTime')
         refresco_incremental = fuente.get('extractLastIncrementalUpdateTime')
         actualizacion = fuente.get('extractLastUpdateTime')
 
+        # Ver docstring: se prioriza el refresco real (completo o incremental)
+        # sobre extractLastUpdateTime.
         marcas_reales = [m for m in (refresco_completo, refresco_incremental) if m]
         if marcas_reales:
             fecha = max(a_fecha_local(m) for m in marcas_reales)
@@ -1117,8 +1107,6 @@ def preparar_informe(servidor, config, informe, hoy):
 
     ruta = Path(config['directorio_salida']) / f"{sanear_nombre_archivo(nombre)}_{hoy.isoformat()}.csv"
 
-    # El Excel que exporta Tableau ya tiene la disposicion del dashboard;
-    # solo se convierte a CSV, que es lo que se envia.
     try:
         tabla = excel_a_filas(contenido_excel, informe.get('hoja_excel'),
                               informe.get('separador_miles', config['separador_miles']))
@@ -1297,14 +1285,7 @@ def main():
     if pendientes:
         servidor = conectar_tableau(config)
         try:
-            # Doble comprobacion, SIEMPRE las dos (los 8 informes comparten
-            # la misma fuente, se comprueba una sola vez por pasada): que
-            # los datos de origen esten al dia en Oracle, Y que el propio
-            # dashboard/extracto de Tableau tambien lo este. Las dos hacen
-            # falta porque el CSV sale del extracto de Tableau, no
-            # directamente de Oracle: aunque Oracle ya tenga los datos de
-            # hoy, si Tableau todavia no ha refrescado su extracto con
-            # ellos, el CSV seguiria mostrando datos viejos.
+            # Doble comprobacion, SIEMPRE las dos (ver docstring del modulo).
             fecha_oracle = None
             try:
                 fecha_oracle = fecha_actualizacion_oracle(config)
@@ -1365,10 +1346,6 @@ def main():
                     else:
                         resultados['error'].append(informe['nombre'])
 
-                # Todo o nada: se envia si y solo si los 8 informes han
-                # quedado listos. Si alguno fallo por un problema tecnico,
-                # no se envia NADA esta pasada -- no hay aviso a medias, se
-                # reintenta todo junto en la siguiente pasada.
                 if resultados['error']:
                     log.warning("No se envia ningun correo esta pasada: no se pudo generar %s",
                                 ", ".join(resultados['error']))

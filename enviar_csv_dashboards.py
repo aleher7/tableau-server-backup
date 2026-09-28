@@ -783,7 +783,17 @@ def fecha_actualizacion_fuentes(servidor, workbook_luid):
                         "extractLastUpdateTime (%s) -- puede no reflejar un refresco real "
                         "de los datos", fuente['name'], fecha.strftime('%d/%m/%Y'))
         else:
-            log.info("        Fuente '%s': actualizada el %s", fuente['name'], fecha.strftime('%d/%m/%Y'))
+            # Se muestran las dos fechas siempre (no solo cuando difieren),
+            # para poder auditar cada dia en el log que ambas coinciden y
+            # detectar a simple vista si algun dia se separan (alguien toco
+            # la definicion de la fuente sin refrescar los datos).
+            if actualizacion:
+                fecha_definicion = a_fecha_local(actualizacion).strftime('%d/%m/%Y')
+                log.info("        Fuente '%s': datos actualizados el %s (definicion tocada el %s)",
+                         fuente['name'], fecha.strftime('%d/%m/%Y'), fecha_definicion)
+            else:
+                log.info("        Fuente '%s': datos actualizados el %s (sin dato de definicion)",
+                         fuente['name'], fecha.strftime('%d/%m/%Y'))
         fechas.append(fecha)
 
     return min(fechas) if fechas else None

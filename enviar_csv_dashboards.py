@@ -427,7 +427,7 @@ def _valor_oracle_a_fecha(valor):
 
     texto = valor.strip()
     for patron in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%d/%m/%Y %H:%M:%S', '%d/%m/%Y',
-                  '%Y%m%d'):
+                  '%d/%m/%Y, %H:%M:%S', '%d/%m/%Y, %H:%M', '%Y%m%d'):
         try:
             return datetime.strptime(texto, patron).date()
         except ValueError:

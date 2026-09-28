@@ -365,9 +365,10 @@ def fecha_actualizacion_oracle(config):
 
     Raises:
         Exception: cualquier error de conexion o de la consulta (de
-            oracledb, o si falta la libreria). Sin capturar aqui a
-            proposito: main() la captura y recurre a Tableau como
-            respaldo, dejando constancia en el log del motivo.
+            oracledb, o si falta la libreria), o ValueError si la columna
+            devuelve texto en un formato de fecha no reconocido. Sin
+            capturar aqui a proposito: main() la captura como error
+            tecnico, dejando constancia en el log del motivo.
     """
     import os
     import oracledb
@@ -389,7 +390,65 @@ def fecha_actualizacion_oracle(config):
 
     if valor is None:
         return None
-    return valor.date() if hasattr(valor, 'date') else valor
+    return _valor_oracle_a_fecha(valor)
+
+
+_MESES_ORACLE = {
+    'ene': 1, 'jan': 1, 'feb': 2, 'mar': 3, 'abr': 4, 'apr': 4, 'may': 5,
+    'jun': 6, 'jul': 7, 'ago': 8, 'aug': 8, 'sep': 9, 'oct': 10,
+    'nov': 11, 'dic': 12, 'dec': 12,
+}
+
+
+def _valor_oracle_a_fecha(valor):
+    """
+    Convierte a date lo que devuelva la consulta de fecha_actualizacion_
+    oracle(): normalmente un datetime (columna DATE/TIMESTAMP), pero si la
+    columna esta definida como texto (VARCHAR2), oracledb devuelve un str
+    y hay que interpretarlo a mano.
+
+    Args:
+        valor: lo que devuelve cursor.fetchone() para la columna de fecha
+            (nunca None: eso se comprueba antes de llamar a esta funcion).
+
+    Returns:
+        Objeto date.
+
+    Raises:
+        ValueError: si es texto y no encaja con ninguno de los formatos de
+            fecha habituales de Oracle.
+    """
+    if hasattr(valor, 'date'):
+        return valor.date()
+    if isinstance(valor, date):
+        return valor
+    if not isinstance(valor, str):
+        raise ValueError(f"tipo de dato no reconocido para una fecha: {type(valor)} ({valor!r})")
+
+    texto = valor.strip()
+    for patron in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%d/%m/%Y %H:%M:%S', '%d/%m/%Y',
+                  '%Y%m%d'):
+        try:
+            return datetime.strptime(texto, patron).date()
+        except ValueError:
+            continue
+
+    # Formato clasico de Oracle 'DD-MON-YY' (o '-YYYY'), con el mes en
+    # espanol o ingles, independientemente del idioma configurado en el
+    # sistema que ejecuta el script (evita depender de locale.setlocale).
+    partes = texto.replace('-', ' ').split()
+    if len(partes) == 3 and partes[1].lower()[:3] in _MESES_ORACLE:
+        try:
+            dia = int(partes[0])
+            mes = _MESES_ORACLE[partes[1].lower()[:3]]
+            anio = int(partes[2])
+            if anio < 100:
+                anio += 2000 if anio < 70 else 1900
+            return date(anio, mes, dia)
+        except (ValueError, IndexError):
+            pass
+
+    raise ValueError(f"no se reconoce el formato de fecha de Oracle: {valor!r}")
 
 
 # ============================================================================

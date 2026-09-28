@@ -4,13 +4,19 @@ ENVIO DIARIO POR CORREO DE TABLAS DE TABLEAU EN CSV
 
 Flujo, para la lista 'informes' de config_envio.json (cada uno por su
 'nombre', localizado en Tableau dentro de la carpeta 'proyecto_ruta'):
-    1. Los 8 informes comparten la misma fuente de datos (un extracto
-       publicado), asi que su fecha de actualizacion se comprueba UNA sola
-       vez (consultando la Metadata API con el primer informe pendiente),
-       no una vez por informe.
-    2. Si esa fecha NO es HOY (la carga del dia no ha llegado o ha fallado),
-       no se descarga ni se envia nada, bajo ninguna circunstancia: se anota
-       en el log y se reintenta todo junto en la siguiente pasada.
+    1. Los 8 informes comparten la misma fuente de datos, asi que su fecha
+       de actualizacion se comprueba UNA sola vez por pasada, no una vez
+       por informe. Se comprueban SIEMPRE las dos, obligatorias: los datos
+       de origen en Oracle (consulta directa a la tabla, MAX(DATE_UPD)) y
+       el dashboard/extracto en Tableau (Metadata API, con el primer
+       informe pendiente). Hacen falta las dos porque el CSV sale del
+       extracto de Tableau, no directamente de Oracle: aunque Oracle ya
+       tenga los datos de hoy, si Tableau no ha refrescado su extracto con
+       ellos, el CSV seguiria mostrando datos viejos.
+    2. Si CUALQUIERA de las dos fechas NO es HOY (la carga del dia no ha
+       llegado, o ha fallado, en Oracle o en Tableau), no se descarga ni se
+       envia nada, bajo ninguna circunstancia: se anota en el log y se
+       reintenta todo junto en la siguiente pasada.
     3. Si es HOY, se descarga la tabla en CSV de cada uno de los 8 informes
        (misma disposicion visual que el dashboard). Todo o nada: se envia
        si y solo si los 8 se han podido generar. Si alguno falla por un
@@ -90,8 +96,12 @@ log = logging.getLogger(__name__)
 CLAVES_TABLEAU = ['tableau_server', 'tableau_token_name', 'tableau_token', 'tableau_site']
 CLAVES_CORREO = ['destinatarios']
 CLAVES_GRAPH = ['graph_tenant_id', 'graph_client_id', 'graph_remitente']
+CLAVES_ORACLE = ['oracle_dsn', 'oracle_usuario']
 CLAVES_OPCIONALES = {
     'graph_client_secret': '',
+    'oracle_password': '',
+    'oracle_tabla': 'ANL_VENTA_INTERNA_ESP',
+    'oracle_columna_fecha': 'DATE_UPD',
     'directorio_salida': './csv_generados',
     'archivo_estado': './estado_envios.json',
     'csv_separador': ';',
@@ -99,6 +109,8 @@ CLAVES_OPCIONALES = {
     'rellenar_etiquetas': True,
     'separador_miles': False,
 }
+
+_IDENTIFICADOR_ORACLE = re.compile(r'^[A-Za-z][A-Za-z0-9_$#]*$')
 
 
 def cargar_config(fichero):
@@ -126,7 +138,8 @@ def cargar_config(fichero):
     for clave, valor in CLAVES_OPCIONALES.items():
         config.setdefault(clave, valor)
 
-    obligatorias = CLAVES_TABLEAU + CLAVES_CORREO + CLAVES_GRAPH + ['informes', 'proyecto_ruta']
+    obligatorias = (CLAVES_TABLEAU + CLAVES_CORREO + CLAVES_GRAPH + CLAVES_ORACLE
+                    + ['informes', 'proyecto_ruta'])
     faltan = [c for c in obligatorias if c not in config or config[c] in ('', [])]
     if faltan:
         log.error("Faltan claves obligatorias en %s: %s", fichero, ", ".join(faltan))
@@ -137,6 +150,16 @@ def cargar_config(fichero):
         log.error("Falta 'graph_client_secret' en %s (o la variable de entorno "
                   "GRAPH_CLIENT_SECRET)", fichero)
         sys.exit(1)
+
+    if not config['oracle_password'] and not os.environ.get('ORACLE_PASSWORD'):
+        log.error("Falta 'oracle_password' en %s (o la variable de entorno "
+                  "ORACLE_PASSWORD)", fichero)
+        sys.exit(1)
+
+    for clave in ('oracle_tabla', 'oracle_columna_fecha'):
+        if not _IDENTIFICADOR_ORACLE.match(config[clave]):
+            log.error("'%s' ('%s') no parece un identificador valido de Oracle", clave, config[clave])
+            sys.exit(1)
 
     if not config['informes']:
         log.error("La lista 'informes' esta vacia")
@@ -310,6 +333,63 @@ def guardar_estado(ruta, estado, hoy):
     Path(ruta).write_text(
         json.dumps({hoy: estado.get(hoy, [])}, ensure_ascii=False, indent=2),
         encoding='utf-8')
+
+
+# ============================================================================
+# ORACLE
+# ============================================================================
+
+def fecha_actualizacion_oracle(config):
+    """
+    Consulta directamente la base de datos Oracle de origen (la fuente real
+    detras de Tableau) la fecha de actualizacion de los datos: el MAX() de
+    la columna de fecha configurada, en la tabla configurada.
+
+    main() la comprueba SIEMPRE, junto con fecha_actualizacion_fuentes()
+    (Tableau): las dos son obligatorias, no una respaldo de la otra. Esta
+    dice si los datos de origen ya estan al dia; fecha_actualizacion_fuentes
+    dice si el extracto de Tableau (del que sale el CSV) ya refleja esos
+    datos. Solo se envia si las dos confirman que es hoy.
+
+    El secreto se toma de config['oracle_password'] o, si esta vacio, de
+    la variable de entorno ORACLE_PASSWORD.
+
+    Args:
+        config: diccionario de configuracion, con 'oracle_dsn',
+            'oracle_usuario', 'oracle_password', 'oracle_tabla' y
+            'oracle_columna_fecha'.
+
+    Returns:
+        Objeto date con el valor mas reciente de la columna de fecha en la
+        tabla. None si la tabla no tiene ninguna fila.
+
+    Raises:
+        Exception: cualquier error de conexion o de la consulta (de
+            oracledb, o si falta la libreria). Sin capturar aqui a
+            proposito: main() la captura y recurre a Tableau como
+            respaldo, dejando constancia en el log del motivo.
+    """
+    import os
+    import oracledb
+
+    password = config['oracle_password'] or os.environ.get('ORACLE_PASSWORD', '')
+    # 'oracle_tabla' y 'oracle_columna_fecha' ya se validaron en cargar_config
+    # como identificadores de Oracle (letras/digitos/_/$/#): no se pueden
+    # pasar como parametros normales de la consulta (eso solo vale para
+    # valores, no para nombres de tabla/columna), pero al venir siempre del
+    # propio fichero de configuracion y no de ninguna entrada externa, no
+    # hay riesgo de inyeccion real.
+    consulta = f"SELECT MAX({config['oracle_columna_fecha']}) FROM {config['oracle_tabla']}"
+
+    with oracledb.connect(user=config['oracle_usuario'], password=password,
+                          dsn=config['oracle_dsn']) as conexion:
+        with conexion.cursor() as cursor:
+            cursor.execute(consulta)
+            (valor,) = cursor.fetchone()
+
+    if valor is None:
+        return None
+    return valor.date() if hasattr(valor, 'date') else valor
 
 
 # ============================================================================
@@ -1155,30 +1235,54 @@ def main():
     if pendientes:
         servidor = conectar_tableau(config)
         try:
-            # Los 8 informes comparten la misma fuente de datos: se comprueba
-            # su fecha UNA sola vez, con el primer informe pendiente, en vez
-            # de una consulta a la Metadata API por cada uno de los 8.
+            # Doble comprobacion, SIEMPRE las dos (los 8 informes comparten
+            # la misma fuente, se comprueba una sola vez por pasada): que
+            # los datos de origen esten al dia en Oracle, Y que el propio
+            # dashboard/extracto de Tableau tambien lo este. Las dos hacen
+            # falta porque el CSV sale del extracto de Tableau, no
+            # directamente de Oracle: aunque Oracle ya tenga los datos de
+            # hoy, si Tableau todavia no ha refrescado su extracto con
+            # ellos, el CSV seguiria mostrando datos viejos.
+            fecha_oracle = None
+            try:
+                fecha_oracle = fecha_actualizacion_oracle(config)
+                if fecha_oracle is not None:
+                    log.info("Fecha de los datos en Oracle (%s.%s): %s",
+                            config['oracle_tabla'], config['oracle_columna_fecha'],
+                            fecha_oracle.strftime('%d/%m/%Y'))
+                else:
+                    log.warning("Oracle no devuelve ninguna fecha en %s.%s (tabla vacia)",
+                                config['oracle_tabla'], config['oracle_columna_fecha'])
+            except Exception as e:
+                log.error("No se pudo comprobar la fecha en Oracle: %s", e)
+
             informe_referencia = pendientes[0]
-            fecha_fuente = None
+            fecha_tableau = None
             try:
                 _, workbook_referencia = localizar_vista(servidor, config, informe_referencia)
-                fecha_fuente = fecha_actualizacion_fuentes(servidor, workbook_referencia)
+                fecha_tableau = fecha_actualizacion_fuentes(servidor, workbook_referencia)
+                if fecha_tableau is not None:
+                    log.info("Fecha del dashboard/extracto en Tableau (via '%s'): %s",
+                            informe_referencia['nombre'], fecha_tableau.strftime('%d/%m/%Y'))
             except Exception as e:
-                log.error("No se pudo comprobar la fecha de la fuente compartida (via '%s'): %s",
+                log.error("No se pudo comprobar la fecha en Tableau (via '%s'): %s",
                           informe_referencia['nombre'], e)
 
-            if fecha_fuente is None:
-                log.error("No se puede comprobar la fecha de actualizacion de la fuente compartida")
-                log.error("Ejecuta con --diagnostico para ver de donde salen los datos")
+            if fecha_oracle is None or fecha_tableau is None:
+                log.error("No se puede confirmar la fecha de actualizacion en Oracle Y en "
+                          "Tableau a la vez")
+                log.error("Ejecuta con --diagnostico para ver de donde salen los datos en Tableau")
                 resultados['error'].extend(i['nombre'] for i in pendientes)
-            elif fecha_fuente != hoy:
-                log.warning("DESCARTADO: la fuente compartida esta actualizada el %s, no el %s -- "
-                            "no se envia ningun correo esta pasada", fecha_fuente.strftime('%d/%m/%Y'),
-                            hoy.strftime('%d/%m/%Y'))
+            elif fecha_oracle != hoy or fecha_tableau != hoy:
+                log.warning("DESCARTADO: Oracle dice %s, Tableau dice %s (hoy es %s) -- no "
+                            "coinciden las dos en que esta al dia, no se envia ningun correo "
+                            "esta pasada", fecha_oracle.strftime('%d/%m/%Y'),
+                            fecha_tableau.strftime('%d/%m/%Y'), hoy.strftime('%d/%m/%Y'))
                 resultados['descartado'].extend(i['nombre'] for i in pendientes)
             else:
-                log.info("Fuente compartida actualizada correctamente (%s)",
-                        fecha_fuente.strftime('%d/%m/%Y'))
+                fecha_fuente = hoy
+                log.info("Oracle y Tableau confirman que los datos y el dashboard estan al "
+                        "dia (%s)", hoy.strftime('%d/%m/%Y'))
                 listos = []     # [(informe, ruta), ...] listos en esta pasada
                 for numero, informe in enumerate(pendientes, start=1):
                     log.info("[%d/%d] %s", numero, len(pendientes), informe['nombre'])

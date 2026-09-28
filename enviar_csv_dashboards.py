@@ -706,8 +706,11 @@ def fecha_actualizacion_fuentes(servidor, workbook_luid):
     """
     Consulta a la Metadata API la fecha de actualizacion de la fuente de
     datos publicada de la que depende un workbook (los 8 informes comparten
-    la misma). De ella se toma la mas reciente entre extractLastRefreshTime
-    y extractLastUpdateTime; si no tiene fecha (conexion en vivo), se ignora.
+    la misma). Se usa extractLastRefreshTime (la unica marca que refleja un
+    refresco real de los DATOS); extractLastUpdateTime solo se usa si esa
+    faltara, porque puede cambiar solo por editar/republicar la fuente sin
+    haber refrescado los datos, y daria una fecha de "actualizado" falsa.
+    Si no hay ninguna fecha (conexion en vivo), se ignora.
 
     Por robustez, si la Metadata API llegara a devolver mas de una fuente
     para el workbook, se queda con la MAS ANTIGUA de todas (el informe solo
@@ -761,14 +764,27 @@ def fecha_actualizacion_fuentes(servidor, workbook_luid):
 
     fechas = []
     for fuente in publicadas + embebidas:
-        marcas = [fuente.get('extractLastRefreshTime'), fuente.get('extractLastUpdateTime')]
-        marcas = [a_fecha_local(m) for m in marcas if m]
-        if not marcas:
+        # extractLastRefreshTime es la unica marca que refleja un refresco
+        # REAL de los datos del extracto. extractLastUpdateTime puede
+        # cambiar solo por editar o republicar la fuente (definicion,
+        # conexion, permisos...) sin que los datos se hayan vuelto a
+        # cargar -- combinarla con max() daria falsos positivos de
+        # "actualizado hoy" cuando en realidad solo se toco la definicion.
+        refresco = fuente.get('extractLastRefreshTime')
+        actualizacion = fuente.get('extractLastUpdateTime')
+        marca = refresco or actualizacion
+        if not marca:
             log.info("        Fuente '%s': sin fecha de extracto (conexion en vivo), se ignora",
                      fuente['name'])
             continue
-        log.info("        Fuente '%s': actualizada el %s", fuente['name'], max(marcas).strftime('%d/%m/%Y'))
-        fechas.append(max(marcas))
+        fecha = a_fecha_local(marca)
+        if not refresco:
+            log.warning("        Fuente '%s': sin extractLastRefreshTime, se usa "
+                        "extractLastUpdateTime (%s) -- puede no reflejar un refresco real "
+                        "de los datos", fuente['name'], fecha.strftime('%d/%m/%Y'))
+        else:
+            log.info("        Fuente '%s': actualizada el %s", fuente['name'], fecha.strftime('%d/%m/%Y'))
+        fechas.append(fecha)
 
     return min(fechas) if fechas else None
 

@@ -937,8 +937,6 @@ def fecha_actualizacion_fuentes(servidor, workbook_luid):
                         "se usa extractLastUpdateTime (%s) -- puede no reflejar un refresco "
                         "real de los datos", fuente['name'], fecha.strftime('%d/%m/%Y'))
         else:
-            log.info("        Fuente '%s': sin fecha de extracto (conexion en vivo), se ignora",
-                     fuente['name'])
             continue
         fechas.append(fecha)
 

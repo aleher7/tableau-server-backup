@@ -95,6 +95,13 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# tableauserverclient escribe su propio registro interno, en ingles, en el
+# logger "TSC" ('Signed into...', 'Querying all workbooks on site',
+# 'Populated views for workbook...'...); al no tener handlers propios, se
+# cuela en los mismos ficheros/consola que este log. Se sube su nivel a
+# AVISO para que solo aparezca si de verdad hay un problema.
+logging.getLogger("TSC").setLevel(logging.WARNING)
+
 
 # ============================================================================
 # CONFIGURACION

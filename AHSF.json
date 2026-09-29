@@ -1,36 +1,48 @@
-"""
-PRUEBA: Tableau al dia, pero Oracle NO -- descarte real con conexiones reales
-================================================================================
+            if fecha_oracle is None:
+                log.error("No se puede confirmar la fecha de actualizacion en Oracle "
+                          "(revisa la conexion o la consulta; el error concreto aparece "
+                          "mas arriba)")
+                resultados['error'].extend(i['nombre'] for i in pendientes)
+            elif fecha_oracle != hoy:
+                log.warning("DESCARTADO: Oracle dice %s (hoy es %s) -- la carga del dia "
+                            "todavia no ha llegado", fecha_oracle.strftime('%d/%m/%Y'),
+                            hoy.strftime('%d/%m/%Y'))
+                resultados['descartado'].extend(i['nombre'] for i in pendientes)
+            else:
+                log.info("Oracle confirma que los datos estan al dia (%s)",
+                         hoy.strftime('%d/%m/%Y'))
+                # Tableau solo informa: si Oracle esta bien, se sigue adelante.
+                if fecha_tableau is None:
+                    log.warning("No se pudo leer la fecha del extracto en Tableau; se continua "
+                                "porque Oracle esta al dia")
+                elif fecha_tableau != hoy:
+                    log.warning("El extracto de Tableau indica %s (no es hoy); se continua "
+                                "porque Oracle esta al dia. El CSV podria traer datos "
+                                "anteriores.", fecha_tableau.strftime('%d/%m/%Y'))
 
-Al reves que prueba_tableau_desactualizado.py: se conecta de VERDAD a Oracle
-y a Tableau, pero sustituye unicamente la funcion que lee la fecha en Oracle
-(fecha_actualizacion_oracle) para que siempre devuelva "ayer", sin tocar la
-conexion real a Oracle ni el resto de la logica.
+                listos = []     # [(informe, ruta), ...] listos en esta pasada
+                for numero, informe in enumerate(pendientes, start=1):
+                    log.info("[%d/%d] %s", numero, len(pendientes), informe['nombre'])
+                    estado_informe, ruta = preparar_informe(servidor, config, informe, hoy)
+                    if estado_informe == 'listo':
+                        listos.append((informe, ruta))
+                    else:
+                        resultados['error'].append(informe['nombre'])
 
-Con esto se ve el mensaje DESCARTADO exacto que saldria un dia real en que
-el extracto de Tableau ya estuviera al dia pero los datos de origen en
-Oracle aun no se hubieran actualizado.
-
-Seguro de ejecutar: usa --sin-enviar (no puede enviar nada), y ademas el
-descarte por fecha nunca llega a la parte de envio de todas formas.
-
-Uso (desde la carpeta del proyecto, con config_envio.json al lado):
-    python prueba_oracle_desactualizado.py
-"""
-import sys
-from datetime import date, timedelta
-
-import enviar_csv_dashboards as m
-
-AYER = date.today() - timedelta(days=1)
-
-
-def fecha_oracle_falsa(config):
-    print(f"    (prueba) fecha_actualizacion_oracle() sustituida: devuelve {AYER} en vez de la real")
-    return AYER
+                if resultados['error']:
+                    log.warning("No se envia ningun correo esta pasada: no se pudo generar %s",
+                                ", ".join(resultados['error']))
+                elif not enviar:
+                    for informe, ruta in listos:
+                        log.info("        (modo --sin-enviar) CSV generado en %s", ruta)
+                    resultados['enviado'].extend(informe['nombre'] for informe, _ in listos)
+                else:
+                    resultados_envio = enviar_lote(config, listos, hoy, estado, hoy_txt)
+                    for nombre, resultado in resultados_envio.items():
+                        resultados[resultado].append(nombre)
 
 
-m.fecha_actualizacion_oracle = fecha_oracle_falsa
 
-sys.argv = ["enviar_csv_dashboards.py", "--sin-enviar"]
-m.main()
+            except Exception as e:
+                log.warning("No se pudo comprobar la fecha en Tableau (via '%s'): %s",
+                            informe_referencia['nombre'], e)

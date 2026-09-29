@@ -884,7 +884,9 @@ def a_fecha_local(marca):
     return marca.astimezone().date()
 
 
-_TIPOS_REFRESCO = {'refresh_extracts', 'increment_extracts'}
+# Prefijos, no nombres exactos: con Tableau Bridge los trabajos se llaman
+# 'refresh_extracts_via_bridge' / 'increment_extracts_via_bridge'.
+_TIPOS_REFRESCO = ('refresh_extracts', 'increment_extracts')
 
 
 def trabajos_recientes(servidor, nombre_fuente, dias=3):
@@ -933,7 +935,8 @@ def fecha_refresco_rest(servidor, nombre_fuente):
         Exception: si la API rechaza la consulta (ver trabajos_recientes).
     """
     finales = [t.ended_at for t in trabajos_recientes(servidor, nombre_fuente)
-               if t.type in _TIPOS_REFRESCO and t.status == 'Success' and t.ended_at]
+               if (t.type or '').startswith(_TIPOS_REFRESCO) and t.status == 'Success'
+               and t.ended_at]
     return max(a_fecha_local(f) for f in finales) if finales else None
 
 

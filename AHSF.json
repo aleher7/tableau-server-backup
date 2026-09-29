@@ -6,14 +6,18 @@ Flujo, para la lista 'informes' de config_envio.json (cada uno por su
 'nombre', localizado en Tableau dentro de la carpeta 'proyecto_ruta'):
     1. Los 8 informes comparten la misma fuente de datos, asi que su fecha
        de actualizacion se comprueba UNA sola vez por pasada, no una vez
-       por informe. La comprobacion que DECIDE es Oracle (consulta directa
-       a la tabla, MAX(DATE_UPD)). Ademas se consulta el dashboard/extracto
-       en Tableau (Metadata API, con el primer informe pendiente), pero solo
-       como aviso en el log: si Tableau no da fecha o no es hoy, se continua
-       igualmente mientras Oracle este al dia.
-    2. Si la fecha de Oracle NO es HOY (la carga del dia no ha llegado, o
-       ha fallado), no se descarga ni se envia nada: se anota en el log y
-       se reintenta todo junto en la siguiente pasada.
+       por informe. Se comprueban SIEMPRE las dos, obligatorias: los datos
+       de origen en Oracle (consulta directa a la tabla, MAX(DATE_UPD)) y
+       el dashboard/extracto en Tableau (historial de refrescos por la API
+       REST y Metadata API, con el primer informe pendiente). Hacen falta
+       las dos porque el CSV sale del extracto de Tableau, no directamente
+       de Oracle: aunque Oracle ya tenga los datos de hoy, si Tableau no ha
+       refrescado su extracto con ellos, el CSV seguiria mostrando datos
+       viejos.
+    2. Si CUALQUIERA de las dos fechas NO es HOY (la carga del dia no ha
+       llegado, o ha fallado, en Oracle o en Tableau), no se descarga ni se
+       envia nada, bajo ninguna circunstancia: se anota en el log y se
+       reintenta todo junto en la siguiente pasada.
     3. Si es HOY, se descarga la tabla en CSV de cada uno de los 8 informes
        (misma disposicion visual que el dashboard). Todo o nada: se envia
        si y solo si los 8 se han podido generar. Si alguno falla por un
@@ -36,8 +40,8 @@ Uso:
     python enviar_csv_dashboards.py --sin-enviar        # prueba: descarga y
                                                         # comprueba, no envia
     python enviar_csv_dashboards.py --fecha 2026-09-21  # simular otro "hoy"
-    python enviar_csv_dashboards.py --diagnostico       # que fuentes ve la
-                                                        # Metadata API por informe
+    python enviar_csv_dashboards.py --diagnostico       # fuentes e historial de
+                                                        # refrescos por informe
     python enviar_csv_dashboards.py --crosstab-excel "CdM SRI Marca MTD"
                                                         # prueba: baja ese informe
                                                         # como Excel (crosstab)
@@ -45,6 +49,11 @@ Uso:
                                                         # prueba solo el envio de
                                                         # correo por Graph (sin Tableau)
     python enviar_csv_dashboards.py --forzar            # ignora lo ya enviado
+    python enviar_csv_dashboards.py --sin-comprobar-fecha
+                                                        # envio manual, tras
+                                                        # verificar tu mismo que
+                                                        # Oracle y Tableau estan
+                                                        # al dia (no las consulta)
 
 Codigo de salida: 0 si todo fue bien (incluidos los informes descartados por
 fecha, que es un caso normal), 1 si hubo errores tecnicos (Tableau, Graph...).
@@ -63,7 +72,7 @@ import requests
 from io import BytesIO
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
-from datetime import datetime, date
+from datetime import datetime, date, timedelta, timezone
 from logging.handlers import TimedRotatingFileHandler
 
 
@@ -260,9 +269,10 @@ def interpretar_numero(texto):
     Returns:
         Decimal, o None si el texto no es un numero.
     """
-    # '\u00a0' es el espacio de no separacion, que Excel/Tableau usan a veces
-    # como separador de miles.
-    t = (texto or '').replace('\u00a0', ' ')
+    # El primer caracter es un espacio de no separacion (U+00A0), que
+    # Excel/Tableau usan a veces como separador de miles; no es un no-op
+    # aunque lo parezca a simple vista.
+    t = (texto or '').replace(' ', ' ')
     if not _NUMERO.match(t):
         return None
     t = re.sub(r'[^\d,.+-]', '', t)
@@ -354,9 +364,11 @@ def fecha_actualizacion_oracle(config):
     detras de Tableau) la fecha de actualizacion de los datos: el MAX() de
     la columna de fecha configurada, en la tabla configurada.
 
-    Es la comprobacion que decide en main(): si Oracle esta al dia, se
-    envia. fecha_actualizacion_fuentes() (Tableau) solo se usa como aviso
-    en el log.
+    main() la comprueba SIEMPRE, junto con fecha_actualizacion_fuentes()
+    (Tableau): las dos son obligatorias, no una respaldo de la otra. Esta
+    dice si los datos de origen ya estan al dia; fecha_actualizacion_fuentes
+    dice si el extracto de Tableau (del que sale el CSV) ya refleja esos
+    datos. Solo se envia si las dos confirman que es hoy.
 
     El secreto se toma de config['oracle_password'] o, si esta vacio, de
     la variable de entorno ORACLE_PASSWORD.
@@ -788,10 +800,11 @@ def excel_a_filas(contenido, hoja=None, miles=False):
 
 def diagnosticar_informe(servidor, config, informe):
     """
-    Muestra en el log que ve la Metadata API para el workbook de un informe:
-    fuentes publicadas, fuentes embebidas (con o sin extracto) y bases de
-    datos/tablas de origen. No envia nada. Sirve para saber de donde salen
-    de verdad los datos de un workbook cuya fecha no se puede leer.
+    Muestra en el log que ve la Metadata API para el workbook de un informe
+    (fuentes publicadas, fuentes embebidas y bases de datos/tablas de
+    origen) y el historial de refrescos de sus fuentes publicadas (API
+    REST). No envia nada. Sirve para saber de donde salen de verdad los
+    datos de un workbook y cuando se refresco realmente su extracto.
 
     Args:
         servidor: objeto Server ya autenticado.
@@ -817,6 +830,7 @@ def diagnosticar_informe(servidor, config, informe):
         "bases de datos y tablas": "upstreamDatabases { name connectionType } "
                                    "upstreamTables { name schema }",
     }
+    nombres_publicadas = []
     for titulo, cuerpo in bloques.items():
         consulta = ("query { workbooks(filter: {luid: %s}) { name %s } }"
                     % (json.dumps(workbook_luid), cuerpo))
@@ -831,31 +845,111 @@ def diagnosticar_informe(servidor, config, informe):
         datos = (respuesta['data']['workbooks'] or [{}])[0]
         datos.pop('name', None)
         log.info("        [%s] %s", titulo, json.dumps(datos, ensure_ascii=False))
+        if titulo == "fuentes publicadas":
+            nombres_publicadas = [f['name'] for f in datos.get('upstreamDatasources') or []]
+
+    for nombre in nombres_publicadas:
+        try:
+            trabajos = trabajos_recientes(servidor, nombre)
+        except Exception as e:
+            log.info("        [historial de refrescos] '%s': fallo la consulta (API REST): %s",
+                     nombre, e)
+            continue
+        if not trabajos:
+            log.info("        [historial de refrescos] '%s': ningun trabajo en los ultimos dias",
+                     nombre)
+        for t in trabajos:
+            fin = t.ended_at.astimezone().strftime('%d/%m/%Y %H:%M') if t.ended_at else 'sin terminar'
+            log.info("        [historial de refrescos] '%s': %s, %s, terminado %s",
+                     nombre, t.type, t.status, fin)
 
 
-def a_fecha_local(texto):
+def a_fecha_local(marca):
     """
-    Convierte una marca de tiempo de la Metadata API (UTC, ISO 8601) en la
-    fecha local del servidor. Importa: una carga a las 00:30 en Espana es
-    del dia anterior en UTC.
+    Convierte una marca de tiempo de Tableau (UTC) en la fecha local del
+    servidor. Importa: una carga a las 00:30 en Espana es del dia anterior
+    en UTC.
 
     Args:
-        texto: p. ej. '2026-09-21T05:12:33Z'.
+        marca: texto ISO 8601 de la Metadata API (p. ej.
+            '2026-09-21T05:12:33Z') o datetime de la API REST.
 
     Returns:
         Objeto date en la zona horaria del equipo que ejecuta el script.
     """
-    return datetime.fromisoformat(texto.replace('Z', '+00:00')).astimezone().date()
+    if isinstance(marca, str):
+        marca = datetime.fromisoformat(marca.replace('Z', '+00:00'))
+    if marca.tzinfo is None:
+        marca = marca.replace(tzinfo=timezone.utc)
+    return marca.astimezone().date()
+
+
+_TIPOS_REFRESCO = {'refresh_extracts', 'increment_extracts'}
+
+
+def trabajos_recientes(servidor, nombre_fuente, dias=3):
+    """
+    Historial de trabajos de Tableau (API REST, "Query Jobs") de una fuente
+    publicada en los ultimos dias: el mismo que se ve en Tableau Cloud >
+    Trabajos. Requiere que la cuenta del token sea administrador del sitio.
+
+    Args:
+        servidor: objeto Server ya autenticado.
+        nombre_fuente: nombre de la fuente publicada (el titulo del trabajo).
+        dias: cuantos dias hacia atras se consultan.
+
+    Returns:
+        Lista de BackgroundJobItem (de cualquier tipo y estado).
+
+    Raises:
+        Exception: si la API rechaza la consulta (p. ej. 403 sin permisos).
+    """
+    import tableauserverclient as TSC
+    desde = (datetime.now(timezone.utc) - timedelta(days=dias)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    opciones = TSC.RequestOptions(pagesize=100)
+    opciones.filter.add(TSC.Filter(TSC.RequestOptions.Field.Title,
+                                   TSC.RequestOptions.Operator.Equals, nombre_fuente))
+    opciones.filter.add(TSC.Filter(TSC.RequestOptions.Field.CreatedAt,
+                                   TSC.RequestOptions.Operator.GreaterThanOrEqual, desde))
+    return list(TSC.Pager(servidor.jobs, opciones))
+
+
+def fecha_refresco_rest(servidor, nombre_fuente):
+    """
+    Fecha del ultimo refresco CORRECTO (completo o incremental) del extracto
+    de una fuente publicada, segun el historial de trabajos (API REST). A
+    diferencia de la Metadata API, se actualiza en cuanto termina el
+    refresco.
+
+    Args:
+        servidor: objeto Server ya autenticado.
+        nombre_fuente: nombre de la fuente publicada.
+
+    Returns:
+        Objeto date (local) del refresco correcto mas reciente, o None si no
+        hay ninguno en los ultimos dias.
+
+    Raises:
+        Exception: si la API rechaza la consulta (ver trabajos_recientes).
+    """
+    finales = [t.ended_at for t in trabajos_recientes(servidor, nombre_fuente)
+               if t.type in _TIPOS_REFRESCO and t.status == 'Success' and t.ended_at]
+    return max(a_fecha_local(f) for f in finales) if finales else None
 
 
 def fecha_actualizacion_fuentes(servidor, workbook_luid):
     """
-    Consulta a la Metadata API la fecha de actualizacion de la fuente de
-    datos publicada de la que depende un workbook (los 8 informes comparten
-    la misma). Se usa la MAS RECIENTE entre extractLastRefreshTime (refresco
-    completo) y extractLastIncrementalUpdateTime (refresco incremental): las
-    dos reflejan una carga real de datos, ya sea completa o incremental.
-    extractLastUpdateTime NO se usa salvo que las dos anteriores falten,
+    Fecha de actualizacion del extracto de la fuente de datos de la que
+    depende un workbook (los 8 informes comparten la misma). Se usa la MAS
+    RECIENTE de las marcas que reflejan una carga real de datos: el ultimo
+    refresco correcto del historial de trabajos (API REST, solo fuentes
+    publicadas) y extractLastRefreshTime / extractLastIncrementalUpdateTime
+    (Metadata API). El historial REST se anadio porque la Metadata API puede
+    tardar horas en reflejar un refresco y dar "ayer" cuando el extracto ya
+    es de hoy; si la API REST falla (p. ej. sin permisos), se sigue solo con
+    la Metadata API y se avisa en el log.
+
+    extractLastUpdateTime NO se usa salvo que falten todas las anteriores,
     porque su definicion oficial de Tableau incluye tambien "creacion" del
     extracto, no solo refrescos de datos, y daria una fecha de "actualizado"
     falsa. Si no hay ninguna fecha (conexion en vivo), se ignora.
@@ -864,9 +958,6 @@ def fecha_actualizacion_fuentes(servidor, workbook_luid):
     para el workbook, se queda con la MAS ANTIGUA de todas (el informe solo
     esta al dia si todas lo estan) -- aunque en la practica, con una unica
     fuente compartida, esto no cambia nada.
-
-    En main() su resultado es solo informativo (aviso en el log): no
-    bloquea el envio.
 
     Args:
         servidor: objeto Server ya autenticado.
@@ -914,23 +1005,39 @@ def fecha_actualizacion_fuentes(servidor, workbook_luid):
         log.warning("        La Metadata API no devuelve ninguna fuente de datos para este workbook")
 
     def _fmt(marca):
-        return a_fecha_local(marca).strftime('%d/%m/%Y') if marca else '-'
+        return a_fecha_local(marca).strftime('%d/%m/%Y') if marca else '—'
 
+    rest_disponible = True
     fechas = []
-    for fuente in publicadas + embebidas:
+    for es_publicada, fuente in [(True, f) for f in publicadas] + [(False, f) for f in embebidas]:
         refresco_completo = fuente.get('extractLastRefreshTime')
         refresco_incremental = fuente.get('extractLastIncrementalUpdateTime')
         actualizacion = fuente.get('extractLastUpdateTime')
 
-        # Ver docstring: se prioriza el refresco real (completo o incremental)
-        # sobre extractLastUpdateTime.
-        marcas_reales = [m for m in (refresco_completo, refresco_incremental) if m]
-        if marcas_reales:
-            fecha = max(a_fecha_local(m) for m in marcas_reales)
-            log.info("        Fuente '%s': datos actualizados el %s "
-                     "(refresco completo: %s, incremental: %s, definicion tocada: %s)",
-                     fuente['name'], fecha.strftime('%d/%m/%Y'), _fmt(refresco_completo),
-                     _fmt(refresco_incremental), _fmt(actualizacion))
+        # El historial REST solo existe para fuentes publicadas (el trabajo de
+        # refresco lleva su nombre). Si falla una vez (p. ej. sin permisos),
+        # no se reintenta con las demas fuentes de esta pasada.
+        refresco_rest = None
+        if es_publicada and rest_disponible:
+            try:
+                refresco_rest = fecha_refresco_rest(servidor, fuente['name'])
+            except Exception as e:
+                rest_disponible = False
+                log.warning("        No se pudo leer el historial de refrescos (API REST): %s "
+                            "-- se usa solo la Metadata API", e)
+
+        # Ver docstring: se prioriza el refresco real (historial, completo o
+        # incremental) sobre extractLastUpdateTime.
+        fechas_reales = [a_fecha_local(m) for m in (refresco_completo, refresco_incremental) if m]
+        if refresco_rest:
+            fechas_reales.append(refresco_rest)
+        if fechas_reales:
+            fecha = max(fechas_reales)
+            log.info("        Fuente '%s': datos actualizados el %s (historial de refrescos: %s, "
+                     "refresco completo: %s, incremental: %s, definicion tocada: %s)",
+                     fuente['name'], fecha.strftime('%d/%m/%Y'),
+                     refresco_rest.strftime('%d/%m/%Y') if refresco_rest else '—',
+                     _fmt(refresco_completo), _fmt(refresco_incremental), _fmt(actualizacion))
         elif actualizacion:
             fecha = a_fecha_local(actualizacion)
             log.warning("        Fuente '%s': sin refresco completo ni incremental registrados, "
@@ -1080,12 +1187,81 @@ def probar_correo(config, direccion):
 # PROCESO DE UN INFORME
 # ============================================================================
 
+def comprobar_fechas(servidor, config, informe_referencia, hoy):
+    """
+    Doble comprobacion de la fecha de actualizacion (ver docstring del
+    modulo): Oracle Y Tableau, las dos obligatorias. Se hace una sola vez
+    por pasada, porque los 8 informes comparten la misma fuente.
+
+    Args:
+        servidor: objeto Server ya autenticado.
+        config: diccionario de configuracion.
+        informe_referencia: informe cuyo workbook se usa para leer la fecha
+            en Tableau (el primero pendiente).
+        hoy: objeto date del dia de envio.
+
+    Returns:
+        'ok' si las dos confirman que es hoy, 'descartado' si alguna da otra
+        fecha, 'error' si alguna de las dos no se pudo comprobar.
+    """
+    fecha_oracle = None
+    try:
+        fecha_oracle = fecha_actualizacion_oracle(config)
+        if fecha_oracle is not None:
+            log.info("Fecha de los datos en Oracle (%s.%s): %s",
+                     config['oracle_tabla'], config['oracle_columna_fecha'],
+                     fecha_oracle.strftime('%d/%m/%Y'))
+        else:
+            log.warning("Oracle no devuelve ninguna fecha en %s.%s (tabla vacia)",
+                        config['oracle_tabla'], config['oracle_columna_fecha'])
+    except Exception as e:
+        log.error("No se pudo comprobar la fecha en Oracle: %s", e)
+
+    fecha_tableau = None
+    try:
+        _, workbook_referencia = localizar_vista(servidor, config, informe_referencia)
+        fecha_tableau = fecha_actualizacion_fuentes(servidor, workbook_referencia)
+        if fecha_tableau is not None:
+            log.info("Fecha del dashboard/extracto en Tableau (via '%s'): %s",
+                     informe_referencia['nombre'], fecha_tableau.strftime('%d/%m/%Y'))
+    except Exception as e:
+        log.error("No se pudo comprobar la fecha en Tableau (via '%s'): %s",
+                  informe_referencia['nombre'], e)
+
+    if fecha_oracle is None or fecha_tableau is None:
+        # Se distingue cual de las dos fallo: --diagnostico solo ayuda con
+        # Tableau (no comprueba Oracle), asi que no tiene sentido sugerirlo
+        # cuando el problema esta en Oracle.
+        if fecha_oracle is None and fecha_tableau is None:
+            log.error("No se puede confirmar la fecha de actualizacion ni por Oracle ni por "
+                      "Tableau")
+        elif fecha_oracle is None:
+            log.error("No se puede confirmar la fecha de actualizacion en Oracle (revisa la "
+                      "conexion o la consulta a la base de datos; el error concreto aparece "
+                      "mas arriba)")
+        else:
+            log.error("No se puede confirmar la fecha de actualizacion en Tableau (via '%s')",
+                      informe_referencia['nombre'])
+            log.error("Ejecuta con --diagnostico para ver de donde salen los datos en Tableau")
+        return 'error'
+
+    if fecha_oracle != hoy or fecha_tableau != hoy:
+        log.warning("DESCARTADO: Oracle dice %s, Tableau dice %s (hoy es %s) -- no coinciden "
+                    "las dos en que esta al dia, no se envia ningun correo esta pasada",
+                    fecha_oracle.strftime('%d/%m/%Y'), fecha_tableau.strftime('%d/%m/%Y'),
+                    hoy.strftime('%d/%m/%Y'))
+        return 'descartado'
+
+    log.info("Oracle y Tableau confirman que los datos y el dashboard estan al dia (%s)",
+             hoy.strftime('%d/%m/%Y'))
+    return 'ok'
+
+
 def preparar_informe(servidor, config, informe, hoy):
     """
-    Descarga un informe y genera su CSV. Su fecha de actualizacion ya se
-    comprobo en main() (los 8 informes comparten la misma fuente, asi que
-    se comprueba una sola vez para todos, no aqui por cada uno: al llegar
-    aqui ya se sabe que hoy es la fecha correcta). No envia nada: main()
+    Descarga un informe y genera su CSV. La fecha no se comprueba aqui: ya
+    lo hizo comprobar_fechas() una sola vez para los 8 (o se omitio a mano
+    con --sin-comprobar-fecha). No envia nada: main()
     agrupa los informes que preparar_informe() deja listos en la misma
     pasada y los manda en el menor numero de correos posible (ver
     enviar_lote).
@@ -1135,8 +1311,7 @@ def preparar_informe(servidor, config, informe, hoy):
         if repetidas:
             log.info("        Etiquetas repetidas en cada fila (%s): %d celdas rellenadas",
                      ", ".join(tabla[0][i] for i in indices), repetidas)
-    log.info("        Fecha de actualizacion correcta (%s), %d filas (disposicion del dashboard)",
-             hoy.strftime('%d/%m/%Y'), len(tabla) - 1)
+    log.info("        %d filas (disposicion del dashboard)", len(tabla) - 1)
     try:
         escribir_filas_csv(ruta, tabla, config['csv_separador'])
     except PermissionError as e:
@@ -1220,9 +1395,13 @@ def main():
     parser.add_argument('--fecha', help="simula otro dia de envio (YYYY-MM-DD)")
     parser.add_argument('--forzar', action='store_true',
                         help="ignora los informes ya enviados hoy")
+    parser.add_argument('--sin-comprobar-fecha', action='store_true',
+                        help="envio manual: no consulta la fecha en Oracle ni en Tableau. Solo "
+                             "para lanzarlo a mano despues de verificar tu mismo que las dos "
+                             "fuentes tienen los datos de hoy")
     parser.add_argument('--diagnostico', action='store_true',
-                        help="muestra de donde salen los datos de cada workbook segun la "
-                             "Metadata API; no descarga ni envia nada")
+                        help="muestra de donde salen los datos de cada workbook y el "
+                             "historial de refrescos de su fuente; no descarga ni envia nada")
     parser.add_argument('--crosstab-excel', metavar='INFORME',
                         help="prueba: descarga como Excel (crosstab) el informe con ese nombre, "
                              "para ver la disposicion del dashboard; no envia nada")
@@ -1290,55 +1469,18 @@ def main():
     if pendientes:
         servidor = conectar_tableau(config)
         try:
-            # Oracle DECIDE; Tableau solo informa (ver docstring del modulo).
-            fecha_oracle = None
-            try:
-                fecha_oracle = fecha_actualizacion_oracle(config)
-                if fecha_oracle is not None:
-                    log.info("Fecha de los datos en Oracle (%s.%s): %s",
-                             config['oracle_tabla'], config['oracle_columna_fecha'],
-                             fecha_oracle.strftime('%d/%m/%Y'))
-                else:
-                    log.warning("Oracle no devuelve ninguna fecha en %s.%s (tabla vacia)",
-                                config['oracle_tabla'], config['oracle_columna_fecha'])
-            except Exception as e:
-                log.error("No se pudo comprobar la fecha en Oracle: %s", e)
+            if args.sin_comprobar_fecha:
+                log.warning("Comprobacion de fecha OMITIDA a mano (--sin-comprobar-fecha): no "
+                            "se consulta ni Oracle ni Tableau")
+                comprobacion = 'ok'
+            else:
+                comprobacion = comprobar_fechas(servidor, config, pendientes[0], hoy)
 
-            informe_referencia = pendientes[0]
-            fecha_tableau = None
-            try:
-                _, workbook_referencia = localizar_vista(servidor, config, informe_referencia)
-                fecha_tableau = fecha_actualizacion_fuentes(servidor, workbook_referencia)
-                if fecha_tableau is not None:
-                    log.info("Fecha del dashboard/extracto en Tableau (via '%s'): %s",
-                             informe_referencia['nombre'], fecha_tableau.strftime('%d/%m/%Y'))
-            except Exception as e:
-                log.warning("No se pudo comprobar la fecha en Tableau (via '%s'): %s",
-                            informe_referencia['nombre'], e)
-
-            if fecha_oracle is None:
-                log.error("No se puede confirmar la fecha de actualizacion en Oracle "
-                          "(revisa la conexion o la consulta a la base de datos; el error "
-                          "concreto aparece mas arriba)")
+            if comprobacion == 'error':
                 resultados['error'].extend(i['nombre'] for i in pendientes)
-            elif fecha_oracle != hoy:
-                log.warning("DESCARTADO: Oracle dice %s (hoy es %s) -- la carga del dia "
-                            "todavia no ha llegado, no se envia ningun correo esta pasada",
-                            fecha_oracle.strftime('%d/%m/%Y'), hoy.strftime('%d/%m/%Y'))
+            elif comprobacion == 'descartado':
                 resultados['descartado'].extend(i['nombre'] for i in pendientes)
             else:
-                log.info("Oracle confirma que los datos estan al dia (%s)",
-                         hoy.strftime('%d/%m/%Y'))
-                # Tableau es solo informativo: si Oracle esta al dia, se sigue.
-                if fecha_tableau is None:
-                    log.warning("No se pudo leer la fecha del extracto en Tableau; se "
-                                "continua porque Oracle esta al dia "
-                                "(--diagnostico muestra las fuentes que ve Tableau)")
-                elif fecha_tableau != hoy:
-                    log.warning("El extracto de Tableau indica %s (no es hoy); se continua "
-                                "porque Oracle esta al dia. El CSV podria traer datos "
-                                "anteriores.", fecha_tableau.strftime('%d/%m/%Y'))
-
                 listos = []     # [(informe, ruta), ...] listos en esta pasada
                 for numero, informe in enumerate(pendientes, start=1):
                     log.info("[%d/%d] %s", numero, len(pendientes), informe['nombre'])

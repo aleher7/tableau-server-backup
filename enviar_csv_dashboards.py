@@ -75,7 +75,6 @@ from io import BytesIO
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from datetime import datetime, date, timedelta, timezone
-from logging.handlers import TimedRotatingFileHandler
 
 
 # ============================================================================
@@ -88,16 +87,12 @@ logging.addLevelName(logging.WARNING, 'AVISO')
 logging.addLevelName(logging.CRITICAL, 'CRITICO')
 logging.addLevelName(logging.DEBUG, 'DEPURACION')
 
-_manejador_fichero = TimedRotatingFileHandler(
-    'envio_csv_dashboards.log', when='midnight', backupCount=90, encoding='utf-8')
-_manejador_fichero.suffix = '%Y-%m-%d'
-
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s  %(levelname)-5s %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S',
     handlers=[
-        _manejador_fichero,
+        logging.FileHandler('envio_csv_dashboards.log', encoding='utf-8'),
         logging.StreamHandler(),
     ]
 )
@@ -360,15 +355,15 @@ def guardar_estado(ruta, estado, hoy):
 # ORACLE
 # ============================================================================
 
-def fecha_actualizacion_oracle(config):
+def ultima_carga_oracle(config):
     """
     Consulta directamente la base de datos Oracle de origen (la fuente real
     detras de Tableau) la fecha de actualizacion de los datos: el MAX() de
     la columna de fecha configurada, en la tabla configurada.
 
-    main() la comprueba SIEMPRE, junto con fecha_actualizacion_fuentes()
+    main() la comprueba SIEMPRE, junto con ultimo_refresco_tableau()
     (Tableau): las dos son obligatorias, no una respaldo de la otra. Esta
-    dice si los datos de origen ya estan al dia; fecha_actualizacion_fuentes
+    dice si los datos de origen ya estan al dia; ultimo_refresco_tableau
     dice si el extracto de Tableau (del que sale el CSV) ya refleja esos
     datos. Solo se envia si las dos confirman que es hoy.
 
@@ -412,7 +407,7 @@ def fecha_actualizacion_oracle(config):
 
     if valor is None:
         return None
-    return _valor_oracle_a_momento(valor)
+    return interpretar_fecha_oracle(valor)
 
 
 _MESES_ORACLE = {
@@ -422,10 +417,10 @@ _MESES_ORACLE = {
 }
 
 
-def _valor_oracle_a_momento(valor):
+def interpretar_fecha_oracle(valor):
     """
     Convierte a datetime (fecha y hora, sin zona horaria) lo que devuelva la
-    consulta de fecha_actualizacion_oracle(): normalmente un datetime
+    consulta de ultima_carga_oracle(): normalmente un datetime
     (columna DATE/TIMESTAMP), pero si la columna esta definida como texto
     (VARCHAR2), oracledb devuelve un str y hay que interpretarlo a mano.
 
@@ -934,7 +929,7 @@ def trabajos_recientes(servidor, nombre_fuente, dias=3):
     return list(TSC.Pager(servidor.jobs, opciones))
 
 
-def fecha_refresco_rest(servidor, nombre_fuente):
+def ultimo_refresco_historial(servidor, nombre_fuente):
     """
     Momento en que termino el ultimo refresco CORRECTO (completo o
     incremental) del extracto de una fuente publicada, segun el historial
@@ -958,7 +953,7 @@ def fecha_refresco_rest(servidor, nombre_fuente):
     return max(finales) if finales else None
 
 
-def fecha_actualizacion_fuentes(servidor, workbook_luid):
+def ultimo_refresco_tableau(servidor, workbook_luid):
     """
     Fecha de actualizacion del extracto de la fuente de datos de la que
     depende un workbook (los 8 informes comparten la misma). Se usa la MAS
@@ -1025,7 +1020,7 @@ def fecha_actualizacion_fuentes(servidor, workbook_luid):
     if not publicadas and not embebidas:
         log.warning("        La Metadata API no devuelve ninguna fuente de datos para este workbook")
 
-    def _fmt(marca):
+    def fecha_o_guion(marca):
         return a_fecha_local(marca).strftime('%d/%m/%Y') if marca else '—'
 
     rest_disponible = True
@@ -1041,7 +1036,7 @@ def fecha_actualizacion_fuentes(servidor, workbook_luid):
         refresco_rest = None
         if es_publicada and rest_disponible:
             try:
-                refresco_rest = fecha_refresco_rest(servidor, fuente['name'])
+                refresco_rest = ultimo_refresco_historial(servidor, fuente['name'])
             except Exception as e:
                 rest_disponible = False
                 log.warning("        No se pudo leer el historial de refrescos (API REST): %s "
@@ -1057,13 +1052,13 @@ def fecha_actualizacion_fuentes(servidor, workbook_luid):
             log.info("        Fuente '%s': datos actualizados el %s (historial de refrescos: %s, "
                      "refresco completo: %s, incremental: %s, definicion tocada: %s)",
                      fuente['name'], a_fecha_local(momento).strftime('%d/%m/%Y'),
-                     _fmt(refresco_rest), _fmt(refresco_completo), _fmt(refresco_incremental),
-                     _fmt(actualizacion))
+                     fecha_o_guion(refresco_rest), fecha_o_guion(refresco_completo),
+                     fecha_o_guion(refresco_incremental), fecha_o_guion(actualizacion))
         elif actualizacion:
             momento = a_utc(actualizacion)
             log.warning("        Fuente '%s': sin refresco completo ni incremental registrados, "
                         "se usa extractLastUpdateTime (%s) -- puede no reflejar un refresco "
-                        "real de los datos", fuente['name'], _fmt(actualizacion))
+                        "real de los datos", fuente['name'], fecha_o_guion(actualizacion))
         else:
             continue
         momentos.append(momento)
@@ -1231,7 +1226,7 @@ def comprobar_fechas(servidor, config, informe_referencia, hoy):
     """
     momento_oracle = None
     try:
-        momento_oracle = fecha_actualizacion_oracle(config)
+        momento_oracle = ultima_carga_oracle(config)
         if momento_oracle is not None:
             log.info("Fecha de los datos en Oracle (%s.%s): %s",
                      config['oracle_tabla'], config['oracle_columna_fecha'],
@@ -1245,7 +1240,7 @@ def comprobar_fechas(servidor, config, informe_referencia, hoy):
     momento_tableau = None
     try:
         _, workbook_referencia = localizar_vista(servidor, config, informe_referencia)
-        momento_tableau = fecha_actualizacion_fuentes(servidor, workbook_referencia)
+        momento_tableau = ultimo_refresco_tableau(servidor, workbook_referencia)
         if momento_tableau is not None:
             log.info("Fecha del dashboard/extracto en Tableau (via '%s'): %s (refresco "
                      "terminado a las %s, hora del servidor)", informe_referencia['nombre'],

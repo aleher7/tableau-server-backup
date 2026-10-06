@@ -87,6 +87,66 @@ logging.addLevelName(logging.WARNING, 'AVISO')
 logging.addLevelName(logging.CRITICAL, 'CRITICO')
 logging.addLevelName(logging.DEBUG, 'DEPURACION')
 
+_DIAS_LOG = 30
+_FECHA_LINEA_LOG = re.compile(r'^(\d{4}-\d{2}-\d{2}) \d{2}:\d{2}:\d{2}')
+
+
+def recortar_log(ruta, dias):
+    """
+    Borra del principio del log las lineas de mas de 'dias' dias, para que
+    el fichero unico no crezca sin limite: con dias=30, el dia 30 se borra el
+    dia 1, el 31 el dia 2, y asi sucesivamente. Una linea sin fecha delante
+    (la traza de un error, por ejemplo) se conserva o se borra junto con la
+    linea con fecha que la precede.
+
+    Se ejecuta ANTES de configurar el log: una vez abierto el fichero por el
+    manejador de logging, Windows no permite sustituirlo.
+
+    Args:
+        ruta: ruta del fichero de log.
+        dias: dias que se conservan, contando hoy.
+
+    Returns:
+        Numero de lineas borradas (0 si no existe el fichero o no habia nada
+        que borrar).
+    """
+    fichero = Path(ruta)
+    if not fichero.exists():
+        return 0
+
+    limite = date.today() - timedelta(days=dias - 1)
+    conservadas = []
+    borradas = 0
+    vigente = True
+    with open(fichero, 'r', encoding='utf-8', newline='') as f:
+        for linea in f:
+            coincidencia = _FECHA_LINEA_LOG.match(linea)
+            if coincidencia:
+                vigente = date.fromisoformat(coincidencia.group(1)) > limite
+            if vigente:
+                conservadas.append(linea)
+            else:
+                borradas += 1
+
+    if borradas:
+        temporal = fichero.with_name(fichero.name + '.tmp')
+        try:
+            with open(temporal, 'w', encoding='utf-8', newline='') as f:
+                f.writelines(conservadas)
+            os.replace(temporal, fichero)
+        except OSError:
+            temporal.unlink(missing_ok=True)
+            raise
+    return borradas
+
+
+try:
+    _lineas_recortadas = recortar_log('envio_csv_dashboards.log', _DIAS_LOG)
+    _error_recorte = None
+except Exception as e:
+    _lineas_recortadas = 0
+    _error_recorte = e
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s  %(levelname)-5s %(message)s',
@@ -97,6 +157,11 @@ logging.basicConfig(
     ]
 )
 log = logging.getLogger(__name__)
+
+if _error_recorte:
+    log.warning("No se pudo recortar el log (%s); se seguira escribiendo en el", _error_recorte)
+elif _lineas_recortadas:
+    log.info("Limpieza del log: %d lineas de mas de %d dias borradas", _lineas_recortadas, _DIAS_LOG)
 
 # tableauserverclient escribe su propio registro interno, en ingles, en el
 # logger "TSC" ('Signed into...', 'Querying all workbooks on site',

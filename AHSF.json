@@ -1,7 +1,60 @@
-    momento_tableau = None
-    try:
-        workbook_referencia = localizar_vista(servidor, config, informe_referencia)[1]
-        momento_tableau = ultimo_refresco_tableau(servidor, workbook_referencia)
-    except Exception as e:
-        log.error("No se pudo comprobar la fecha en Tableau (via '%s'): %s",
-                  informe_referencia['nombre'], e)
+SELECT FECHA_VISITA
+FROM CLABS_ANL_PRO.ANL_PT_F_ACTIVIDAD
+WHERE ROWNUM <= 5;
+
+
+
+
+SELECT COUNT(*)
+FROM CLABS_ANL_PRO.ANL_PT_F_ACTIVIDAD
+WHERE ESTADO_VISITA = 'TERMINADA'
+  AND ORIGEN_TIPO_SF = 'Visita'
+  AND TIPO_VISITA IN ('VISITA REMOTA','VISITA','VISITA COMPLETA')
+  AND FICHERO_FLAG = '1'
+  AND substr(to_char(FECHA_VISITA),1,4) = TO_CHAR(EXTRACT(YEAR FROM SYSDATE-1));
+
+
+
+SELECT NVL(CICLO_FASE, '(vacío)') AS CICLO_FASE, COUNT(*) AS VISITAS
+FROM (
+  SELECT CASE
+           WHEN substr(FECHA_VISITA,1,6) IN ('202401','202402') THEN 'C1_F1'
+           WHEN substr(FECHA_VISITA,1,6) IN ('202403')          THEN 'C1_F2'
+           WHEN substr(FECHA_VISITA,1,6) IN ('202404','202405') THEN 'C2_F1'
+           WHEN substr(FECHA_VISITA,1,6) IN ('202406','202407') THEN 'C2_F2'
+           WHEN substr(FECHA_VISITA,1,6) IN ('202408')          THEN 'C2_F2'
+           WHEN substr(FECHA_VISITA,1,6) IN ('202409','202410') THEN 'C3_F1'
+           WHEN substr(FECHA_VISITA,1,6) IN ('202411','202412') THEN 'C3_F2'
+         END AS CICLO_FASE
+  FROM CLABS_ANL_PRO.ANL_PT_F_ACTIVIDAD
+  WHERE ESTADO_VISITA = 'TERMINADA'
+    AND ORIGEN_TIPO_SF = 'Visita'
+    AND TIPO_VISITA IN ('VISITA REMOTA','VISITA','VISITA COMPLETA')
+    AND FICHERO_FLAG = '1'
+    AND substr(to_char(FECHA_VISITA),1,4) = TO_CHAR(EXTRACT(YEAR FROM SYSDATE-1))
+)
+GROUP BY CICLO_FASE;
+
+
+
+
+SELECT NVL(CICLO_FASE, '(vacío)') AS CICLO_FASE, COUNT(*) AS VISITAS
+FROM (
+  SELECT CASE
+           WHEN substr(FECHA_VISITA,5,2) IN ('01','02') THEN 'C1_F1'
+           WHEN substr(FECHA_VISITA,5,2) IN ('03')      THEN 'C1_F2'
+           WHEN substr(FECHA_VISITA,5,2) IN ('04','05') THEN 'C2_F1'
+           WHEN substr(FECHA_VISITA,5,2) IN ('06','07') THEN 'C2_F2'
+           WHEN substr(FECHA_VISITA,5,2) IN ('08')      THEN 'C2_F2'
+           WHEN substr(FECHA_VISITA,5,2) IN ('09','10') THEN 'C3_F1'
+           WHEN substr(FECHA_VISITA,5,2) IN ('11','12') THEN 'C3_F2'
+         END AS CICLO_FASE
+  FROM CLABS_ANL_PRO.ANL_PT_F_ACTIVIDAD
+  WHERE ESTADO_VISITA = 'TERMINADA'
+    AND ORIGEN_TIPO_SF = 'Visita'
+    AND TIPO_VISITA IN ('VISITA REMOTA','VISITA','VISITA COMPLETA')
+    AND FICHERO_FLAG = '1'
+    AND substr(to_char(FECHA_VISITA),1,4) = TO_CHAR(EXTRACT(YEAR FROM SYSDATE-1))
+)
+GROUP BY CICLO_FASE
+ORDER BY CICLO_FASE;

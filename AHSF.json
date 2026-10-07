@@ -1,19 +1,7 @@
-# Por defecto la libreria usa la API 2.4; la Metadata API pide 3.5 o
-        # superior. Esto la sube a la version que soporta el servidor.
-        # Ojo: use_server_version() no lanza ningun error si falla la consulta de la version (por
-        # ejemplo, un corte de red puntual): la libreria se queda en la 2.4 sin avisar y despues
-        # falla la Metadata API. Por eso se comprueba la version resultante y se reintenta hasta 3
-        # veces, esperando unos segundos entre intentos.
-        version_valida = False
-        for intento in range(3):
-            servidor.use_server_version()
-            version_valida = tuple(int(n) for n in servidor.version.split('.')) >= (3, 5)
-            if version_valida:
-                break
-            log.warning("Tableau no ha indicado su version de API (intento %d de 3), se reintenta",
-                        intento + 1)
-            time.sleep(3)
-        if not version_valida:
-            raise RuntimeError(f"Tableau no devolvio su version de API (se queda en la "
-                               f"{servidor.version}, y la Metadata API necesita la 3.5 o superior)")
-        
+    momento_tableau = None
+    try:
+        workbook_referencia = localizar_vista(servidor, config, informe_referencia)[1]
+        momento_tableau = ultimo_refresco_tableau(servidor, workbook_referencia)
+    except Exception as e:
+        log.error("No se pudo comprobar la fecha en Tableau (via '%s'): %s",
+                  informe_referencia['nombre'], e)

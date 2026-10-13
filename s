@@ -1,15 +1,13 @@
-SELECT 'BASE' AS lado,
-       SUM(CASE WHEN FLAG_DIA = 1 THEN 1 ELSE 0 END)           AS dia_1,
-       SUM(CASE WHEN FLAG_DIA_FICHERO = 1 THEN 1 ELSE 0 END)   AS fich_1,
-       SUM(CASE WHEN FLAG_DIA_FICH_PUBL = 1 THEN 1 ELSE 0 END) AS publ_1,
-       SUM(CASE WHEN FLAG_DIA_FICH_PRIV = 1 THEN 1 ELSE 0 END) AS priv_1
-FROM base
-WHERE ID_AGENTE = '005Qu00000BgaYbIAJ' AND FECHA_VISITA >= DATE '2026-09-01'
-UNION ALL
-SELECT 'NUEVA',
-       SUM(CASE WHEN FLAG_DIA = 1 THEN 1 ELSE 0 END),
-       SUM(CASE WHEN FLAG_DIA_FICHERO = 1 THEN 1 ELSE 0 END),
-       SUM(CASE WHEN FLAG_DIA_FICH_PUBL = 1 THEN 1 ELSE 0 END),
-       SUM(CASE WHEN FLAG_DIA_FICH_PRIV = 1 THEN 1 ELSE 0 END)
-FROM nueva
-WHERE ID_AGENTE = '005Qu00000BgaYbIAJ' AND FECHA_VISITA >= DATE '2026-09-01';
+SELECT i.index_name, i.index_type, i.uniqueness, i.status,
+       LISTAGG(c.column_name, ', ') WITHIN GROUP (ORDER BY c.column_position) AS columnas
+FROM all_indexes i
+JOIN all_ind_columns c
+  ON c.index_owner = i.owner AND c.index_name = i.index_name
+WHERE i.table_owner = 'CLABS_ANL_PRO' AND i.table_name = 'ANL_ACTIVIDAD_PT'
+GROUP BY i.index_name, i.index_type, i.uniqueness, i.status
+ORDER BY i.index_name;
+
+SELECT grantee, privilege, grantable
+FROM all_tab_privs
+WHERE table_schema = 'CLABS_ANL_PRO' AND table_name = 'ANL_ACTIVIDAD_PT'
+ORDER BY grantee, privilege;

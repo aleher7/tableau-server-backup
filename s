@@ -1,12 +1,16 @@
-SELECT USER FROM dual;
-
-SELECT owner, object_name, object_type
-FROM all_objects
-WHERE object_name = 'ANL_ACTIVIDAD_PT';
-
-
-SELECT index_name, uniqueness, status FROM dba_indexes
-WHERE table_owner = 'CLABS_ANL_PRO' AND table_name = 'ANL_ACTIVIDAD_PT';
-
-SELECT grantee, privilege, grantable FROM dba_tab_privs
-WHERE owner = 'CLABS_ANL_PRO' AND table_name = 'ANL_ACTIVIDAD_PT';
+WITH dias AS (
+  SELECT ID_AGENTE, TRUNC(FECHA_VISITA) AS dia,
+         MAX(CASE WHEN FRANJA_VISITA = 'MAÑANA' THEN 1 ELSE 0 END) AS man,
+         MAX(CASE WHEN FRANJA_VISITA = 'TARDE'  THEN 1 ELSE 0 END) AS tar,
+         MIN(FLAG_DIA) AS flag_min, MAX(FLAG_DIA) AS flag_max
+  FROM nueva
+  WHERE ESTADO_VISITA = 'TERMINADA' AND ORIGEN_TIPO_SF = 'Visita'
+    AND TIPO_VISITA IN ('VISITA REMOTA','VISITA','VISITA COMPLETA','FORMAÇÃO')
+    AND FECHA_VISITA >= DATE '2026-09-01' AND FECHA_VISITA < TRUNC(SYSDATE)
+    AND ID_AGENTE <> '<ID_MEDIA_JORNADA>'
+  GROUP BY ID_AGENTE, TRUNC(FECHA_VISITA)
+)
+SELECT man, tar, flag_min, flag_max, COUNT(*) AS dias, COUNT(DISTINCT ID_AGENTE) AS agentes
+FROM dias
+GROUP BY man, tar, flag_min, flag_max
+ORDER BY man DESC, tar DESC;

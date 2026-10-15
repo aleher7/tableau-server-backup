@@ -26,19 +26,19 @@ ORDER BY 2, 1;
 
 
 
-
-
-
-
-
-WITH ORIG AS (
-    SELECT /*+ MATERIALIZE */ * FROM ( <consulta original> )
-),
-NUEVA AS (
-    SELECT /*+ MATERIALIZE */ * FROM ( <consulta nueva> )
-)
-SELECT 'EN ORIG Y NO EN NUEVA' t, COUNT(*) FROM (
-    SELECT * FROM ORIG
+SELECT 'EN ORIG Y NO EN NUEVA' AS t, COUNT(*) AS filas FROM (
+    SELECT ID_SF_VISITA, Fecha_Visita, YEAR, MONTH, DAY, FRANJA_VISITA, Tipo_Visita, Subtipo_Visita,
+           Estado_Visita, ORIGEN_TIPO_SF, Producto_Visita, Marca_Visita, ID_Agente, Agente, Gerente,
+           Jefe_Ventas, TIPO_RED, Division, Estado_Agente, ID_CENTRO_SF, ID_CONTACTO_SF, CODIGO_JDE,
+           Centro, CIUDAD, PT_CLASIFICACION_CENTRO, PT_GEO1, PT_GEO2, PT_NATURALEZA, PT_TIPO_CONTACTO,
+           PT_TIPO_ENTIDAD, NOMBRE_CONTACTO, ESPECIALIDAD_PRINCIPAL, ESPECIALIDAD_SECUNDARIA,
+           NUMERO_COLEGIADO, FICHERO_FLAG, Motivo_Ausencia, Fich_Agente_Contacto, PT_CLASIFICACION_CONT,
+           flag_dia, Dias_Trabajados, Dias_Trabajados_Agentes, flag_dia_fichero, Dias_Trabajados_fichero,
+           Dias_Trabajados_fichero_Agentes, flag_dia_fich_publ, Dias_Trabajados_fich_Publ,
+           Dias_Trabajados_Fich_Agentes_Publ, flag_dia_fich_priv, Dias_Trabajados_fich_Priv,
+           Dias_Trabajados_Fich_Agentes_Priv, color_ciclo, color_total, CICLO, FASE, OBJETIVO_MED,
+           OBJETIVO_FAR, YTD, PREV_YTD, MTD, PREV_MTD, TAM, PREV_TAM, DATE_UPD, PCT_JORNADA
+    FROM ORIG
     MINUS
     SELECT ID_SF_VISITA, Fecha_Visita, YEAR, MONTH, DAY, FRANJA_VISITA, Tipo_Visita, Subtipo_Visita,
            Estado_Visita, ORIGEN_TIPO_SF, Producto_Visita, Marca_Visita, ID_Agente, Agente, Gerente,
@@ -68,8 +68,23 @@ SELECT 'EN NUEVA Y NO EN ORIG', COUNT(*) FROM (
            OBJETIVO_FAR, YTD, PREV_YTD, MTD, PREV_MTD, TAM, PREV_TAM, DATE_UPD, PCT_JORNADA
     FROM NUEVA
     MINUS
-    SELECT * FROM ORIG
+    SELECT ID_SF_VISITA, Fecha_Visita, YEAR, MONTH, DAY, FRANJA_VISITA, Tipo_Visita, Subtipo_Visita,
+           Estado_Visita, ORIGEN_TIPO_SF, Producto_Visita, Marca_Visita, ID_Agente, Agente, Gerente,
+           Jefe_Ventas, TIPO_RED, Division, Estado_Agente, ID_CENTRO_SF, ID_CONTACTO_SF, CODIGO_JDE,
+           Centro, CIUDAD, PT_CLASIFICACION_CENTRO, PT_GEO1, PT_GEO2, PT_NATURALEZA, PT_TIPO_CONTACTO,
+           PT_TIPO_ENTIDAD, NOMBRE_CONTACTO, ESPECIALIDAD_PRINCIPAL, ESPECIALIDAD_SECUNDARIA,
+           NUMERO_COLEGIADO, FICHERO_FLAG, Motivo_Ausencia, Fich_Agente_Contacto, PT_CLASIFICACION_CONT,
+           flag_dia, Dias_Trabajados, Dias_Trabajados_Agentes, flag_dia_fichero, Dias_Trabajados_fichero,
+           Dias_Trabajados_fichero_Agentes, flag_dia_fich_publ, Dias_Trabajados_fich_Publ,
+           Dias_Trabajados_Fich_Agentes_Publ, flag_dia_fich_priv, Dias_Trabajados_fich_Priv,
+           Dias_Trabajados_Fich_Agentes_Priv, color_ciclo, color_total, CICLO, FASE, OBJETIVO_MED,
+           OBJETIVO_FAR, YTD, PREV_YTD, MTD, PREV_MTD, TAM, PREV_TAM, DATE_UPD, PCT_JORNADA
+    FROM ORIG
 );
+
+
+
+
 
 
 

@@ -1,8 +1,12 @@
 -- 1) Resumen
-SELECT COUNT(*) filas, COUNT(DISTINCT PEDIDO) pedidos, COUNT(FACTURA) con_factura,
-       (SELECT COUNT(*) FROM (SELECT 1 FROM <TABLA>
-                              GROUP BY SDKCOO, PEDIDO, TIPO_PEDIDO, SDLNID HAVING COUNT(*) > 1)) claves_repetidas
-FROM <TABLA>;
+SELECT a.filas, a.pedidos, a.con_factura, b.claves_repetidas
+FROM (SELECT COUNT(*) filas, COUNT(DISTINCT PEDIDO) pedidos, COUNT(FACTURA) con_factura
+      FROM <TABLA>) a
+CROSS JOIN
+     (SELECT COUNT(*) claves_repetidas
+      FROM (SELECT 1 FROM <TABLA>
+            GROUP BY SDKCOO, PEDIDO, TIPO_PEDIDO, SDLNID
+            HAVING COUNT(*) > 1)) b;
 
 -- 2) Por año
 SELECT 1900 + TRUNC(t.f/1000) anio, COUNT(*) filas, COUNT(DISTINCT p.PEDIDO) pedidos,

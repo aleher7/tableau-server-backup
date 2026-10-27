@@ -1,33 +1,67 @@
-SELECT (SELECT status FROM user_objects WHERE object_name = 'INT_UNIDADES_PROYECTADAS' AND object_type = 'PROCEDURE') estado,
-       (SELECT COUNT(*) FROM user_errors WHERE name = 'INT_UNIDADES_PROYECTADAS') errores,
-       (SELECT COUNT(*) FROM user_source WHERE name = 'INT_UNIDADES_PROYECTADAS' AND UPPER(text) LIKE '%''INT''%') int_fijos
+SELECT COUNT(*) FROM user_tables WHERE table_name = 'BKP1027_PROYECTADAS_SQL';   -- 1 = ya existe
+-- Si sale 0:
+CREATE TABLE bkp1027_proyectadas_sql AS SELECT * FROM ANL_INT_UNIDADES_PROYECTADAS;
+
+
+
+SELECT (SELECT SUM(CASE WHEN UPPER(text) LIKE '%''INT''%' THEN 1 ELSE 0 END)
+        FROM bkp1027_codigo_proc WHERE name = 'ANL_ROLLING12_INT') int_en_copia,
+       (SELECT COUNT(*) FROM ANL_UNIDADES_ROLLING12_INT) filas_tabla,
+       (SELECT COUNT(*) FROM bkp1027_rolling12_antes)    filas_foto
 FROM dual;
 
 
 
+
+
+SELECT (SELECT status FROM user_objects WHERE object_name = 'ANL_ROLLING12_INT' AND object_type = 'PROCEDURE') estado,
+       (SELECT COUNT(*) FROM user_errors WHERE name = 'ANL_ROLLING12_INT') errores,
+       (SELECT COUNT(*) FROM user_source WHERE name = 'ANL_ROLLING12_INT' AND UPPER(text) LIKE '%''INT''%') int_fijos
+FROM dual;
+
+
+
+
 SELECT 'SOLO_ORIGINAL' origen, text FROM (
-  SELECT text FROM bkp1027_codigo_proc WHERE name = 'INT_UNIDADES_PROYECTADAS'
+  SELECT text FROM bkp1027_codigo_proc WHERE name = 'ANL_ROLLING12_INT'
   MINUS
-  SELECT text FROM user_source WHERE name = 'INT_UNIDADES_PROYECTADAS' AND type = 'PROCEDURE')
+  SELECT text FROM user_source WHERE name = 'ANL_ROLLING12_INT' AND type = 'PROCEDURE')
 UNION ALL
 SELECT 'SOLO_NUEVO', text FROM (
-  SELECT text FROM user_source WHERE name = 'INT_UNIDADES_PROYECTADAS' AND type = 'PROCEDURE'
+  SELECT text FROM user_source WHERE name = 'ANL_ROLLING12_INT' AND type = 'PROCEDURE'
   MINUS
-  SELECT text FROM bkp1027_codigo_proc WHERE name = 'INT_UNIDADES_PROYECTADAS');
+  SELECT text FROM bkp1027_codigo_proc WHERE name = 'ANL_ROLLING12_INT');
 
 
-SELECT MIN(CASE WHEN UPPER(text) LIKE '%V_ID_BU%'      THEN line END) primera_aparicion_variable,
-       MIN(CASE WHEN UPPER(text) LIKE '%CURSOR %'      THEN line END) primer_cursor,
-       MIN(CASE WHEN UPPER(text) LIKE '%INTO V_ID_BU%' THEN line END) linea_select_into,
-       MIN(CASE WHEN UPPER(text) LIKE '%TRUNCATE%'     THEN line END) primer_truncate
-FROM user_source WHERE name = 'INT_UNIDADES_PROYECTADAS' AND type = 'PROCEDURE';
+
+
+SELECT SUM(CASE WHEN UPPER(text) LIKE '%ANL_M_ALMACEN%'                 THEN 1 ELSE 0 END) usos_tabla_config,
+       SUM(CASE WHEN UPPER(text) LIKE '%DISTINCT%ID_BU%'                THEN 1 ELSE 0 END) con_distinct,
+       SUM(CASE WHEN REPLACE(UPPER(text),' ','') LIKE '%ID_PROCESO=7%'  THEN 1 ELSE 0 END) con_proceso_7,
+       SUM(CASE WHEN REPLACE(UPPER(text),' ','') LIKE '%ID_PROCESO=6%'  THEN 1 ELSE 0 END) con_proceso_6,
+       SUM(CASE WHEN UPPER(text) LIKE '%DESC_PROCESO%'                  THEN 1 ELSE 0 END) con_desc_proceso
+FROM user_source WHERE name = 'ANL_ROLLING12_INT' AND type = 'PROCEDURE';
+
+
+
+
+
+WITH a AS (SELECT AÑO, MES, PRODUCT_CODE, UNIDADES_ROLLING, VUELTA, COUNT(*) veces FROM bkp1027_rolling12_antes GROUP BY AÑO, MES, PRODUCT_CODE, UNIDADES_ROLLING, VUELTA),
+     n AS (SELECT AÑO, MES, PRODUCT_CODE, UNIDADES_ROLLING, VUELTA, COUNT(*) veces FROM ANL_UNIDADES_ROLLING12_INT GROUP BY AÑO, MES, PRODUCT_CODE, UNIDADES_ROLLING, VUELTA)
+SELECT * FROM (
+  SELECT 'SOLO_ANTES' AS origen, x.* FROM (SELECT * FROM a MINUS SELECT * FROM n) x
+  UNION ALL
+  SELECT 'SOLO_DESPUES' AS origen, y.* FROM (SELECT * FROM n MINUS SELECT * FROM a) y)
+ORDER BY 6, 2, 3, 4;
+
 
 
 
 SELECT NVL(a.VUELTA, d.VUELTA) vuelta, a.filas antes, d.filas despues
-FROM (SELECT VUELTA, COUNT(*) filas FROM bkp1027_proyectadas_antes GROUP BY VUELTA) a
-FULL OUTER JOIN (SELECT VUELTA, COUNT(*) filas FROM ANL_INT_UNIDADES_PROYECTADAS GROUP BY VUELTA) d
+FROM (SELECT VUELTA, COUNT(*) filas FROM bkp1027_rolling12_antes GROUP BY VUELTA) a
+FULL OUTER JOIN (SELECT VUELTA, COUNT(*) filas FROM ANL_UNIDADES_ROLLING12_INT GROUP BY VUELTA) d
   ON a.VUELTA = d.VUELTA
 ORDER BY 1;
 
-SELECT COMENTARIO FROM COMENTARIO2 WHERE UPPER(COMENTARIO) LIKE 'FIN DEL PROCESO%';
+SELECT MAX(DATE_UPD) FROM ANL_UNIDADES_ROLLING12_INT;
+SELECT * FROM COMENTARIO2;

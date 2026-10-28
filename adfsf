@@ -1,0 +1,17 @@
+-- 1. Confirmar esquemas reales de cada tabla de la ruta
+SELECT owner, object_name, object_type FROM all_objects
+WHERE object_name IN ('STG_SF_IFC_VISITA','STD_IFC_ACT_FACT_VISITAS_TMP_1','STD_IFC_ACT_FACT_VISITAS_F',
+  'STD_IFC_ACT_FACT_EVENTO','STD_IFC_ACT_FACT_ACTIVIDAD_F','ANL_F_IFC_ACTIVIDAD','ANL_ACTIVIDAD_ESP')
+ORDER BY object_name;
+
+-- 2. Que ninguna de las columnas nuevas exista ya
+SELECT owner, table_name, column_name FROM all_tab_columns
+WHERE column_name = 'RED_NEGOCIO_VISITA';
+
+-- 3. Quién depende de la tabla ANL y de la VM (vistas, procedimientos, otras VM)
+SELECT owner, name, type, referenced_name FROM all_dependencies
+WHERE referenced_name IN ('ANL_F_IFC_ACTIVIDAD','ANL_ACTIVIDAD_ESP');
+
+-- 4. Grants e índices de la VM, para reponerlos al recrearla
+SELECT grantee, privilege FROM all_tab_privs WHERE table_name = 'ANL_ACTIVIDAD_ESP';
+SELECT index_name, uniqueness FROM all_indexes WHERE table_name = 'ANL_ACTIVIDAD_ESP';

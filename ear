@@ -1,0 +1,51 @@
+WITH base AS (
+    SELECT DIVISION, ESTATUS_ESPECIALIDAD, ESPECIALIDAD_RESUMEN, ID_IMPACTO
+    FROM ANL_ACTIVIDAD_ESP
+    WHERE PERIODO_ACTUAL = 1
+      -- aquí los mismos filtros que tiene la hoja de Tableau
+      -- (Filtro Con Visitas, Filtro Impactos, ZONA, AGENTE, CATEGORIA, etc.)
+),
+detalle AS (            -- Imp de cada celda
+    SELECT DIVISION, ESTATUS_ESPECIALIDAD, ESPECIALIDAD_RESUMEN,
+           COUNT(DISTINCT ID_IMPACTO) AS IMP
+    FROM base
+    GROUP BY DIVISION, ESTATUS_ESPECIALIDAD, ESPECIALIDAD_RESUMEN
+),
+tot_fila AS (           -- denominador de % Imp H (Tabla a lo largo)
+    SELECT DIVISION, COUNT(DISTINCT ID_IMPACTO) AS IMP_FILA
+    FROM base
+    GROUP BY DIVISION
+),
+tot_col AS (            -- denominador de % Imp V (Panel hacia abajo)
+    SELECT ESTATUS_ESPECIALIDAD, ESPECIALIDAD_RESUMEN,
+           COUNT(DISTINCT ID_IMPACTO) AS IMP_COL
+    FROM base
+    GROUP BY ESTATUS_ESPECIALIDAD, ESPECIALIDAD_RESUMEN
+),
+tot_general AS (
+    SELECT COUNT(DISTINCT ID_IMPACTO) AS IMP_TOTAL FROM base
+)
+-- Celdas por estatus / especialidad
+SELECT d.DIVISION,
+       d.ESTATUS_ESPECIALIDAD,
+       d.ESPECIALIDAD_RESUMEN,
+       d.IMP,
+       ROUND(100 * d.IMP / NULLIF(c.IMP_COL, 0), 1)  AS PCT_IMP_V,
+       ROUND(100 * d.IMP / NULLIF(f.IMP_FILA, 0), 1) AS PCT_IMP_H
+FROM detalle d
+JOIN tot_fila f ON f.DIVISION = d.DIVISION
+JOIN tot_col  c ON c.ESTATUS_ESPECIALIDAD = d.ESTATUS_ESPECIALIDAD
+               AND c.ESPECIALIDAD_RESUMEN = d.ESPECIALIDAD_RESUMEN
+
+UNION ALL
+
+-- Columna "Total"
+SELECT f.DIVISION,
+       'TOTAL', 'TOTAL',
+       f.IMP_FILA,
+       ROUND(100 * f.IMP_FILA / NULLIF(g.IMP_TOTAL, 0), 1),
+       100
+FROM tot_fila f
+CROSS JOIN tot_general g
+
+ORDER BY 1, 2, 3;

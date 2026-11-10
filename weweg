@@ -1,29 +1,27 @@
-SELECT 'AGENTES' tabla,
-       (SELECT COUNT(*) FROM clabs_anl_pro.anl_m_ifc_agentes WHERE id_sf_user IS NOT NULL) maestro,
-       COUNT(*)                                              total_hist,
-       SUM(CASE WHEN flag_activo = 1 THEN 1 ELSE 0 END)      activos,
-       SUM(CASE WHEN flag_activo = 0 THEN 1 ELSE 0 END)      cerrados,
-       SUM(CASE WHEN id_sf_user IS NULL THEN 1 ELSE 0 END)   id_nulos,
-       SUM(CASE WHEN fecha_fin <> TO_DATE('31-12-9999','DD-MM-YYYY') OR fecha_fin IS NULL THEN 1 ELSE 0 END) fecha_fin_rara,
-       SUM(CASE WHEN fecha_inicio <> TO_DATE('01-01-1900','DD-MM-YYYY') THEN 1 ELSE 0 END) fecha_ini_rara
-  FROM clabs_anl_pro.anl_m_ifc_agentes_hist
-UNION ALL
-SELECT 'CENTROS',
-       (SELECT COUNT(*) FROM clabs_anl_pro.anl_m_ifc_centros WHERE id_sf IS NOT NULL),
-       COUNT(*),
-       SUM(CASE WHEN flag_activo = 1 THEN 1 ELSE 0 END),
-       SUM(CASE WHEN flag_activo = 0 THEN 1 ELSE 0 END),
-       SUM(CASE WHEN id_sf IS NULL THEN 1 ELSE 0 END),
-       SUM(CASE WHEN fecha_fin <> TO_DATE('31-12-9999','DD-MM-YYYY') OR fecha_fin IS NULL THEN 1 ELSE 0 END),
-       SUM(CASE WHEN fecha_inicio <> TO_DATE('01-01-1900','DD-MM-YYYY') THEN 1 ELSE 0 END)
+SELECT COUNT(*) AS maestro
+  FROM clabs_anl_pro.anl_m_ifc_agentes
+ WHERE id_sf_user IS NOT NULL;
+
+SELECT COUNT(*)                                            AS total_hist,
+       SUM(CASE WHEN flag_activo = 1 THEN 1 ELSE 0 END)    AS activos,
+       SUM(CASE WHEN flag_activo = 0 THEN 1 ELSE 0 END)    AS cerrados,
+       SUM(CASE WHEN id_sf_user IS NULL THEN 1 ELSE 0 END) AS id_nulos,
+       SUM(CASE WHEN fecha_fin IS NULL
+                  OR fecha_fin <> TO_DATE('31-12-9999','DD-MM-YYYY') THEN 1 ELSE 0 END) AS fecha_fin_rara,
+       SUM(CASE WHEN fecha_inicio <> TO_DATE('01-01-1900','DD-MM-YYYY') THEN 1 ELSE 0 END) AS fecha_ini_rara
+  FROM clabs_anl_pro.anl_m_ifc_agentes_hist;
+
+
+
+SELECT COUNT(*) AS maestro
+  FROM clabs_anl_pro.anl_m_ifc_centros
+ WHERE id_sf IS NOT NULL;
+
+SELECT COUNT(*)                                         AS total_hist,
+       SUM(CASE WHEN flag_activo = 1 THEN 1 ELSE 0 END) AS activos,
+       SUM(CASE WHEN flag_activo = 0 THEN 1 ELSE 0 END) AS cerrados,
+       SUM(CASE WHEN id_sf IS NULL THEN 1 ELSE 0 END)   AS id_nulos,
+       SUM(CASE WHEN fecha_fin IS NULL
+                  OR fecha_fin <> TO_DATE('31-12-9999','DD-MM-YYYY') THEN 1 ELSE 0 END) AS fecha_fin_rara,
+       SUM(CASE WHEN fecha_inicio <> TO_DATE('01-01-1900','DD-MM-YYYY') THEN 1 ELSE 0 END) AS fecha_ini_rara
   FROM clabs_anl_pro.anl_m_ifc_centros_hist;
-
-
-
-SELECT COUNT(*) FROM clabs_anl_pro.anl_m_ifc_agentes_hist
- WHERE estado IS NULL OR zona IS NULL OR division IS NULL OR cd_gerente_jde IS NULL;   -- 0
-
-SELECT COUNT(*) FROM clabs_anl_pro.anl_m_ifc_centros_hist
- WHERE segmento IS NULL OR categoria IS NULL;                                         -- 0
-
-SELECT COUNT(*) FROM clabs_anl_pro.anl_m_ifc_centros_hist WHERE segmento = '-';     -- ≈ 36.643

@@ -1,9 +1,10 @@
--- ¿Hay duplicados reales en la vista entre las filas con producto local?
-SELECT COUNT(*) - COUNT(DISTINCT BUSINESS_UNIT||'|'||LOCAL_PRODUCT_CODE) AS DUP
-FROM CLABS_ANL_PRO.ANL_M_PROD_CATALOG_FULL_VIEW WHERE LOCAL_PRODUCT_CODE IS NOT NULL;
-
--- ¿Qué productos de la vista no están en el join?
-SELECT BUSINESS_UNIT, LOCAL_PRODUCT_CODE FROM CLABS_ANL_PRO.ANL_M_PROD_CATALOG_FULL_VIEW WHERE LOCAL_PRODUCT_CODE IS NOT NULL
-MINUS
-SELECT l.BUSINESS_UNIT, l.LOCAL_PRODUCT_CODE FROM anl_m_prod_catalog_local l
-JOIN anl_m_prod_catalog_corp c ON l.grouped_gold_code = c.grouped_gold_code;
+SELECT 'VISTA' AS ORIGEN, SUM(a.UNIDADES_BRUTAS) AS TOTAL
+FROM anl_venta_interna_esp a
+JOIN CLABS_ANL_PRO.ANL_M_PROD_CATALOG_FULL_VIEW v ON a.PRODUCTO_AGRUPADO_COD = v.LOCAL_PRODUCT_CODE
+WHERE a.data_source = 1
+UNION ALL
+SELECT 'JOIN', SUM(a.UNIDADES_BRUTAS)
+FROM anl_venta_interna_esp a
+JOIN anl_m_prod_catalog_local l ON a.PRODUCTO_AGRUPADO_COD = l.LOCAL_PRODUCT_CODE
+JOIN anl_m_prod_catalog_corp c ON l.grouped_gold_code = c.grouped_gold_code
+WHERE a.data_source = 1;

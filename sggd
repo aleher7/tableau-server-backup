@@ -1,6 +1,9 @@
 WITH base AS (
     SELECT a.*,
-           CASE WHEN AÑO = '2026' THEN 1 END AS EN_PERIODO
+           CASE WHEN AÑO = '2026' THEN 1 END AS EN_PERIODO,
+           MAX(CASE WHEN F_FICH_AGENTE_CONTACTO > 0 THEN AGENTE END)
+             OVER (PARTITION BY AGENTE_WID, ESTATUS_ESPECIALIDAD, ESPECIALIDAD_RESUMEN,
+                                ESPECIALIDAD_PRINCIPAL, TIPO, SUBTIPO, PERFIL) AS AGENTE_FICHERO
     FROM ANL_ACTIVIDAD_ESP a
     WHERE AÑO >= '2024'
       AND (   ID_VISITA IS NULL
@@ -11,24 +14,19 @@ WITH base AS (
 k AS (
     SELECT CASE WHEN GROUPING(RED_NEGOCIO_VISITA) = 1 THEN 'TOTAL'
                 ELSE NVL(TO_CHAR(RED_NEGOCIO_VISITA), '(null)') END AS RED,
-           COUNT(DISTINCT CASE WHEN F_FICH_AGENTE_CONTACTO = 1 THEN AGENTE_WID END)       AS agentes_fichero,
+           COUNT(DISTINCT AGENTE_FICHERO) AS agentes_fichero_tab,
            COUNT(DISTINCT CASE WHEN F_FICH_AGENTE_CONTACTO > 0 AND EN_PERIODO = 1
-                               THEN AGENTES_VISITADOS END)                                AS agentes_con_visita,
+                               THEN AGENTES_VISITADOS END) AS agentes_con_visita,
            COUNT(DISTINCT CASE WHEN F_FICH_AGENTE_CONTACTO = 1
-                               THEN TO_CHAR(AGENTE_WID) || TO_CHAR(CONTACTO_WID) END)     AS f,
-           COUNT(DISTINCT CASE WHEN F_FICH_AGENTE_CONTACTO = 1 THEN CONTACTO_WID END)     AS f_unicos,
-           COUNT(DISTINCT CASE WHEN EN_PERIODO = 1 AND CONTACTOS_VISITADOS_FICHERO IS NOT NULL
-                               THEN TO_CHAR(AGENTE_WID) || TO_CHAR(CONTACTO_WID) END)     AS cv_fichero,
-           COUNT(DISTINCT CASE WHEN EN_PERIODO = 1 THEN VISITAS END)                      AS visitas,
-           COUNT(DISTINCT CASE WHEN EN_PERIODO = 1 THEN VISITAS_FICHERO END)              AS visitas_fichero
+                               THEN TO_CHAR(AGENTE_WID) || TO_CHAR(CONTACTO_WID) END) AS f,
+           COUNT(DISTINCT CASE WHEN EN_PERIODO = 1 THEN VISITAS END) AS visitas,
+           COUNT(DISTINCT CASE WHEN EN_PERIODO = 1 THEN DIAS_TRABAJADOS_AGENTES END) AS dias_trabajados
     FROM base
     GROUP BY ROLLUP (RED_NEGOCIO_VISITA)
 )
 SELECT k.*,
-       ROUND(100 * agentes_con_visita / NULLIF(agentes_fichero, 0), 1) AS pct_agentes,
-       ROUND(100 * cv_fichero / NULLIF(f, 0), 1)                       AS cobertura,
-       TRUNC(f / NULLIF(agentes_fichero, 0))                           AS fichero_m,
-       ROUND(100 * visitas_fichero / NULLIF(visitas, 0), 1)            AS pct_visitas_fich,
-       ROUND(visitas_fichero / NULLIF(cv_fichero, 0), 2)               AS fr
+       ROUND(100 * agentes_con_visita / NULLIF(agentes_fichero_tab, 0), 1) AS pct_agentes,
+       TRUNC(f / NULLIF(agentes_fichero_tab, 0))                           AS fichero_m,
+       ROUND(visitas / NULLIF(dias_trabajados, 0), 2)                      AS media_visitas
 FROM k
 ORDER BY CASE WHEN RED = 'TOTAL' THEN 1 ELSE 0 END, RED;

@@ -1,23 +1,30 @@
 WITH base AS (
-    SELECT *
-    FROM anl_actividad_esp
-    WHERE "AÑO" = 2026
-      AND mes <= 10          -- ajusta al periodo de [Periodo Actual]
-      -- Filtro Contacto No nulo = 'True'
-      AND NOT (id_visita IS NOT NULL
-               AND contacto_wid IS NULL
-               AND NVL(division, '#') IN ('RED NEO', 'RED PLUS', 'RED SKIN',
-                                          'RED DERM', 'RED CARE'))
+    SELECT a.*,
+           CASE WHEN AÑO = '2026' THEN 1 END AS EN_PERIODO                    -- [Periodo Actual]
+    FROM ANL_ACTIVIDAD_ESP a
+    WHERE AÑO >= '2024'                                                       -- alcance de Tableau
+      AND (   ID_VISITA IS NULL                                               -- Filtro Contacto No nulo
+           OR CONTACTO_WID IS NOT NULL
+           OR DIVISION IS NULL
+           OR DIVISION NOT IN ('RED NEO','RED PLUS','RED SKIN','RED DERM','RED CARE'))
+),
+k AS (
+    SELECT
+        COUNT(DISTINCT CASE WHEN F_FICH_AGENTE_CONTACTO = 1 THEN AGENTE_WID END)           AS agentes_fichero,       -- 153 (supuesto)
+        COUNT(DISTINCT CASE WHEN F_FICH_AGENTE_CONTACTO > 0 AND EN_PERIODO = 1
+                            THEN AGENTES_VISITADOS END)                                    AS agentes_con_visita,    -- 147
+        COUNT(DISTINCT CASE WHEN F_FICH_AGENTE_CONTACTO = 1
+                            THEN TO_CHAR(AGENTE_WID) || TO_CHAR(CONTACTO_WID) END)         AS f,                     -- 29.776
+        COUNT(DISTINCT CASE WHEN F_FICH_AGENTE_CONTACTO = 1 THEN CONTACTO_WID END)         AS f_unicos,              -- 17.050
+        COUNT(DISTINCT CASE WHEN EN_PERIODO = 1 AND CONTACTOS_VISITADOS_FICHERO IS NOT NULL
+                            THEN TO_CHAR(AGENTE_WID) || TO_CHAR(CONTACTO_WID) END)         AS cv_fichero,            -- 22.587
+        COUNT(DISTINCT CASE WHEN EN_PERIODO = 1 THEN VISITAS END)                          AS visitas,               -- 140.209 (supuesto)
+        COUNT(DISTINCT CASE WHEN EN_PERIODO = 1 THEN VISITAS_FICHERO END)                  AS visitas_fichero        -- 116.324
+    FROM base
 )
-SELECT
-    COUNT(DISTINCT agentes_visitados) AS agentes_con_visita,           -- esperado 178
-    COUNT(DISTINCT CASE WHEN contactos_visitados IS NOT NULL
-                        THEN agente_wid || '|' || contacto_wid END)
-                                       AS contactos_visitados,          -- esperado 31.701
-    COUNT(DISTINCT contactos_visitados) AS contactos_unicos,            -- esperado 13.932
-    COUNT(DISTINCT CASE WHEN contactos_visitados_fichero IS NOT NULL
-                        THEN agente_wid || '|' || contacto_wid END)
-                                       AS contactos_visitados_fichero,  -- esperado 22.401
-    COUNT(DISTINCT visitas)            AS visitas,                      -- esperado 136.354
-    COUNT(DISTINCT visitas_fichero)    AS visitas_fichero               -- esperado 113.044
-FROM base;
+SELECT k.*,
+       ROUND(100 * agentes_con_visita / NULLIF(agentes_fichero, 0), 1) AS pct_agentes,      -- 96,1
+       ROUND(100 * cv_fichero / NULLIF(f, 0), 1)                       AS cobertura,        -- 75,9
+       TRUNC(f / NULLIF(agentes_fichero, 0))                           AS fichero_m,        -- 194
+       ROUND(100 * visitas_fichero / NULLIF(visitas, 0), 1)            AS pct_visitas_fich  -- 83,0
+FROM k;

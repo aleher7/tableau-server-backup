@@ -1,0 +1,36 @@
+WITH base AS (
+    SELECT a.*,
+           CASE WHEN AÑO = '2026' THEN 1 END AS EN_PERIODO,
+           MAX(CASE WHEN F_FICH_AGENTE_CONTACTO > 0 THEN AGENTE END)
+             OVER (PARTITION BY AGENTE_WID, ESTATUS_ESPECIALIDAD, ESPECIALIDAD_RESUMEN,
+                                ESPECIALIDAD_PRINCIPAL, TIPO, SUBTIPO, PERFIL) AS AGENTE_FICHERO
+    FROM ANL_ACTIVIDAD_ESP a
+    WHERE AÑO >= '2024'
+      AND (   ID_VISITA IS NULL
+           OR CONTACTO_WID IS NOT NULL
+           OR DIVISION IS NULL
+           OR DIVISION NOT IN ('RED NEO','RED PLUS','RED SKIN','RED DERM','RED CARE'))
+),
+k AS (
+    SELECT CASE WHEN GROUPING(RED_NEGOCIO_VISITA) = 1 THEN 'TOTAL'
+                ELSE NVL(TO_CHAR(RED_NEGOCIO_VISITA), '(null)') END AS RED,
+           COUNT(DISTINCT AGENTE_FICHERO) AS agentes_fichero,
+           COUNT(DISTINCT CASE WHEN F_FICH_AGENTE_CONTACTO > 0 AND EN_PERIODO = 1
+                               THEN AGENTES_VISITADOS END) AS agentes_con_visita,
+           COUNT(DISTINCT CASE WHEN F_FICH_AGENTE_CONTACTO = 1
+                               THEN TO_CHAR(AGENTE_WID) || TO_CHAR(CONTACTO_WID) END) AS f,
+           COUNT(DISTINCT CASE WHEN EN_PERIODO = 1 AND CONTACTOS_VISITADOS_FICHERO IS NOT NULL
+                               THEN TO_CHAR(AGENTE_WID) || TO_CHAR(CONTACTO_WID) END) AS cv,
+           COUNT(DISTINCT CASE WHEN EN_PERIODO = 1 THEN VISITAS END) AS visitas,
+           COUNT(DISTINCT CASE WHEN EN_PERIODO = 1 THEN VISITAS_FICHERO END) AS visitas_fichero
+    FROM base
+    GROUP BY ROLLUP (RED_NEGOCIO_VISITA)
+),
+r AS (SELECT * FROM k WHERE RED NOT IN ('TOTAL','(null)','NA')),
+t AS (SELECT * FROM k WHERE RED = 'TOTAL')
+SELECT 'F (contactos fichero)' AS metrica, (SELECT SUM(f) FROM r) AS suma_redes, (SELECT f FROM t) AS total FROM dual
+UNION ALL SELECT 'Agentes fichero',     (SELECT SUM(agentes_fichero) FROM r),   (SELECT agentes_fichero FROM t)   FROM dual
+UNION ALL SELECT 'Agentes con visita',  (SELECT SUM(agentes_con_visita) FROM r), (SELECT agentes_con_visita FROM t) FROM dual
+UNION ALL SELECT 'CV',                  (SELECT SUM(cv) FROM r),                 (SELECT cv FROM t)                 FROM dual
+UNION ALL SELECT 'Visitas',             (SELECT SUM(visitas) FROM r),            (SELECT visitas FROM t)            FROM dual
+UNION ALL SELECT 'Visitas fichero',     (SELECT SUM(visitas_fichero) FROM r),    (SELECT visitas_fichero FROM t)    FROM dual;
